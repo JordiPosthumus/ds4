@@ -2633,13 +2633,14 @@ static void anthropic_prepare_live_continuation(request *r,
  * skip extension fields.  The output is always a rendered DS4 chat/completion
  * prompt plus the small amount of protocol state needed to translate the reply. */
 static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
-                               int ctx_size, request *r, char *err, size_t errlen) {
+                               int ctx_size, bool default_thinking_enabled,
+                               request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     const char *p = body;
     bool got_messages = false;
     bool tool_choice_none = false;
     bool got_thinking = false;
-    bool thinking_enabled = true;
+    bool thinking_enabled = default_thinking_enabled;
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
     chat_msgs msgs = {0};
     char *tool_schemas = NULL;
@@ -2804,14 +2805,15 @@ bad:
 }
 
 static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, int def_tokens,
-                                    int ctx_size, request *r, char *err, size_t errlen) {
+                                    int ctx_size, bool default_thinking_enabled,
+                                    request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     r->api = API_ANTHROPIC;
     const char *p = body;
     bool got_messages = false;
     bool tool_choice_none = false;
     bool got_thinking = false;
-    bool thinking_enabled = true;
+    bool thinking_enabled = default_thinking_enabled;
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
     chat_msgs msgs = {0};
     char *system = NULL;
@@ -3694,14 +3696,15 @@ static bool parse_responses_reasoning(const char **p, ds4_think_mode *effort,
 }
 
 static bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def_tokens,
-                                    int ctx_size, request *r, char *err, size_t errlen) {
+                                    int ctx_size, bool default_thinking_enabled,
+                                    request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     r->api = API_RESPONSES;
     const char *p = body;
     bool got_input = false;
     bool tool_choice_none = false;
     bool got_thinking = false;
-    bool thinking_enabled = true;
+    bool thinking_enabled = default_thinking_enabled;
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
     chat_msgs msgs = {0};
     buf loaded_tool_schemas = {0};
@@ -3989,12 +3992,13 @@ static bool parse_prompt(const char **p, char **out) {
 }
 
 static bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
-                                     int ctx_size, request *r, char *err, size_t errlen) {
+                                     int ctx_size, bool default_thinking_enabled,
+                                     request *r, char *err, size_t errlen) {
     request_init(r, REQ_COMPLETION, def_tokens);
     const char *p = body;
     char *prompt = NULL;
     bool got_thinking = false;
-    bool thinking_enabled = true;
+    bool thinking_enabled = default_thinking_enabled;
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
 
     json_ws(&p);
@@ -7720,6 +7724,7 @@ struct server {
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
     bool disable_exact_dsml_tool_replay;
+    bool default_thinking_enabled;
     bool enable_cors;
     pthread_mutex_t tool_mu;
     pthread_mutex_t mu;
@@ -8707,24 +8712,27 @@ static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
                                             int store_len, const char *reason,
                                             const char *cache_text_override,
                                             uint8_t cache_text_ext,
-                                            const char *cache_text_key) {
+                                            const char *cache_text_key,
+                                            const char *protect_text) {
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     return ds4_kvstore_store_live_prefix_text(&s->kv, s->engine, s->session,
                                               tokens, store_len, reason,
-                                              cache_text_override,
-                                              cache_text_ext,
-                                              cache_text_key,
-                                              &hooks, err, sizeof(err));
+                                               cache_text_override,
+                                               cache_text_ext,
+                                               cache_text_key,
+                                               protect_text,
+                                               &hooks, err, sizeof(err));
 }
 
 static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
                                        int store_len, const char *reason) {
     return kv_cache_store_live_prefix_text(s, tokens, store_len, reason,
-                                           NULL, 0, NULL);
+                                           NULL, 0, NULL, NULL);
 }
 
-static void kv_cache_store_current(server *s, const char *reason) {
+static void kv_cache_store_current_protected(server *s, const char *reason,
+                                             const char *protect_text) {
     const ds4_tokens *tokens = ds4_session_tokens(s->session);
     if (!tokens) return;
 
@@ -8758,11 +8766,17 @@ static void kv_cache_store_current(server *s, const char *reason) {
      * tokenizes only the visible suffix that follows this key. */
     if (visible_text) {
         kv_cache_store_live_prefix_text(s, tokens, tokens->len, reason,
-                                        visible_text, visible_ext, visible_key);
+                                        visible_text, visible_ext, visible_key,
+                                        protect_text);
         free(visible_text);
     } else {
-        kv_cache_store_live_prefix(s, tokens, tokens->len, reason);
+        kv_cache_store_live_prefix_text(s, tokens, tokens->len, reason,
+                                        NULL, 0, NULL, protect_text);
     }
+}
+
+static void kv_cache_store_current(server *s, const char *reason) {
+    kv_cache_store_current_protected(s, reason, NULL);
 }
 
 static void kv_cache_note_store(kv_disk_cache *kc, int tokens) {
@@ -10098,7 +10112,7 @@ static void generate_job(server *s, job *j) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
-        kv_cache_store_current(s, "evict");
+        kv_cache_store_current_protected(s, "evict", j->req.prompt_text);
     }
     if (cached == 0) {
         disk_cached = kv_cache_try_load(s, &j->req, &effective_prompt,
@@ -11284,16 +11298,20 @@ static void *client_main(void *arg) {
     const int ctx_size = ds4_session_ctx(s->session);
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
-                                     ctx_size, &req, err, sizeof(err));
+                                     ctx_size, s->default_thinking_enabled,
+                                     &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/chat/completions")) {
         ok = parse_chat_request(s->engine, s, hr.body, s->default_tokens,
-                                ctx_size, &req, err, sizeof(err));
+                                ctx_size, s->default_thinking_enabled,
+                                &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/responses")) {
         ok = parse_responses_request(s->engine, s, hr.body, s->default_tokens,
-                                     ctx_size, &req, err, sizeof(err));
+                                     ctx_size, s->default_thinking_enabled,
+                                     &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/completions")) {
         ok = parse_completion_request(s->engine, hr.body, s->default_tokens,
-                                      ctx_size, &req, err, sizeof(err));
+                                      ctx_size, s->default_thinking_enabled,
+                                      &req, err, sizeof(err));
     } else {
         http_error(fd, s->enable_cors, 404, "unknown endpoint");
         http_request_free(&hr);
@@ -11400,6 +11418,7 @@ typedef struct {
     kv_cache_options kv_cache;
     bool kv_cache_reject_different_quant;
     bool disable_exact_dsml_tool_replay;
+    bool default_thinking_enabled;
     int tool_memory_max_ids;
     bool enable_cors;
 } server_config;
@@ -11522,6 +11541,7 @@ static server_config parse_options(int argc, char **argv) {
         .port = 8000,
         .ctx_size = 32768,
         .default_tokens = 393216,
+        .default_thinking_enabled = true,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
     };
     c.kv_cache = kv_cache_default_options();
@@ -11594,6 +11614,10 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_cache_reject_different_quant = true;
         } else if (!strcmp(arg, "--disable-exact-dsml-tool-replay")) {
             c.disable_exact_dsml_tool_replay = true;
+        } else if (!strcmp(arg, "--nothink")) {
+            c.default_thinking_enabled = false;
+        } else if (!strcmp(arg, "--think")) {
+            c.default_thinking_enabled = true;
         } else if (!strcmp(arg, "--tool-memory-max-ids")) {
             c.tool_memory_max_ids = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
@@ -11737,6 +11761,7 @@ int main(int argc, char **argv) {
     s.engine = engine;
     s.session = session;
     s.default_tokens = cfg.default_tokens;
+    s.default_thinking_enabled = cfg.default_thinking_enabled;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
@@ -15352,6 +15377,64 @@ static void test_kv_cache_eviction_prefers_superseded_continued_prefix(void) {
     rmdir(dir);
 }
 
+static void test_kv_cache_eviction_protects_incoming_prefix_on_live_miss(void) {
+    char tmpl[] = "/tmp/ds4-kv-prefix-protect-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *prefix_text = "system: long stable prompt prefix";
+    const char *other_text = "unrelated checkpoint";
+    const char *old_live_text = "system: long stable prompt prefix\nassistant: failed streamed tail";
+    const char *incoming_prompt_text = "system: long stable prompt prefix\nuser: replayed visible tail";
+    const uint64_t protected_payload = 2000000u;
+    const uint64_t other_payload = 2048u;
+    const uint64_t extra_bytes = 4096u;
+
+    test_kv_text_stub_file(dir, prefix_text, KV_REASON_CONTINUED,
+                           81920, protected_payload);
+    test_kv_text_stub_file(dir, other_text, KV_REASON_COLD,
+                           1024, other_payload);
+
+    char prefix_sha[41], other_sha[41];
+    sha1_bytes_hex(prefix_text, strlen(prefix_text), prefix_sha);
+    sha1_bytes_hex(other_text, strlen(other_text), other_sha);
+    char prefix_name[44], other_name[44];
+    snprintf(prefix_name, sizeof(prefix_name), "%.40s.kv", prefix_sha);
+    snprintf(other_name, sizeof(other_name), "%.40s.kv", other_sha);
+    char *prefix_path = path_join(dir, prefix_name);
+    char *other_path = path_join(dir, other_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    uint64_t protected_file_bytes =
+        KV_CACHE_FIXED_HEADER + 4u + strlen(prefix_text) + protected_payload;
+    kc.budget_bytes = extra_bytes + protected_file_bytes + 16u;
+    ds4_kvstore_eviction_context incoming = {
+        .text = old_live_text,
+        .text_len = strlen(old_live_text),
+        .protect_text = incoming_prompt_text,
+        .protect_text_len = strlen(incoming_prompt_text),
+        .model_id = 0,
+        .quant_bits = 2,
+        .ctx_size = 32768,
+        .reject_different_quant = false,
+    };
+    kv_cache_evict(&kc, NULL, extra_bytes, &incoming);
+
+    TEST_ASSERT(access(prefix_path, F_OK) == 0);
+    TEST_ASSERT(access(other_path, F_OK) != 0);
+
+    kv_cache_close(&kc);
+    unlink(prefix_path);
+    unlink(other_path);
+    free(prefix_path);
+    free(other_path);
+    rmdir(dir);
+}
+
 static void test_kv_cache_eviction_keeps_smaller_context_prefix(void) {
     char tmpl[] = "/tmp/ds4-kv-prefix-ctx-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -15854,6 +15937,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_makes_room_before_store();
     test_kv_cache_eviction_ignores_oversize_incoming();
     test_kv_cache_eviction_prefers_superseded_continued_prefix();
+    test_kv_cache_eviction_protects_incoming_prefix_on_live_miss();
     test_kv_cache_eviction_keeps_smaller_context_prefix();
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();

@@ -1827,7 +1827,7 @@ static void test_think_tool_recovery(void) {
     request r;
     char err[160];
     TEST_ASSERT(parse_chat_request(engine, NULL, test_think_recovery_request_json(),
-                                   512, 32768, &r, err, sizeof(err)));
+                                   512, 32768, true, &r, err, sizeof(err)));
 
     ds4_session *session = NULL;
     TEST_ASSERT(ds4_session_create(&session, engine, 32768) == 0);
@@ -1970,7 +1970,7 @@ static void test_tool_call_quality_one(bool quality) {
     request r;
     char err[160];
     TEST_ASSERT(parse_chat_request(engine, NULL, test_tool_call_request_json(),
-                                   512, 32768, &r, err, sizeof(err)));
+                                   512, 32768, true, &r, err, sizeof(err)));
 
     ds4_session *session = NULL;
     TEST_ASSERT(ds4_session_create(&session, engine, 32768) == 0);

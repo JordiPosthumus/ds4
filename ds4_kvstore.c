@@ -523,6 +523,24 @@ static bool kv_cache_incoming_supersedes_continued(
     return !strcmp(prefix_sha, e->sha);
 }
 
+static bool kv_cache_incoming_protects_prefix(
+        const ds4_kvstore_entry *e,
+        const ds4_kvstore_eviction_context *incoming) {
+    if (!e || !incoming || !incoming->protect_text) return false;
+    if (e->text_bytes == 0 || e->text_bytes > SIZE_MAX) return false;
+    if ((size_t)e->text_bytes > incoming->protect_text_len) return false;
+    if (e->model_id != incoming->model_id) return false;
+    if (incoming->reject_different_quant &&
+        e->quant_bits != incoming->quant_bits)
+        return false;
+    if (incoming->ctx_size > e->ctx_size) return false;
+
+    char prefix_sha[41];
+    ds4_kvstore_sha1_bytes_hex(incoming->protect_text,
+                               (size_t)e->text_bytes, prefix_sha);
+    return !strcmp(prefix_sha, e->sha);
+}
+
 static bool kv_cache_reason_is_anchor(uint8_t reason) {
     return reason == DS4_KVSTORE_REASON_COLD ||
            reason == DS4_KVSTORE_REASON_EVICT ||
@@ -555,6 +573,7 @@ double ds4_kvstore_entry_eviction_score(
         score *= KV_CACHE_CONTINUED_PREFIX_MIN_FACTOR +
                  KV_CACHE_CONTINUED_PREFIX_HIT_FACTOR * h;
     }
+    if (kv_cache_incoming_protects_prefix(e, incoming)) score *= 1.0e12;
     return score;
 }
 
@@ -929,6 +948,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         const char *cache_text_override,
                                         uint8_t cache_text_ext,
                                         const char *cache_text_key,
+                                        const char *protect_text,
                                         const ds4_kvstore_trailer_hooks *hooks,
                                         char *err,
                                         size_t err_len) {
@@ -1044,6 +1064,8 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     ds4_kvstore_eviction_context incoming = {
         .text = text,
         .text_len = text_len,
+        .protect_text = protect_text,
+        .protect_text_len = protect_text ? strlen(protect_text) : 0,
         .model_id = (uint8_t)model_id,
         .quant_bits = (uint8_t)quant_bits,
         .ctx_size = (uint32_t)ds4_session_ctx(session),
@@ -1164,8 +1186,9 @@ bool ds4_kvstore_store_live_prefix(ds4_kvstore *kc,
                                    char *err,
                                    size_t err_len) {
     return ds4_kvstore_store_live_prefix_text(kc, engine, session, tokens,
-                                              store_len, reason, NULL, 0, NULL,
-                                              hooks, err, err_len);
+                                               store_len, reason, NULL, 0, NULL,
+                                               NULL,
+                                               hooks, err, err_len);
 }
 
 bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
