@@ -2413,6 +2413,19 @@ static bool role_is_user_like(const char *role) {
     return !strcmp(role, "user") || !strcmp(role, "tool") || !strcmp(role, "function");
 }
 
+static bool text_is_ascii_ws_only(const char *s) {
+    if (!s) return true;
+    for (; *s; s++) {
+        if (!isspace((unsigned char)*s)) return false;
+    }
+    return true;
+}
+
+static const char *canonical_reasoning_text(const chat_msg *m) {
+    if (!m || text_is_ascii_ws_only(m->reasoning)) return "";
+    return m->reasoning;
+}
+
 static bool chat_history_uses_tool_context(const chat_msgs *msgs,
                                            const char *tool_schemas) {
     if (tool_schemas && tool_schemas[0]) return true;
@@ -2481,7 +2494,7 @@ static char *render_deepseek_chat_prompt_text(const chat_msgs *msgs, const char 
                 if (think) {
                     if (tool_context || i > last_user_idx) {
                         buf_puts(&out, "<think>");
-                        buf_puts(&out, m->reasoning ? m->reasoning : "");
+                        buf_puts(&out, canonical_reasoning_text(m));
                         buf_puts(&out, "</think>");
                     } else {
                         buf_puts(&out, "</think>");
@@ -2518,7 +2531,7 @@ static void append_glm_assistant_message_prefix(buf *out,
     if (text_starts_with_think_tag(content)) return;
     if (preserve_reasoning) {
         buf_puts(out, "<think>");
-        buf_puts(out, m && m->reasoning ? m->reasoning : "");
+        buf_puts(out, canonical_reasoning_text(m));
         buf_puts(out, "</think>");
     } else {
         buf_puts(out, "<think></think>");
@@ -2662,7 +2675,7 @@ static char *render_deepseek_live_tool_tail(const chat_msgs *msgs, int start,
                 buf_puts(&out, "<｜Assistant｜>");
                 if (think) {
                     buf_puts(&out, "<think>");
-                    buf_puts(&out, m->reasoning ? m->reasoning : "");
+                    buf_puts(&out, canonical_reasoning_text(m));
                     buf_puts(&out, "</think>");
                 } else {
                     buf_puts(&out, "</think>");
@@ -14648,6 +14661,59 @@ static void test_render_glm_drops_old_reasoning_without_tools(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_render_chat_prompt_canonicalizes_blank_reasoning(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("hello");
+    chat_msgs_push(&msgs, user);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.reasoning = xstrdup(" \t\n");
+    assistant.content = xstrdup("answer");
+    chat_msgs_push(&msgs, assistant);
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.content = xstrdup("result");
+    chat_msgs_push(&msgs, tool);
+
+    char *prompt = render_chat_prompt_text(&msgs, "TOOL_SCHEMA_MARKER", NULL,
+                                           DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "<｜Assistant｜><think></think>answer") != NULL);
+    TEST_ASSERT(strstr(prompt, "<think> \t\n</think>") == NULL);
+
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+static void test_render_glm_canonicalizes_blank_reasoning(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("hello");
+    chat_msgs_push(&msgs, user);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.reasoning = xstrdup(" ");
+    assistant.content = xstrdup("answer");
+    chat_msgs_push(&msgs, assistant);
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.content = xstrdup("result");
+    chat_msgs_push(&msgs, tool);
+
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, &msgs, "TOOL_SCHEMA_MARKER", NULL,
+        DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "<|assistant|><think></think>answer") != NULL);
+    TEST_ASSERT(strstr(prompt, "<think> </think>") == NULL);
+
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
 static void test_render_glm_preserves_reasoning_with_tools(void) {
     chat_msgs msgs = {0};
     chat_msg user1 = {0};
@@ -17425,6 +17491,8 @@ static void ds4_server_unit_tests_run(void) {
     test_render_chat_prompt_text_renders_tools_before_system();
     test_render_glm_chat_prompt_text();
     test_render_glm_drops_old_reasoning_without_tools();
+    test_render_chat_prompt_canonicalizes_blank_reasoning();
+    test_render_glm_canonicalizes_blank_reasoning();
     test_render_glm_preserves_reasoning_with_tools();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
