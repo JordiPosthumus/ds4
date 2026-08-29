@@ -10696,6 +10696,23 @@ static void trace_write_cache_diag(
     }
 }
 
+/* Production kill switch for GLM live-prefix rewind reuse.
+ *
+ * Default: disabled. The DeepSeek production line demonstrated
+ * cross-session state bleed when a request rewound an unrelated resident
+ * slot to a shared prefix (incident 2026-08-25); the GLM path has the
+ * same failure shape. Enabling it requires a dedicated concurrent
+ * cross-session isolation regression to pass first.
+ */
+static bool kv_rewind_reuse_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("DS4_KV_REWIND_REUSE");
+        enabled = (e && e[0] == '1');
+    }
+    return enabled != 0;
+}
+
 static int live_prefix_rewind_target(bool backend_can_rewind,
                                      int old_pos, int prompt_len, int common) {
     if (!backend_can_rewind || prompt_len <= 1 || prompt_len >= old_pos) return -1;
@@ -11993,8 +12010,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         return;
     } else if (cached == 0) {
         const int rewind_to = live_prefix_rewind_target(
-            ds4_engine_is_glm_dsa(s->engine), old_pos,
-            j->req.prompt.len, common);
+            kv_rewind_reuse_enabled() && ds4_engine_is_glm_dsa(s->engine),
+            old_pos, j->req.prompt.len, common);
         if (rewind_to >= 0) {
             pthread_mutex_lock(&s->inference_mu);
             ds4_session_rewind(slot->session, rewind_to);
