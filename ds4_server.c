@@ -2834,11 +2834,22 @@ static void append_dsml_tool_calls_text(buf *b, const tool_calls *calls) {
 static void append_glm_tool_calls_text(buf *b, const tool_calls *calls,
                                        const tool_schema_orders *tool_orders) {
     if (!calls || calls->len == 0) return;
+    /* GLM emits each tool block on its own line, so the sampled stream has a
+     * newline between the visible assistant text and the first block.  The
+     * raw sampled DSML does not carry that newline and the replayed assistant
+     * content is trimmed, so restore exactly one separator here.  Without it
+     * the replayed prompt diverges from the sampled bytes at one token and
+     * every thinking+tool turn drops the whole live KV prefix.  A buffer that
+     * already ends in a newline (the tool checkpoint canonicalizer keeps the
+     * parsed trailing newline) must not gain a second one. */
+    if (b->len && b->ptr[b->len - 1] != '\n') {
+        const char *raw = calls->raw_tool_text;
+        if (!raw || !raw[0] || raw[0] != '\n') buf_putc(b, '\n');
+    }
     if (calls->raw_tool_text && calls->raw_tool_text[0]) {
         buf_puts(b, calls->raw_tool_text);
         return;
     }
-    buf_putc(b, '\n');
     for (int i = 0; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
         const tool_schema_order *order =
@@ -16134,6 +16145,59 @@ static void test_render_glm_preserves_reasoning_with_tools(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_glm_raw_tool_call_keeps_sampled_line_separator(void) {
+    /* Regression: the sampled thinking+tool turn renders the exact raw tool
+     * block on its own line, i.e. one newline between the visible assistant
+     * text and the first block.  The replay trims the assistant content and
+     * carries the exact raw block back through the remembered tool id, so
+     * the renderer must restore exactly that separator.  Without it the
+     * replayed prompt diverges from the sampled bytes at one token and every
+     * thinking+tool turn drops the whole live KV prefix. */
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Run it");
+    chat_msgs_push(&msgs, user);
+    chat_msg asst = {0};
+    asst.role = xstrdup("assistant");
+    asst.reasoning = xstrdup("thinking");
+    asst.content = xstrdup("Visible text:");
+    tool_call tc = {0};
+    tc.id = xstrdup("call_1");
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\":\"pwd\"}");
+    tool_calls_push(&asst.calls, tc);
+    asst.calls.raw_tool_text = xstrdup("<|tool" "_call|bash<arg_key>command</arg_key>"
+                                       "<arg_value>pwd</arg_value>"
+                                       "</|tool" "_call|>");
+    chat_msgs_push(&msgs, asst);
+
+    tool_schema_orders orders = make_bash_order();
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, &orders, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    /* Trimmed replay content + raw block: exactly one separator newline. */
+    TEST_ASSERT(strstr(prompt, "Visible text:\n<|tool" "_call|bash") != NULL);
+    TEST_ASSERT(strstr(prompt, "Visible text:\n\n<|tool" "_call|") == NULL);
+    free(prompt);
+
+    /* The canonical tool checkpoint keeps the parsed trailing newline in the
+     * content; it must not gain a second separator. */
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+    r.think_mode = DS4_THINK_HIGH;
+    char *suffix = build_tool_checkpoint_suffix(&r, "Visible text:\n", "thinking",
+                                                &asst.calls);
+    TEST_ASSERT(suffix != NULL);
+    TEST_ASSERT(strstr(suffix, "Visible text:\n<|tool" "_call|bash") != NULL);
+    TEST_ASSERT(strstr(suffix, "Visible text:\n\n<|tool" "_call|") == NULL);
+    free(suffix);
+    request_free(&r);
+    tool_schema_orders_free(&orders);
+    chat_msgs_free(&msgs);
+}
+
 static void test_render_glm_groups_tool_results(void) {
     chat_msgs msgs = {0};
     chat_msg user = {0};
@@ -19451,6 +19515,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_glm_chat_prompt_text();
     test_render_glm_drops_old_reasoning_without_tools();
     test_render_glm_preserves_reasoning_with_tools();
+    test_glm_raw_tool_call_keeps_sampled_line_separator();
     test_render_glm_groups_tool_results();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
