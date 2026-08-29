@@ -11575,16 +11575,20 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
     const int common = ds4_session_common_prefix(slot->session, &canonical);
     if (common == live_len && canonical.len == live_len) goto done;
 
+    const bool force_glm_thinking_tool_canonicalization =
+        j->req.model_syntax == SERVER_MODEL_SYNTAX_GLM &&
+        ds4_think_mode_enabled(j->req.think_mode);
     size_t live_text_len = 0;
     char *live_text = render_tokens_text(s->engine,
                                          ds4_session_tokens(slot->session),
                                          &live_text_len);
-    if (live_text_len == rendered.len &&
+    if (!force_glm_thinking_tool_canonicalization &&
+        live_text_len == rendered.len &&
         (live_text_len == 0 || memcmp(live_text, rendered.ptr, live_text_len) == 0))
     {
-        /* The graph already represents the bytes the next request will render.
-         * Token-level canonicalization would only replace a valid sampled
-         * history with a different BPE spelling of the same transcript. */
+        /* Outside GLM thinking/tool replay, the graph already represents the
+         * bytes the next request will render.  Re-tokenizing would only swap
+         * a valid sampled history for another BPE spelling of the same text. */
         free(live_text);
         goto done;
     }
@@ -11718,8 +11722,15 @@ done:
     free(suffix_text);
 }
 
-static bool should_canonicalize_tool_checkpoint(const server *s, const tool_calls *calls) {
+static bool should_canonicalize_tool_checkpoint(const server *s, const request *r,
+                                                const tool_calls *calls) {
     if (!calls || calls->len == 0) return false;
+    /* Pi replays GLM thinking/tool turns through JSON.  The replay text can be
+     * byte-identical to the sampled output yet tokenize differently at the
+     * reasoning/tool boundary, so retain the exact DSML but canonicalize the
+     * live token tail to the client's rendering. */
+    if (r && r->model_syntax == SERVER_MODEL_SYNTAX_GLM &&
+        ds4_think_mode_enabled(r->think_mode)) return true;
     if (s && !s->disable_exact_dsml_tool_replay &&
         calls->raw_tool_text && calls->raw_tool_text[0])
     {
@@ -12976,14 +12987,14 @@ decode_again:
 
     if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
-        should_canonicalize_tool_checkpoint(s, &parsed_calls))
+        should_canonicalize_tool_checkpoint(s, &j->req, &parsed_calls))
     {
         /* Chat/completions has no protocol object that binds the next request
-         * to this live KV state.  Canonicalize only the fallback tool-call
-         * path where we lack exact sampled DSML replay; when raw DSML is known,
-         * replaying those bytes keeps future prompts aligned without rebuilding
-         * hidden reasoning.  Responses deliberately skips this path because its
-         * previous_response_id contract binds the next turn to live state. */
+         * to this live KV state.  Normally exact sampled DSML replay is enough;
+         * GLM thinking/tool turns also canonicalize their tail because Pi's
+         * JSON replay can use different BPE segmentation for the same bytes.
+         * Responses deliberately skips this path because its previous_response_id
+         * contract binds the next turn to live state. */
         canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "",
                                      parsed_reasoning, &parsed_calls);
@@ -17178,15 +17189,23 @@ static void test_tool_checkpoint_canonicalization_gate_exact_replay(void) {
         "</｜DSML｜invoke>\n"
         DS4_TOOL_CALLS_END);
 
-    TEST_ASSERT(!should_canonicalize_tool_checkpoint(&s, &calls));
+    TEST_ASSERT(!should_canonicalize_tool_checkpoint(&s, NULL, &calls));
 
     s.disable_exact_dsml_tool_replay = true;
-    TEST_ASSERT(should_canonicalize_tool_checkpoint(&s, &calls));
+    TEST_ASSERT(should_canonicalize_tool_checkpoint(&s, NULL, &calls));
 
     s.disable_exact_dsml_tool_replay = false;
     free(calls.raw_tool_text);
     calls.raw_tool_text = NULL;
-    TEST_ASSERT(should_canonicalize_tool_checkpoint(&s, &calls));
+    TEST_ASSERT(should_canonicalize_tool_checkpoint(&s, NULL, &calls));
+
+    calls.raw_tool_text = xstrdup("<tool_call>bash</tool_call>");
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+    r.think_mode = DS4_THINK_HIGH;
+    TEST_ASSERT(should_canonicalize_tool_checkpoint(&s, &r, &calls));
+    request_free(&r);
 
     tool_calls_free(&calls);
 }
