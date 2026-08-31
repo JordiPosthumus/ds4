@@ -436,6 +436,9 @@ bool ds4_session_vision_state_matches(const ds4_session *s,
 /* True while a session contains, or is actively syncing, image-conditioned
  * state. Such state must not be written to the text-keyed disk KV cache. */
 bool ds4_session_has_vision_state(const ds4_session *s);
+/* Text-keyed disk payloads deliberately contain no image identity.  Once one
+ * replaces a session, discard image metadata left by the slot's prior owner. */
+void ds4_session_clear_text_restore_vision_state(ds4_session *s);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,

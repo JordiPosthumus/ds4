@@ -56331,6 +56331,17 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 #endif
 }
 
+void ds4_session_clear_text_restore_vision_state(ds4_session *s) {
+    if (!s) return;
+    /* Text-keyed disk payloads contain token/KV state but no image identities.
+     * Their restore therefore supersedes image metadata left by the slot's
+     * previous owner.  Keeping those fingerprints makes the next text-only
+     * sync reject the freshly restored checkpoint and cold-prefill from zero. */
+    free(s->checkpoint_images);
+    s->checkpoint_images = NULL;
+    s->checkpoint_image_count = 0;
+}
+
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");

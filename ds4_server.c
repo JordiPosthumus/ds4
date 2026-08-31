@@ -14804,13 +14804,126 @@ static void test_slot_probe_and_routing_scores(void) {
     TEST_ASSERT(slot_probe_reuse_locked(&s, &tslot, &txt.req).kind ==
                 REUSE_NONE);
 
+    /* 5. Multimodal reuse is bound to image identity, not just tokens/text.
+     * An exact fingerprint and span may reuse the live checkpoint; a changed
+     * or omitted image must not.  A new image is allowed only beyond the live
+     * frontier. */
+    ds4_vision_span image_a = {0};
+    image_a.token_start = 20;
+    image_a.embedding.token_count = 4;
+    memset(image_a.embedding.fingerprint, 0xa5,
+           sizeof(image_a.embedding.fingerprint));
+    ds4_vision_span image_b = image_a;
+    image_b.embedding.fingerprint[0] ^= 0xff;
+
+    server_slot vslot = {0};
+    vslot.last_used = now;
+    vslot.session = ds4_session_new_test_vision_checkpoint(
+        main_tok, 160, &image_a, 1);
+    TEST_ASSERT(vslot.session != NULL);
+    TEST_ASSERT(ds4_session_has_vision_state(vslot.session));
+    TEST_ASSERT(ds4_session_vision_prefix_matches(vslot.session, &image_a, 1));
+    TEST_ASSERT(ds4_session_vision_state_matches(vslot.session, &image_a, 1));
+    TEST_ASSERT(!ds4_session_vision_prefix_matches(vslot.session, &image_b, 1));
+    TEST_ASSERT(!ds4_session_vision_state_matches(vslot.session, &image_b, 1));
+    TEST_ASSERT(!ds4_session_vision_prefix_matches(vslot.session, NULL, 0));
+
+    job vision_ext = {0};
+    for (int i = 0; i < 160; i++)
+        ds4_tokens_push(&vision_ext.req.prompt, main_tok[i]);
+    ds4_tokens_push(&vision_ext.req.prompt, 9999);
+    vision_ext.req.images = &image_a;
+    vision_ext.req.image_count = 1;
+    pr = slot_probe_reuse_locked(&s, &vslot, &vision_ext.req);
+    TEST_ASSERT(pr.kind == REUSE_MEMORY_TOKEN);
+    TEST_ASSERT(pr.reuse_tokens == 160);
+    TEST_ASSERT(server_multimodal_resume_pos(vslot.session,
+                                             &vision_ext.req.prompt,
+                                             &image_a, 1) == 160);
+
+    vision_ext.req.images = &image_b;
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &vslot, &vision_ext.req).kind ==
+                REUSE_NONE);
+    TEST_ASSERT(server_multimodal_resume_pos(vslot.session,
+                                             &vision_ext.req.prompt,
+                                             &image_b, 1) == 0);
+
+    /* Pi may re-tokenize the same rendered history at a BPE boundary.  The
+     * memory-text tier can still retain the exact sampled tokens, but only
+     * with the same image fingerprint. */
+    vslot.live_text = (char *)"vision transcript";
+    vslot.live_text_len = strlen(vslot.live_text);
+    vslot.live_text_pos = 160;
+    job vision_text = {0};
+    for (int i = 0; i < 160; i++)
+        ds4_tokens_push(&vision_text.req.prompt, main_tok[i]);
+    vision_text.req.prompt.v[159] ^= 1; /* force token-prefix divergence */
+    vision_text.req.prompt_text = (char *)"vision transcript tool output";
+    vision_text.req.images = &image_a;
+    vision_text.req.image_count = 1;
+    pr = slot_probe_reuse_locked(&s, &vslot, &vision_text.req);
+    TEST_ASSERT(pr.kind == REUSE_MEMORY_TEXT);
+    TEST_ASSERT(pr.reuse_tokens == 160);
+    vision_text.req.images = &image_b;
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &vslot, &vision_text.req).kind ==
+                REUSE_NONE);
+    vslot.live_text = NULL;
+    vslot.live_text_len = 0;
+    vslot.live_text_pos = 0;
+
+    vision_ext.req.images = NULL;
+    vision_ext.req.image_count = 0;
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &vslot, &vision_ext.req).kind ==
+                REUSE_NONE);
+
+    ds4_vision_span appended = image_a;
+    appended.token_start = 160;
+    ds4_vision_span two_images[2] = {image_a, appended};
+    TEST_ASSERT(ds4_session_vision_prefix_matches(vslot.session,
+                                                  two_images, 2));
+    TEST_ASSERT(!ds4_session_vision_state_matches(vslot.session,
+                                                  two_images, 2));
+    appended.token_start = 159;
+    two_images[1] = appended;
+    TEST_ASSERT(!ds4_session_vision_prefix_matches(vslot.session,
+                                                   two_images, 2));
+
+    /* Defense in depth: even if a future caller forgets its multimodal guard,
+     * the disk writer itself refuses image-conditioned session state. */
+    TEST_ASSERT(!kv_cache_store_live_prefix_text(
+        &s, &vslot, ds4_session_tokens(vslot.session), 100, "test",
+        NULL, 0, NULL));
+
+    /* A text-only disk payload may replace an image-bearing slot.  The KV and
+     * token restore is valid, but stale image identity from the old request
+     * must not invalidate that freshly loaded checkpoint at sync time. */
+    TEST_ASSERT(!ds4_session_vision_prefix_matches(vslot.session, NULL, 0));
+    ds4_session_clear_text_restore_vision_state(vslot.session);
+    TEST_ASSERT(!ds4_session_has_vision_state(vslot.session));
+    TEST_ASSERT(ds4_session_vision_prefix_matches(vslot.session, NULL, 0));
+    TEST_ASSERT(ds4_session_common_prefix(vslot.session,
+                                          &vision_ext.req.prompt) == 160);
+    TEST_ASSERT(server_multimodal_resume_pos(vslot.session,
+                                             &vision_ext.req.prompt,
+                                             NULL, 0) == 160);
+
+    /* A text-only live checkpoint cannot be reused when an image appears
+     * inside its already-evaluated prefix. */
+    ds4_vision_span inserted = image_a;
+    inserted.token_start = 2;
+    TEST_ASSERT(!ds4_session_has_vision_state(tslot.session));
+    TEST_ASSERT(!ds4_session_vision_prefix_matches(tslot.session,
+                                                   &inserted, 1));
     ds4_session_free_test_checkpoint(tslot.session);
+    ds4_session_free_test_checkpoint(vslot.session);
     ds4_session_free_test_checkpoint(slots[0].session);
     ds4_session_free_test_checkpoint(slots[1].session);
     ds4_session_free_test_checkpoint(slots[2].session);
     ds4_tokens_free(&sub.req.prompt);
     ds4_tokens_free(&ext.req.prompt);
     ds4_tokens_free(&txt.req.prompt);
+    ds4_tokens_free(&vision_ext.req.prompt);
+    ds4_tokens_free(&vision_text.req.prompt);
 }
 
 /* Staleness tiers: a resident checkpoint idle past SLOT_STALE_AFTER_SEC is

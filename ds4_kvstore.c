@@ -1288,6 +1288,11 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     if (header_ok &&
         ds4_session_load_payload(session, fp, hdr.payload_bytes, err, sizeof(err)) == 0)
     {
+        /* Text-keyed disk entries never carry image identity.  The session may
+         * have belonged to an image-bearing request before this load; retain
+         * its stale fingerprints and ds4_session_sync() will invalidate the
+         * freshly restored text checkpoint and cold-prefill from token zero. */
+        ds4_session_clear_text_restore_vision_state(session);
         const ds4_tokens *loaded_tokens = ds4_session_tokens(session);
         if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens) {
             loaded = (int)hdr.tokens;
