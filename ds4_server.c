@@ -10322,6 +10322,15 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->inference_mu);
 }
 
+static bool kv_cache_should_discard_failed_disk_entry(
+        const char *path, int sync_rc, bool cancelled) {
+    /* A client disconnect or server shutdown interrupts otherwise valid
+     * suffix work.  It says nothing about the checkpoint that was already
+     * loaded and validated, so never unlink that reusable disk entry. */
+    return path && path[0] && !cancelled &&
+           sync_rc != DS4_SESSION_SYNC_INTERRUPTED;
+}
+
 static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
     if (!s || !slot) return;
     kv_disk_cache *kc = &s->kv;
@@ -10342,6 +10351,14 @@ static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
 }
 #endif
 
+static void kv_cache_slot_note_restore(server_slot *slot, int tokens) {
+    if (!slot) return;
+    /* A disk payload replaces the slot's checkpoint frontier.  This is an
+     * assignment, not max(): canonicalization may intentionally restore an
+     * older prefix than the state it replaces. */
+    slot->continued_last_store_tokens = tokens > 0 ? tokens : 0;
+}
+
 static int kv_cache_try_load_text(server *s, server_slot *slot,
                                   const char *prompt_text,
                                   ds4_tokens *effective_prompt,
@@ -10361,6 +10378,7 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
     if (loaded > 0) {
+        kv_cache_slot_note_restore(slot, loaded);
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
     }
@@ -10932,6 +10950,7 @@ typedef struct {
     double last_t;
     int last_current;
     bool seen;
+    bool frontier_lost;
     /* SSE keepalive during long prefill: send HTTP/SSE headers ahead of
      * generation and emit a `:` comment line every few seconds so HTTP/TCP
      * idle timeouts on the client side don't close the connection while the
@@ -11248,15 +11267,23 @@ static int server_session_sync(server *s, server_slot *slot,
         return rc;
     }
 
-    pthread_mutex_lock(&s->inference_mu);
-    int live = ds4_session_pos(slot->session);
-    int common = ds4_session_common_prefix(slot->session, prompt);
-    pthread_mutex_unlock(&s->inference_mu);
-    int done = common == live && prompt->len >= live ? live : 0;
+    int done = 0;
+    bool initialized = false;
     bool called = false;
 
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
            (!called || done < prompt->len)) {
+        /* Register with the round-robin scheduler before touching the global
+         * inference lock.  Reading the initial frontier through inference_mu
+         * first lets the current prefill reacquire that raw mutex every slice,
+         * starving this request without ever making it visible as waiting. */
+        if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
+        if (!initialized) {
+            const int live = ds4_session_pos(slot->session);
+            const int common = ds4_session_common_prefix(slot->session, prompt);
+            done = common == live && prompt->len >= live ? live : 0;
+            initialized = true;
+        }
         int quantum = server_prefill_quantum(s);
         int target = done + quantum;
         if (target > prompt->len || target < done) target = prompt->len;
@@ -11264,7 +11291,6 @@ static int server_session_sync(server *s, server_slot *slot,
 
         ds4_tokens prefix = *prompt;
         prefix.len = target;
-        if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
         int rc = ds4_session_sync(slot->session, &prefix, err, errlen);
         if (rc == 0) done = ds4_session_pos(slot->session);
         server_prefill_leave(s);
@@ -11316,16 +11342,19 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
         return rc;
     }
 
-    /* Start at the exact live frontier when both tokens and image identities
-     * match. Starting at zero made the first scheduling slice truncate a
-     * perfectly reusable long checkpoint, forcing a complete refill. */
-    pthread_mutex_lock(&s->inference_mu);
-    int done = server_multimodal_resume_pos(slot->session, prompt,
-                                            images, image_count);
-    pthread_mutex_unlock(&s->inference_mu);
+    int done = 0;
+    bool initialized = false;
     bool called = false;
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
            (!called || done < prompt->len)) {
+        /* As in the text path, join the scheduler before the first frontier
+         * read so an active prefill cannot starve this request on inference_mu. */
+        if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
+        if (!initialized) {
+            done = server_multimodal_resume_pos(slot->session, prompt,
+                                                images, image_count);
+            initialized = true;
+        }
         int quantum = server_prefill_quantum(s);
         int target = done + quantum;
         if (target > prompt->len || target < done) target = prompt->len;
@@ -11347,7 +11376,6 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
         }
         ds4_tokens prefix = *prompt;
         prefix.len = target;
-        if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
         int rc = ds4_session_sync_multimodal(slot->session, &prefix,
                                              images, prefix_images,
                                              err, errlen);
@@ -11475,30 +11503,49 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
         }
     }
     if (is_display) return;
+    /* Most backends report an absolute prompt position.  The legacy GLM TP
+     * token-prefill path reports suffix-relative progress instead; normalize
+     * that shape before cache accounting and display math. */
+    int progress_current = current;
+    const int suffix_total = p->prompt_tokens - p->cached_tokens;
+    if (p->cached_tokens > 0 && suffix_total >= 0 && total == suffix_total &&
+        current >= 0 && current <= total) {
+        progress_current += p->cached_tokens;
+    }
+
     double elapsed = now - p->t0;
-    if (p->seen && current == p->last_current) {
-        if (p->srv && p->slot && current > p->cached_tokens) {
+    if (p->seen && progress_current == p->last_current) {
+        if (p->srv && p->slot && progress_current > p->cached_tokens) {
             kv_cache_maybe_store_continued(p->srv, p->slot);
         }
         return;
     }
     int display_start = p->cached_tokens;
     if (display_start < 0 || display_start > p->prompt_tokens) display_start = 0;
+    if (display_start > 0 && progress_current < display_start) {
+        if (!p->frontier_lost) {
+            p->frontier_lost = true;
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: cache frontier lost ctx=%s cached=%d backend_current=%d backend_total=%d; showing cold progress",
+                       p->ctx, display_start, current, total);
+        }
+        display_start = 0;
+    }
     int display_total = p->prompt_tokens - display_start;
     if (display_total <= 0) {
         display_start = 0;
         display_total = p->prompt_tokens > total ? p->prompt_tokens : total;
     }
-    int display_current = current - display_start;
+    int display_current = progress_current - display_start;
     if (display_current < 0) display_current = 0;
     if (display_current > display_total) display_current = display_total;
     double pct = display_total > 0 ? 100.0 * (double)display_current / (double)display_total : 100.0;
     double avg_tps = elapsed > 0.0 ? (double)display_current / elapsed : 0.0;
-    int interval_tokens = p->seen ? current - p->last_current : 0;
+    int interval_tokens = p->seen ? progress_current - p->last_current : 0;
     if (interval_tokens < 0) interval_tokens = 0;
     double interval_s = p->seen ? now - p->last_t : 0.0;
     double chunk_tps = interval_s > 0.0 ? (double)interval_tokens / interval_s : 0.0;
-    p->last_current = current;
+    p->last_current = progress_current;
     p->last_t = now;
     p->seen = true;
     char flags[64];
@@ -11518,7 +11565,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                chunk_tps,
                avg_tps,
                elapsed);
-    if (p->srv && p->slot && current > p->cached_tokens) {
+    if (p->srv && p->slot && progress_current > p->cached_tokens) {
         kv_cache_maybe_store_continued(p->srv, p->slot);
     }
 }
@@ -12387,14 +12434,18 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                        err, sizeof(err)) :
         server_session_sync(s, slot, prompt_for_sync, err, sizeof(err));
     if (prompt_sync_rc != 0) {
+        const bool cancelled = job_cancelled(j);
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(slot->session, NULL, NULL);
         ds4_session_set_display_progress(slot->session, NULL, NULL);
         kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                          cold_store_len);
-        kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+        if (kv_cache_should_discard_failed_disk_entry(
+                disk_cache_path, prompt_sync_rc, cancelled)) {
+            kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+        }
         free(disk_cache_path);
-        if (job_cancelled(j)) {
+        if (cancelled) {
             request_live_state_clear(s, slot);
             trace_event(s, trace_id, "cancelled during prefill");
             return;
@@ -18793,6 +18844,44 @@ static void test_cancelled_progress_callback_is_inert(void) {
     test_cancel_job_destroy(&j);
 }
 
+static void test_prefill_progress_cache_coordinates(void) {
+    job j;
+    test_cancel_job_init(&j);
+
+    server_prefill_progress relative = {
+        .request_job = &j,
+        .prompt_tokens = 100,
+        .cached_tokens = 80,
+        .t0 = now_sec(),
+    };
+    server_progress_cb(&relative, "prefill_chunk", 8, 20);
+    TEST_ASSERT(relative.seen);
+    TEST_ASSERT(relative.last_current == 88);
+    TEST_ASSERT(!relative.frontier_lost);
+
+    server_prefill_progress regressed = {
+        .request_job = &j,
+        .prompt_tokens = 100,
+        .cached_tokens = 80,
+        .t0 = now_sec(),
+    };
+    server_progress_cb(&regressed, "prefill_chunk", 16, 16);
+    TEST_ASSERT(regressed.seen);
+    TEST_ASSERT(regressed.last_current == 16);
+    TEST_ASSERT(regressed.frontier_lost);
+
+    test_cancel_job_destroy(&j);
+}
+
+static void test_disk_cache_interruption_keeps_valid_entry(void) {
+    const char *path = "/tmp/validated-checkpoint.kv";
+    TEST_ASSERT(!kv_cache_should_discard_failed_disk_entry(
+        path, DS4_SESSION_SYNC_INTERRUPTED, false));
+    TEST_ASSERT(!kv_cache_should_discard_failed_disk_entry(path, 1, true));
+    TEST_ASSERT(kv_cache_should_discard_failed_disk_entry(path, 1, false));
+    TEST_ASSERT(!kv_cache_should_discard_failed_disk_entry(NULL, 1, false));
+}
+
 static void test_cancel_server_init(server *s) {
     memset(s, 0, sizeof(*s));
     pthread_mutex_init(&s->mu, NULL);
@@ -19184,6 +19273,22 @@ static void test_kv_cache_continued_crosses_interval_frontiers(void) {
     kc.continued_last_store_tokens = 65536;
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 81919) == 0);
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 81920) == 81920);
+
+    /* A successful disk restore must seed the server slot's independent
+     * frontier too.  Otherwise a 33,196-token hit immediately rewrites a huge
+     * checkpoint after only one 1,024-token scheduling slice. */
+    server s = {0};
+    s.kv.enabled = true;
+    s.kv.opt = kv_cache_default_options();
+    s.kv.opt.continued_interval_tokens = 16384;
+    s.kv.opt.boundary_align_tokens = 2048;
+    server_slot slot = {0};
+    slot.continued_last_store_tokens = 90000;
+    kv_cache_slot_note_restore(&slot, 33196);
+    TEST_ASSERT(slot.continued_last_store_tokens == 33196);
+    TEST_ASSERT(kv_cache_slot_continued_target(&s, &slot, 34220) == 0);
+    TEST_ASSERT(kv_cache_slot_continued_target(&s, &slot, 49151) == 0);
+    TEST_ASSERT(kv_cache_slot_continued_target(&s, &slot, 49152) == 49152);
 }
 
 static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void) {
@@ -20361,6 +20466,8 @@ static void ds4_server_unit_tests_run(void) {
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
     test_cancelled_progress_callback_is_inert();
+    test_prefill_progress_cache_coordinates();
+    test_disk_cache_interruption_keeps_valid_entry();
     test_waiting_job_cancels_on_client_close();
     test_cancel_unlinks_queued_jobs();
     test_cancel_detaches_assigned_job();
