@@ -2834,17 +2834,12 @@ static void append_dsml_tool_calls_text(buf *b, const tool_calls *calls) {
 static void append_glm_tool_calls_text(buf *b, const tool_calls *calls,
                                        const tool_schema_orders *tool_orders) {
     if (!calls || calls->len == 0) return;
-    /* GLM emits each tool block on its own line, so the sampled stream has a
-     * newline between the visible assistant text and the first block.  The
-     * raw sampled DSML does not carry that newline and the replayed assistant
-     * content is trimmed, so restore exactly one separator here.  Without it
-     * the replayed prompt diverges from the sampled bytes at one token and
-     * every thinking+tool turn drops the whole live KV prefix.  A buffer that
-     * already ends in a newline (the tool checkpoint canonicalizer keeps the
-     * parsed trailing newline) must not gain a second one. */
-    if (b->len && b->ptr[b->len - 1] != '\n') {
-        const char *raw = calls->raw_tool_text;
-        if (!raw || !raw[0] || raw[0] != '\n') buf_putc(b, '\n');
+    /* GLM emits each tool block on its own line.  Preserve a separator already
+     * retained in the content or raw block; otherwise restore one newline. */
+    const char *raw = calls->raw_tool_text;
+    if ((!b->len || b->ptr[b->len - 1] != '\n') &&
+        (!raw || !raw[0] || raw[0] != '\n')) {
+        buf_putc(b, '\n');
     }
     if (calls->raw_tool_text && calls->raw_tool_text[0]) {
         buf_puts(b, calls->raw_tool_text);
@@ -9119,9 +9114,9 @@ struct server {
     ds4_tp *tp_leader;
     server_slot *slots;
     int slot_count;
-    /* Resident KV capacity and compute concurrency are intentionally
+    /* Resident slot allocation and compute concurrency are intentionally
      * independent.  busy covers both assigned and running jobs, so this cap
-     * serializes complete requests without discarding idle checkpoints. */
+     * serializes complete requests.  Slot selection is unchanged. */
     int max_active_requests;
     int ctx_size;
     bool batched_mode;
@@ -11052,6 +11047,15 @@ static int speculative_tail_rewind_target(int block_start, int block_tokens,
     return block_start + consumed_tokens;
 }
 
+static bool speculative_tail_rewind_supported(bool glm_dsa,
+                                              int block_tokens,
+                                              int consumed_tokens) {
+    /* The backend can reconstruct a complete frontier only for the observed
+     * GLM-5.3 two-token case with its first token retained.  Other partial
+     * blocks must invalidate instead of claiming a successful rewind. */
+    return glm_dsa && block_tokens == 2 && consumed_tokens == 1;
+}
+
 typedef struct {
     bool inside;
     char tail[8]; /* Long enough for "</think>". */
@@ -11744,20 +11748,16 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
     const int common = ds4_session_common_prefix(slot->session, &canonical);
     if (common == live_len && canonical.len == live_len) goto done;
 
-    const bool force_glm_thinking_tool_canonicalization =
-        j->req.model_syntax == SERVER_MODEL_SYNTAX_GLM &&
-        ds4_think_mode_enabled(j->req.think_mode);
     size_t live_text_len = 0;
     char *live_text = render_tokens_text(s->engine,
                                          ds4_session_tokens(slot->session),
                                          &live_text_len);
-    if (!force_glm_thinking_tool_canonicalization &&
-        live_text_len == rendered.len &&
+    if (live_text_len == rendered.len &&
         (live_text_len == 0 || memcmp(live_text, rendered.ptr, live_text_len) == 0))
     {
-        /* Outside GLM thinking/tool replay, the graph already represents the
-         * bytes the next request will render.  Re-tokenizing would only swap
-         * a valid sampled history for another BPE spelling of the same text. */
+        /* The graph already represents the bytes the next request will render.
+         * Re-tokenizing would only swap a valid sampled history for another
+         * BPE spelling of the same text. */
         free(live_text);
         goto done;
     }
@@ -11810,6 +11810,7 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
             pthread_mutex_lock(&s->inference_mu);
             ds4_session_invalidate(slot->session);
             pthread_mutex_unlock(&s->inference_mu);
+            kv_cache_slot_note_restore(slot, 0);
         }
 
         char sync_err[160] = {0};
@@ -11904,15 +11905,9 @@ done:
     free(suffix_text);
 }
 
-static bool should_canonicalize_tool_checkpoint(const server *s, const request *r,
+static bool should_canonicalize_tool_checkpoint(const server *s,
                                                 const tool_calls *calls) {
     if (!calls || calls->len == 0) return false;
-    /* Pi replays GLM thinking/tool turns through JSON.  The replay text can be
-     * byte-identical to the sampled output yet tokenize differently at the
-     * reasoning/tool boundary, so retain the exact DSML but canonicalize the
-     * live token tail to the client's rendering. */
-    if (r && r->model_syntax == SERVER_MODEL_SYNTAX_GLM &&
-        ds4_think_mode_enabled(r->think_mode)) return true;
     if (s && !s->disable_exact_dsml_tool_replay &&
         calls->raw_tool_text && calls->raw_tool_text[0])
     {
@@ -12906,17 +12901,35 @@ decode_again:
         const int tail_rewind_to = speculative_tail_rewind_target(
             block_start, ntok, block_consumed, block_checkpoint_preserved);
         if (tail_rewind_to >= 0) {
+            bool frontier_restored = false;
             pthread_mutex_lock(&s->inference_mu);
-            ds4_session_rewind(slot->session, tail_rewind_to);
+            if (speculative_tail_rewind_supported(
+                    ds4_engine_is_glm_dsa(s->engine), ntok, block_consumed)) {
+                ds4_session_rewind(slot->session, tail_rewind_to);
+                frontier_restored =
+                    ds4_session_checkpoint_valid(slot->session) &&
+                    ds4_session_pos(slot->session) == tail_rewind_to;
+            }
+            if (!frontier_restored) ds4_session_invalidate(slot->session);
             pthread_mutex_unlock(&s->inference_mu);
-            server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: discarded %d unused speculative tail token%s at generation boundary; rewound live checkpoint to %d",
-                       ntok - block_consumed,
-                       ntok - block_consumed == 1 ? "" : "s",
-                       tail_rewind_to);
-            trace_event(s, trace_id,
-                        "discarded %d unused speculative tail tokens; rewound live checkpoint to %d",
-                        ntok - block_consumed, tail_rewind_to);
+            if (frontier_restored) {
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: discarded %d unused speculative tail token%s at generation boundary; rewound live checkpoint to %d",
+                           ntok - block_consumed,
+                           ntok - block_consumed == 1 ? "" : "s",
+                           tail_rewind_to);
+                trace_event(s, trace_id,
+                            "discarded %d unused speculative tail tokens; rewound live checkpoint to %d",
+                            ntok - block_consumed, tail_rewind_to);
+            } else {
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: discarded %d unused speculative tail token%s at generation boundary; exact rewind unavailable, invalidated live checkpoint",
+                           ntok - block_consumed,
+                           ntok - block_consumed == 1 ? "" : "s");
+                trace_event(s, trace_id,
+                            "discarded %d unused speculative tail tokens; exact rewind unavailable, invalidated live checkpoint",
+                            ntok - block_consumed);
+            }
         }
         if (stop_decode) break;
     }
@@ -13230,14 +13243,12 @@ decode_again:
 
     if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
-        should_canonicalize_tool_checkpoint(s, &j->req, &parsed_calls))
+        should_canonicalize_tool_checkpoint(s, &parsed_calls))
     {
         /* Chat/completions has no protocol object that binds the next request
-         * to this live KV state.  Normally exact sampled DSML replay is enough;
-         * GLM thinking/tool turns also canonicalize their tail because Pi's
-         * JSON replay can use different BPE segmentation for the same bytes.
-         * Responses deliberately skips this path because its previous_response_id
-         * contract binds the next turn to live state. */
+         * to this live KV state.  Canonicalize only the fallback tool-call
+         * path where exact sampled replay is unavailable.  Responses skips
+         * this path because previous_response_id binds the next turn. */
         canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "",
                                      parsed_reasoning, &parsed_calls);
@@ -17079,56 +17090,61 @@ static void test_render_glm_preserves_reasoning_with_tools(void) {
 }
 
 static void test_glm_raw_tool_call_keeps_sampled_line_separator(void) {
-    /* Regression: the sampled thinking+tool turn renders the exact raw tool
-     * block on its own line, i.e. one newline between the visible assistant
-     * text and the first block.  The replay trims the assistant content and
-     * carries the exact raw block back through the remembered tool id, so
-     * the renderer must restore exactly that separator.  Without it the
-     * replayed prompt diverges from the sampled bytes at one token and every
-     * thinking+tool turn drops the whole live KV prefix. */
-    chat_msgs msgs = {0};
-    chat_msg user = {0};
-    user.role = xstrdup("user");
-    user.content = xstrdup("Run it");
-    chat_msgs_push(&msgs, user);
-    chat_msg asst = {0};
-    asst.role = xstrdup("assistant");
-    asst.reasoning = xstrdup("thinking");
-    asst.content = xstrdup("Visible text:");
-    tool_call tc = {0};
-    tc.id = xstrdup("call_1");
-    tc.name = xstrdup("bash");
-    tc.arguments = xstrdup("{\"command\":\"pwd\"}");
-    tool_calls_push(&asst.calls, tc);
-    asst.calls.raw_tool_text = xstrdup("<|tool" "_call|bash<arg_key>command</arg_key>"
-                                       "<arg_value>pwd</arg_value>"
-                                       "</|tool" "_call|>");
-    chat_msgs_push(&msgs, asst);
-
-    tool_schema_orders orders = make_bash_order();
-    char *prompt = render_chat_prompt_text_for_syntax(
-        SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, &orders, DS4_THINK_HIGH);
-    TEST_ASSERT(prompt != NULL);
-    /* Trimmed replay content + raw block: exactly one separator newline. */
-    TEST_ASSERT(strstr(prompt, "Visible text:\n<|tool" "_call|bash") != NULL);
-    TEST_ASSERT(strstr(prompt, "Visible text:\n\n<|tool" "_call|") == NULL);
-    free(prompt);
-
-    /* The canonical tool checkpoint keeps the parsed trailing newline in the
-     * content; it must not gain a second separator. */
+    const char *block =
+        "<tool_call>bash<arg_key>command</arg_key>"
+        "<arg_value>pwd</arg_value></tool_call>";
+    const char *generated[] = {
+        "thinking</think>Visible text:\n"
+        "<tool_call>bash<arg_key>command</arg_key>"
+        "<arg_value>pwd</arg_value></tool_call>",
+        "thinking</think>Visible text:\n\n"
+        "<tool_call>bash<arg_key>command</arg_key>"
+        "<arg_value>pwd</arg_value></tool_call>",
+    };
     request r;
     request_init(&r, REQ_CHAT, 128);
     r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
     r.think_mode = DS4_THINK_HIGH;
-    char *suffix = build_tool_checkpoint_suffix(&r, "Visible text:\n", "thinking",
-                                                &asst.calls);
-    TEST_ASSERT(suffix != NULL);
-    TEST_ASSERT(strstr(suffix, "Visible text:\n<|tool" "_call|bash") != NULL);
-    TEST_ASSERT(strstr(suffix, "Visible text:\n\n<|tool" "_call|") == NULL);
-    free(suffix);
+    for (size_t i = 0; i < sizeof(generated) / sizeof(generated[0]); i++) {
+        char *content = NULL;
+        char *reasoning = NULL;
+        tool_calls calls = {0};
+        TEST_ASSERT(parse_generated_message_ex_for_syntax(
+            SERVER_MODEL_SYNTAX_GLM, generated[i], false,
+            &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        char *suffix = build_tool_checkpoint_suffix(
+            &r, content, reasoning, &calls);
+        TEST_ASSERT(suffix != NULL);
+        TEST_ASSERT(!strcmp(suffix, generated[i]));
+        free(suffix);
+        free(content);
+        free(reasoning);
+        tool_calls_free(&calls);
+    }
     request_free(&r);
-    tool_schema_orders_free(&orders);
-    chat_msgs_free(&msgs);
+
+    /* Tool-only non-thinking suffix builders begin with an empty buffer. */
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\":\"pwd\"}");
+    tool_calls_push(&calls, tc);
+    calls.raw_tool_text = xstrdup(block);
+    request_init(&r, REQ_CHAT, 128);
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+    r.think_mode = DS4_THINK_NONE;
+    char *checkpoint = build_tool_checkpoint_suffix(&r, "", NULL, &calls);
+    char *visible = build_responses_visible_assistant_suffix(
+        &r, "", NULL, &calls);
+    TEST_ASSERT(checkpoint && checkpoint[0] == '\n');
+    TEST_ASSERT(visible && visible[0] == '\n');
+    TEST_ASSERT(!strcmp(checkpoint + 1, block));
+    TEST_ASSERT(!strcmp(visible + 1, block));
+    free(checkpoint);
+    free(visible);
+    request_free(&r);
+    tool_calls_free(&calls);
 }
 
 static void test_render_glm_groups_tool_results(void) {
@@ -18186,23 +18202,15 @@ static void test_tool_checkpoint_canonicalization_gate_exact_replay(void) {
         "</｜DSML｜invoke>\n"
         DS4_TOOL_CALLS_END);
 
-    TEST_ASSERT(!should_canonicalize_tool_checkpoint(&s, NULL, &calls));
+    TEST_ASSERT(!should_canonicalize_tool_checkpoint(&s, &calls));
 
     s.disable_exact_dsml_tool_replay = true;
-    TEST_ASSERT(should_canonicalize_tool_checkpoint(&s, NULL, &calls));
+    TEST_ASSERT(should_canonicalize_tool_checkpoint(&s, &calls));
 
     s.disable_exact_dsml_tool_replay = false;
     free(calls.raw_tool_text);
     calls.raw_tool_text = NULL;
-    TEST_ASSERT(should_canonicalize_tool_checkpoint(&s, NULL, &calls));
-
-    calls.raw_tool_text = xstrdup("<tool_call>bash</tool_call>");
-    request r;
-    request_init(&r, REQ_CHAT, 128);
-    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
-    r.think_mode = DS4_THINK_HIGH;
-    TEST_ASSERT(should_canonicalize_tool_checkpoint(&s, &r, &calls));
-    request_free(&r);
+    TEST_ASSERT(should_canonicalize_tool_checkpoint(&s, &calls));
 
     tool_calls_free(&calls);
 }
@@ -18928,6 +18936,11 @@ static void test_speculative_tail_rewind_target(void) {
     TEST_ASSERT(speculative_tail_rewind_target(119453, 2, 1, false) == -1);
     TEST_ASSERT(speculative_tail_rewind_target(-1, 2, 1, true) == -1);
     TEST_ASSERT(speculative_tail_rewind_target(119453, 2, -1, true) == -1);
+
+    TEST_ASSERT(speculative_tail_rewind_supported(true, 2, 1));
+    TEST_ASSERT(!speculative_tail_rewind_supported(true, 2, 0));
+    TEST_ASSERT(!speculative_tail_rewind_supported(true, 3, 1));
+    TEST_ASSERT(!speculative_tail_rewind_supported(false, 2, 1));
 }
 
 static void test_client_socket_nonblocking_flag(void) {
@@ -19447,6 +19460,13 @@ static void test_kv_cache_continued_crosses_interval_frontiers(void) {
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 81919) == 0);
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 81920) == 81920);
 
+    kc.opt.continued_interval_tokens = INT_MAX;
+    kc.opt.boundary_align_tokens = 2;
+    kc.continued_last_store_tokens = 0;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, INT_MAX) == 0);
+    kc.opt.boundary_align_tokens = 1;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, INT_MAX) == INT_MAX);
+
     /* A successful disk restore must seed the server slot's independent
      * frontier too.  Otherwise a 33,196-token hit immediately rewrites a huge
      * checkpoint after only one 1,024-token scheduling slice. */
@@ -19462,6 +19482,9 @@ static void test_kv_cache_continued_crosses_interval_frontiers(void) {
     TEST_ASSERT(kv_cache_slot_continued_target(&s, &slot, 34220) == 0);
     TEST_ASSERT(kv_cache_slot_continued_target(&s, &slot, 49151) == 0);
     TEST_ASSERT(kv_cache_slot_continued_target(&s, &slot, 49152) == 49152);
+
+    kv_cache_slot_note_restore(&slot, 0);
+    TEST_ASSERT(slot.continued_last_store_tokens == 0);
 }
 
 static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void) {
