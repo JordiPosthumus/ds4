@@ -11031,6 +11031,15 @@ static void log_decode_progress(req_kind kind, int prompt_tokens, int completion
     *last_completion = completion;
 }
 
+/* Session-batched serving owns decode through the batch worker.  Until that
+ * worker can restore every partially consumed DeepSeek speculative prefix,
+ * keep speculation on the non-batched path only.  In particular,
+ * --max-active-requests 1 serializes requests but does not change this KV
+ * ownership rule. */
+static bool server_direct_speculation_allowed(const server *s) {
+    return s && !s->batched_mode;
+}
+
 /* A speculative eval commits the whole returned block to the backend before
  * the server examines individual tokens.  If a stop marker, completed tool
  * call, cancellation, or output limit consumes only the front of that block,
@@ -12676,7 +12685,7 @@ decode_again:
         int toks[17];
         int ntok = 0;
         const int block_start = ds4_session_pos(slot->session);
-        if (!s->batched_mode &&
+        if (server_direct_speculation_allowed(s) &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
@@ -15437,6 +15446,98 @@ static void test_dispatch_respects_active_request_limit(void) {
 
     pthread_mutex_destroy(&s.tool_mu);
     pthread_cond_destroy(&s.cv);
+}
+
+static void test_ten_resident_continuations_keep_their_slots(void) {
+    enum { NSLOT = 10, NROUND = 3, MAXTOK = 8 };
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    pthread_cond_init(&s.cv, NULL);
+    s.batched_mode = true;
+    s.max_active_requests = 1;
+    server_slot slots[NSLOT] = {0};
+    int tokens[NSLOT][MAXTOK] = {{0}};
+    int lens[NSLOT] = {0};
+    s.slots = slots;
+    s.slot_count = NSLOT;
+
+    for (int i = 0; i < NSLOT; i++) {
+        slots[i].id = i;
+        tokens[i][0] = 100;       /* Shared system/tool prefix. */
+        tokens[i][1] = 1000 + i;  /* Conversation identity. */
+        tokens[i][2] = 2000 + i;
+        lens[i] = 3;
+        slots[i].session =
+            ds4_session_new_test_checkpoint(tokens[i], lens[i]);
+        slots[i].last_used = time(NULL);
+    }
+
+    for (int round = 0; round < NROUND; round++) {
+        for (int target = 0; target < NSLOT; target++) {
+            job j = {0};
+            int before[NSLOT];
+            for (int i = 0; i < NSLOT; i++) {
+                before[i] = ds4_session_pos(slots[i].session);
+            }
+            for (int i = 0; i < lens[target]; i++) {
+                ds4_tokens_push(&j.req.prompt, tokens[target][i]);
+            }
+            const int extension = 3000 + round * NSLOT + target;
+            ds4_tokens_push(&j.req.prompt, extension);
+            s.head = s.tail = &j;
+
+            dispatch_jobs_locked(&s);
+
+            TEST_ASSERT(slots[target].assigned == &j);
+            TEST_ASSERT(slots[target].busy);
+            TEST_ASSERT(s.head == NULL);
+            TEST_ASSERT(active_request_count_locked(&s) == 1);
+            for (int i = 0; i < NSLOT; i++) {
+                if (i == target) continue;
+                TEST_ASSERT(slots[i].assigned == NULL);
+                TEST_ASSERT(!slots[i].busy);
+                TEST_ASSERT(ds4_session_checkpoint_valid(slots[i].session));
+                TEST_ASSERT(ds4_session_pos(slots[i].session) == before[i]);
+            }
+
+            /* Model a successful warm continuation before releasing the sole
+             * active-request permit.  The next rounds must still bind every
+             * conversation to the same resident checkpoint. */
+            tokens[target][lens[target]++] = extension;
+            ds4_session_free_test_checkpoint(slots[target].session);
+            slots[target].session = ds4_session_new_test_checkpoint(
+                tokens[target], lens[target]);
+            slots[target].assigned = NULL;
+            slots[target].busy = false;
+            slots[target].last_used = time(NULL);
+            request_free(&j.req);
+        }
+    }
+
+    for (int i = 0; i < NSLOT; i++) {
+        TEST_ASSERT(ds4_session_checkpoint_valid(slots[i].session));
+        TEST_ASSERT(ds4_session_pos(slots[i].session) == 3 + NROUND);
+        ds4_session_free_test_checkpoint(slots[i].session);
+    }
+    pthread_mutex_destroy(&s.tool_mu);
+    pthread_cond_destroy(&s.cv);
+}
+
+static void test_batched_cache_capacity_does_not_enable_speculation(void) {
+    server s = {0};
+    TEST_ASSERT(server_direct_speculation_allowed(&s));
+
+    s.batched_mode = true;
+    s.slot_count = 10;
+    s.max_active_requests = 1;
+    TEST_ASSERT(!server_direct_speculation_allowed(&s));
+
+    /* Neither reducing resident capacity nor serializing compute makes the
+     * session-batched decode worker own arbitrary speculative-prefix rewind. */
+    s.slot_count = 1;
+    TEST_ASSERT(!server_direct_speculation_allowed(&s));
+    s.max_active_requests = 10;
+    TEST_ASSERT(!server_direct_speculation_allowed(&s));
 }
 
 static void test_multimodal_prefill_resume_frontier(void) {
@@ -20562,6 +20663,8 @@ static void ds4_server_unit_tests_run(void) {
     test_slot_routing_staleness_tiers();
     test_dispatch_routes_alien_request_to_empty_slot();
     test_dispatch_respects_active_request_limit();
+    test_ten_resident_continuations_keep_their_slots();
+    test_batched_cache_capacity_does_not_enable_speculation();
     test_request_defaults_use_min_p_filtering();
     test_chat_ignore_eos_contract();
     test_reasoning_effort_mapping();
