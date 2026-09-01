@@ -21101,9 +21101,10 @@ int ds4_gpu_dsv4_qkv_rms_norm_kv_rope_fp8_store_tensor(
         float                 beta_slow,
         float                 eps) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    const NSUInteger nth = ds4_gpu_rms_norm_threads(q_n);
     if (!q_out || !q || !kv_out || !kv || !raw_cache ||
         q_n == 0 || kv_n == 0 || (q_n & 3u) != 0 || (kv_n & 3u) != 0 ||
-        n_rot > kv_n || (n_rot & 1u) != 0) {
+        n_rot > kv_n || (n_rot & 1u) != 0 || nth < 64u) {
         return 0;
     }
 
@@ -21197,7 +21198,7 @@ int ds4_gpu_dsv4_qkv_rms_norm_kv_rope_fp8_store_tensor(
         [enc setBuffer:rawbuf offset:ds4_gpu_tensor_offset(raw_cache) atIndex:9];
         [enc setThreadgroupMemoryLength:(32u + 64u) * sizeof(float) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(1, 2, 1)
-             threadsPerThreadgroup:MTLSizeMake(ds4_gpu_rms_norm_threads(q_n), 1, 1)];
+             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "fused q/kv norm RoPE store")) return 0;
