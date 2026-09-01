@@ -10477,15 +10477,27 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
     if (!s || !slot || !slot->session || !req) return pr;
     if (!ds4_session_checkpoint_valid(slot->session)) return pr;
     /* Tokens, rendered text, and protocol IDs are not sufficient keys for
-     * image-conditioned KV.  Every live-reuse tier must prove the same image
-     * spans and embedding fingerprints before it can bind to this slot. */
-    if (!ds4_session_vision_state_matches(slot->session,
-                                          req->images, req->image_count)) {
-        return pr;
-    }
+     * image-conditioned KV.  Reconstruction and rewind tiers require an exact
+     * image-state match.  The one safe exception is an exact token extension
+     * whose old images still match and whose first new image begins at or
+     * beyond the live frontier. */
+    const bool vision_exact = ds4_session_vision_state_matches(
+        slot->session, req->images, req->image_count);
+    const bool vision_prefix = ds4_session_vision_prefix_matches(
+        slot->session, req->images, req->image_count);
+    if (!vision_prefix) return pr;
     const ds4_tokens *live = ds4_session_tokens(slot->session);
     if (!live || live->len <= 0) return pr;
     const int live_pos = live->len;
+    if (!vision_exact) {
+        const int common =
+            ds4_session_common_prefix(slot->session, &req->prompt);
+        if (common == live_pos && req->prompt.len >= live_pos) {
+            pr.kind = REUSE_MEMORY_TOKEN;
+            pr.reuse_tokens = common;
+        }
+        return pr;
+    }
     const char *ptext = req->prompt_text;
     const size_t plen = ptext ? strlen(ptext) : 0;
 
@@ -11308,8 +11320,8 @@ static int server_session_sync(server *s, server_slot *slot,
 
 static int server_multimodal_resume_frontier(int live, int common,
                                              int prompt_len,
-                                             bool image_state_matches) {
-    return common == live && prompt_len >= live && image_state_matches
+                                             bool image_prefix_matches) {
+    return common == live && prompt_len >= live && image_prefix_matches
            ? live : 0;
 }
 
@@ -11322,7 +11334,7 @@ static int server_multimodal_resume_pos(ds4_session *session,
     const int common = ds4_session_common_prefix(session, prompt);
     return server_multimodal_resume_frontier(
         live, common, prompt->len,
-        ds4_session_vision_state_matches(session, images, image_count));
+        ds4_session_vision_prefix_matches(session, images, image_count));
 }
 
 static int server_session_sync_multimodal(server *s, server_slot *slot,
@@ -12125,9 +12137,12 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     pthread_mutex_lock(&s->inference_mu);
     const int old_pos = ds4_session_pos(slot->session);
     const int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
-    const bool live_vision_match =
+    const bool live_vision_exact_match =
         ds4_session_vision_state_matches(slot->session,
                                          j->req.images, j->req.image_count);
+    const bool live_vision_prefix_match =
+        ds4_session_vision_prefix_matches(slot->session,
+                                          j->req.images, j->req.image_count);
     pthread_mutex_unlock(&s->inference_mu);
     trace_cache_diag cache_diag = {0};
     trace_cache_capture(&cache_diag, ds4_session_tokens(slot->session),
@@ -12218,12 +12233,26 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     case REUSE_MEMORY_REWIND:
         pthread_mutex_lock(&s->inference_mu);
         ds4_session_rewind(slot->session, reuse.reuse_tokens);
+        const bool rewind_valid =
+            ds4_session_common_prefix(slot->session, &j->req.prompt) ==
+                reuse.reuse_tokens &&
+            (!multimodal ||
+             ds4_session_vision_state_matches(slot->session,
+                                              j->req.images,
+                                              j->req.image_count));
         pthread_mutex_unlock(&s->inference_mu);
-        cache_source = "memory-rewind";
-        cache_diag.rewind_to = reuse.reuse_tokens;
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
-                   old_pos, reuse.reuse_tokens);
+        if (rewind_valid) {
+            cache_source = "memory-rewind";
+            cache_diag.rewind_to = reuse.reuse_tokens;
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
+                       old_pos, reuse.reuse_tokens);
+        } else {
+            cached = 0;
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: GLM live prefix rewind from %d to %d requires rebuild",
+                       old_pos, reuse.reuse_tokens);
+        }
         break;
     case REUSE_MEMORY_TOKEN:
         cache_source = "memory-token";
@@ -12256,13 +12285,16 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d vision=%s reason=%s",
                    responses_protocol ? " RESPPROTO" : "",
                    old_pos, j->req.prompt.len, common,
-                   live_vision_match ? "match" : "mismatch",
+                   live_vision_exact_match ? "exact-match" :
+                   live_vision_prefix_match ? "prefix-match" : "mismatch",
                    trace_cache_miss_reason(&cache_diag));
     }
     if (multimodal && cached > 0) {
         server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: multimodal live kv hit images=%zu cached=%d prompt=%d identity=fingerprint-match",
-                   j->req.image_count, cached, prompt_for_sync->len);
+                   "ds4-server: multimodal live kv hit images=%zu cached=%d prompt=%d identity=%s",
+                   j->req.image_count, cached, prompt_for_sync->len,
+                   live_vision_exact_match ? "fingerprint-exact-match" :
+                                             "fingerprint-prefix-match");
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
     if (!multimodal && s->kv.enabled && cached == 0 &&
@@ -14934,6 +14966,37 @@ static void test_slot_probe_and_routing_scores(void) {
                                                   two_images, 2));
     TEST_ASSERT(!ds4_session_vision_state_matches(vslot.session,
                                                   two_images, 2));
+    vision_ext.req.images = two_images;
+    vision_ext.req.image_count = 2;
+    pr = slot_probe_reuse_locked(&s, &vslot, &vision_ext.req);
+    TEST_ASSERT(pr.kind == REUSE_MEMORY_TOKEN);
+    TEST_ASSERT(pr.reuse_tokens == 160);
+    TEST_ASSERT(server_multimodal_resume_pos(vslot.session,
+                                             &vision_ext.req.prompt,
+                                             two_images, 2) == 160);
+
+    /* Prefix image identity alone is not enough: the prompt itself must
+     * extend every live token exactly. */
+    vision_ext.req.prompt.v[159] ^= 1;
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &vslot, &vision_ext.req).kind ==
+                REUSE_NONE);
+    TEST_ASSERT(server_multimodal_resume_pos(vslot.session,
+                                             &vision_ext.req.prompt,
+                                             two_images, 2) == 0);
+    vision_ext.req.prompt.v[159] ^= 1;
+
+    /* Removing, moving, or replacing an old image remains unsafe. */
+    TEST_ASSERT(!ds4_session_vision_prefix_matches(vslot.session, NULL, 0));
+    two_images[0].token_start++;
+    TEST_ASSERT(!ds4_session_vision_prefix_matches(vslot.session,
+                                                   two_images, 2));
+    two_images[0] = image_a;
+    two_images[0].embedding.fingerprint[0] ^= 0xff;
+    TEST_ASSERT(!ds4_session_vision_prefix_matches(vslot.session,
+                                                   two_images, 2));
+    two_images[0] = image_a;
+
+    /* A nominally new image inserted into already-computed tokens is unsafe. */
     appended.token_start = 159;
     two_images[1] = appended;
     TEST_ASSERT(!ds4_session_vision_prefix_matches(vslot.session,
