@@ -65916,7 +65916,7 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
  */
 static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
 
-static bool ds4_session_vision_prefix_matches(
+bool ds4_session_vision_prefix_matches(
         const ds4_session     *s,
         const ds4_vision_span *images,
         size_t                 image_count) {
@@ -74535,9 +74535,29 @@ ds4_session *ds4_session_new_test_checkpoint(const int *tokens, int n) {
     return s;
 }
 
+ds4_session *ds4_session_new_test_vision_checkpoint(
+        const int *tokens, int n,
+        const ds4_vision_span *images, size_t image_count) {
+    if (image_count != 0 && !images) return NULL;
+    ds4_session *s = ds4_session_new_test_checkpoint(tokens, n);
+    if (image_count == 0) return s;
+    s->checkpoint_images = xcalloc(image_count,
+                                   sizeof(s->checkpoint_images[0]));
+    s->checkpoint_image_count = image_count;
+    for (size_t i = 0; i < image_count; i++) {
+        s->checkpoint_images[i].token_start = images[i].token_start;
+        s->checkpoint_images[i].token_count = images[i].embedding.token_count;
+        memcpy(s->checkpoint_images[i].fingerprint,
+               images[i].embedding.fingerprint,
+               sizeof(s->checkpoint_images[i].fingerprint));
+    }
+    return s;
+}
+
 void ds4_session_free_test_checkpoint(ds4_session *s) {
     if (!s) return;
     token_vec_free(&s->checkpoint);
+    free(s->checkpoint_images);
     free(s);
 }
 

@@ -428,6 +428,11 @@ int ds4_session_sync_multimodal(ds4_session *s,
                                 size_t image_count,
                                 char *err,
                                 size_t errlen);
+/* Existing live images must retain their token spans and fingerprints.  A
+ * newly appended image is safe only when it begins beyond the live frontier. */
+bool ds4_session_vision_prefix_matches(const ds4_session *s,
+                                       const ds4_vision_span *images,
+                                       size_t image_count);
 /* Return true only when every image that conditioned the live checkpoint has
  * the same token span and embedding fingerprint in the supplied prompt. */
 bool ds4_session_vision_state_matches(const ds4_session *s,
@@ -449,6 +454,9 @@ bool ds4_session_checkpoint_valid(const ds4_session *s);
  * checkpoint tokens, for server-side routing/probe unit tests.  Not usable
  * for inference; free with ds4_session_free_test_checkpoint(). */
 ds4_session *ds4_session_new_test_checkpoint(const int *tokens, int n);
+ds4_session *ds4_session_new_test_vision_checkpoint(
+        const int *tokens, int n,
+        const ds4_vision_span *images, size_t image_count);
 void ds4_session_free_test_checkpoint(ds4_session *s);
 int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
