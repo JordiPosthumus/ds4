@@ -63623,13 +63623,18 @@ uint32_t ds4_weights_fp24_of_fd(int fd, uint64_t data_start, uint64_t file_size)
 }
 
 uint32_t ds4_engine_weights_fp24(ds4_engine *e) {
-    /* Benign race under concurrent first calls: both compute the same
-     * value from the same file and store it, so no synchronization. */
-    if (e->weights_fp24 != 0) return e->weights_fp24;
+    /* Requests can reach the first cache lookup concurrently.  Computing the
+     * same value twice is harmless, but unsynchronised C reads/writes are not;
+     * publish the lazily-computed value atomically. */
+    uint32_t cached = __atomic_load_n(&e->weights_fp24, __ATOMIC_ACQUIRE);
+    if (cached != 0) return cached;
     const ds4_model *m = &e->model;
+    uint32_t computed;
     if (m->tensors && m->n_tensors > 0 && (m->fd >= 0 || m->map)) {
-        /* Sample the head of EVERY tensor, so no single-tensor edit can
-         * slip between windows.  ~1000 reads of 64 bytes, once. */
+        /* Make every tensor contribute instead of sampling only a few global
+         * file offsets.  This is a compatibility fingerprint, not a
+         * cryptographic digest: the 24-bit cache-header field is deliberately
+         * small so existing checkpoint layout remains unchanged. */
         uint32_t h = 2166136261u;
         uint8_t meta[16];
         for (int i = 0; i < 8; i++) meta[i] = (uint8_t)(m->size >> (i * 8));
@@ -63651,12 +63656,18 @@ uint32_t ds4_engine_weights_fp24(ds4_engine *e) {
             }
         }
         uint32_t fp = (h ^ (h >> 24)) & 0xffffffu;
-        e->weights_fp24 = fp ? fp : 1u;
+        computed = fp ? fp : 1u;
     } else {
-        e->weights_fp24 = weights_fp24_compute(m->fd, m->map,
-                                               m->tensor_data_pos, m->size);
+        computed = weights_fp24_compute(m->fd, m->map,
+                                        m->tensor_data_pos, m->size);
     }
-    return e->weights_fp24;
+    uint32_t expected = 0;
+    if (!__atomic_compare_exchange_n(&e->weights_fp24, &expected, computed,
+                                     false, __ATOMIC_RELEASE,
+                                     __ATOMIC_ACQUIRE)) {
+        return expected;
+    }
+    return computed;
 }
 
 /* Decode gate firing schedule for the TP transport (see ds4_tp_identity).
