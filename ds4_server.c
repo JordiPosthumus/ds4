@@ -555,6 +555,36 @@ static bool server_image_inputs_push_data_uri(
     return false;
 }
 
+/* Image markers are random parser sentinels, not prompt identity. Normalize
+ * only their nonce so a replay can compare surrounding text and marker
+ * placement while ds4_session_vision_state_matches() separately verifies the
+ * exact encoded images and token spans. */
+static char *normalize_server_image_markers(const char *text) {
+    static const char prefix[] = "\036DS4_IMAGE_";
+    static const char stable[] = "\036DS4_IMAGE\037";
+    buf out = {0};
+    const char *p = text ? text : "";
+    while (*p) {
+        if (!strncmp(p, prefix, sizeof(prefix) - 1)) {
+            const char *hex = p + sizeof(prefix) - 1;
+            bool marker = true;
+            for (int i = 0; i < 24; i++) {
+                if (!hex[i] || !isxdigit((unsigned char)hex[i])) {
+                    marker = false;
+                    break;
+                }
+            }
+            if (marker && hex[24] == '\x1f') {
+                buf_append(&out, stable, sizeof(stable) - 1);
+                p = hex + 25;
+                continue;
+            }
+        }
+        buf_putc(&out, *p++);
+    }
+    return buf_take(&out);
+}
+
 static void append_owned_text(char **dst, const char *text) {
     buf b = {0};
     buf_puts(&b, *dst ? *dst : "");
@@ -810,6 +840,17 @@ typedef struct {
      * client opted in via reasoning.summary. Other APIs leave this false; the
      * field is ignored on those code paths. */
     bool reasoning_summary_emit;
+    /* OpenAI chat/completions replays the full visible assistant tool-call
+     * message, but its tool_call_id still names the unique live slot that
+     * sampled that call. Keep the final tool-result tail separately so the
+     * scheduler can bind an immediate continuation even when exact DSML tool
+     * memory was not attached while the request was being parsed. */
+    stop_list openai_live_call_ids;
+    char *openai_live_identity_text;
+    char *openai_live_prefix_text;
+    char *openai_live_suffix_text;
+    char *openai_live_assistant_text;
+    char *openai_live_reasoning;
     /* Responses continuation contract:
      *
      * A live Responses tool loop is not a normal "new prompt with a long
@@ -984,6 +1025,13 @@ static void request_free(request *r) {
     free(r->stops.v);
     free(r->raw_body);
     free(r->prompt_text);
+    stop_list_clear(&r->openai_live_call_ids);
+    free(r->openai_live_call_ids.v);
+    free(r->openai_live_identity_text);
+    free(r->openai_live_prefix_text);
+    free(r->openai_live_suffix_text);
+    free(r->openai_live_assistant_text);
+    free(r->openai_live_reasoning);
     stop_list_clear(&r->responses_live_call_ids);
     free(r->responses_live_call_ids.v);
     free(r->responses_live_suffix_text);
@@ -3301,6 +3349,122 @@ static void chat_msg_collect_tool_call_ids(const chat_msg *m, stop_list *ids) {
     }
 }
 
+/* Compare the assistant message the client actually replays, independently of
+ * the sampled DSML spelling. IDs locate a checkpoint; they do not authorize
+ * edits to its content, tool names, argument values, or call order. */
+static char *openai_live_assistant_identity(const char *content,
+                                           const tool_calls *calls) {
+    buf out = {0};
+    buf_putc(&out, '[');
+    json_escape(&out, content ? content : "");
+    for (int i = 0; calls && i < calls->len; i++) {
+        const tool_call *tc = &calls->v[i];
+        buf_puts(&out, ",[");
+        json_escape(&out, tc->id ? tc->id : "");
+        buf_putc(&out, ',');
+        json_escape(&out, tc->name ? tc->name : "");
+        buf_putc(&out, ',');
+        json_args args = {0};
+        if (json_args_parse(tc->arguments, &args)) {
+            buf_putc(&out, '{');
+            for (int k = 0; k < args.len; k++) {
+                if (k) buf_putc(&out, ',');
+                append_json_arg_pair(&out, &args.v[k]);
+            }
+            buf_putc(&out, '}');
+        } else {
+            json_escape(&out, tc->arguments ? tc->arguments : "");
+        }
+        json_args_free(&args);
+        buf_putc(&out, ']');
+    }
+    buf_putc(&out, ']');
+    return buf_take(&out);
+}
+
+static bool openai_msg_is_tool_result_tail(const chat_msg *m) {
+    return m && (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) &&
+           ((m->tool_call_id && m->tool_call_id[0]) ||
+            m->tool_call_ids_len > 0);
+}
+
+/* Stable client-visible identity for the request that may produce a tool call.
+ * Compute this before opportunistic exact-DSML attachment so an entry arriving
+ * in tool memory between consecutive turns cannot change the binding key. */
+static void openai_prepare_live_identity(request *r, const chat_msgs *msgs,
+                                         const char *tool_schemas) {
+    if (!r || r->api != API_OPENAI || !r->has_tools || !msgs) return;
+    char *rendered = render_chat_prompt_text_for_syntax(
+        r->model_syntax, msgs, tool_schemas,
+        &r->tool_orders, r->think_mode);
+    free(r->openai_live_identity_text);
+    r->openai_live_identity_text = normalize_server_image_markers(rendered);
+    free(rendered);
+}
+
+/* Prepare an OpenAI chat tool-result continuation without consulting live
+ * state. A request can arrive while the generating slot is still publishing
+ * its final SSE event; collecting the protocol IDs now and resolving their
+ * owner only at dispatch closes that parse-time race. The full replay remains
+ * available as the ordinary safe fallback when no exact live binding exists. */
+static void openai_prepare_live_continuation(request *r,
+                                             const chat_msgs *msgs,
+                                             const char *tool_schemas) {
+    if (!r || r->api != API_OPENAI || !msgs || msgs->len == 0) return;
+
+    int tail_start = msgs->len;
+    while (tail_start > 0 &&
+           openai_msg_is_tool_result_tail(&msgs->v[tail_start - 1]))
+    {
+        tail_start--;
+    }
+    if (tail_start == msgs->len || tail_start == 0) return;
+
+    const int anchor = tail_start - 1;
+    const chat_msg *assistant = &msgs->v[anchor];
+    if (strcmp(assistant->role, "assistant") || assistant->calls.len == 0) return;
+
+    free(r->openai_live_assistant_text);
+    r->openai_live_assistant_text =
+        openai_live_assistant_identity(assistant->content, &assistant->calls);
+    free(r->openai_live_reasoning);
+    r->openai_live_reasoning =
+        assistant->reasoning ? xstrdup(assistant->reasoning) : NULL;
+
+    stop_list_clear(&r->openai_live_call_ids);
+    for (int i = tail_start; i < msgs->len; i++) {
+        chat_msg_collect_tool_call_ids(&msgs->v[i],
+                                       &r->openai_live_call_ids);
+    }
+    if (r->openai_live_call_ids.len != assistant->calls.len) goto reject;
+    for (int i = 0; i < assistant->calls.len; i++) {
+        const char *id = assistant->calls.v[i].id;
+        if (!id || !id_list_contains(&r->openai_live_call_ids, id)) goto reject;
+    }
+
+    chat_msgs prefix_msgs = *msgs;
+    prefix_msgs.len = anchor;
+    free(r->openai_live_prefix_text);
+    char *rendered_prefix = render_chat_prompt_text_for_syntax(
+        r->model_syntax, &prefix_msgs, tool_schemas,
+        &r->tool_orders, r->think_mode);
+    r->openai_live_prefix_text =
+        normalize_server_image_markers(rendered_prefix);
+    free(rendered_prefix);
+    if (!r->openai_live_prefix_text) goto reject;
+
+    free(r->openai_live_suffix_text);
+    r->openai_live_suffix_text =
+        render_live_tool_tail_for_syntax(r->model_syntax, msgs, tail_start,
+                                         &r->tool_orders, r->think_mode);
+    return;
+
+reject:
+    stop_list_clear(&r->openai_live_call_ids);
+    free(r->openai_live_prefix_text);
+    r->openai_live_prefix_text = NULL;
+}
+
 /* Validate Responses tool outputs before rendering.
  *
  * A tool output with a call_id is meaningful only if either:
@@ -3682,9 +3846,11 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
+    openai_prepare_live_identity(r, &msgs, active_tool_schemas);
+    openai_prepare_live_continuation(r, &msgs, active_tool_schemas);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
-    const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text_for_syntax(
@@ -9047,9 +9213,16 @@ typedef struct {
      * point preserves hidden thinking and sampled DSML bytes that are not
      * necessarily present in the client-visible replay. */
     int live_tokens;
+    /* Exact token spelling at publication time. OpenAI validates this before
+     * appending a result so stale same-length state cannot authorize reuse. */
+    ds4_tokens frontier;
+    char *assistant_text; /* OpenAI client-visible content and canonical calls */
+    char *assistant_reasoning;
     /* Optional rendered conversation text that the client is expected to replay.
-     * Responses uses this because visible replay can omit hidden reasoning.
-     * Anthropic currently uses only the call-id side of the state. */
+     * Responses uses the post-turn visible transcript because replay can omit
+     * hidden reasoning. OpenAI uses the exact pre-tool-call prompt so a reused
+     * call id cannot smuggle edits to prior history or tool schemas. Anthropic
+     * currently uses only the call-id side of the state. */
     char *visible_text;
     size_t visible_len;
     /* Tool-call ids generated at the same live frontier. A following tool
@@ -9073,6 +9246,10 @@ struct server_slot {
     server *srv;
     int id;
     ds4_session *session;
+    live_tool_state openai_live;
+    /* Stable identity of the currently assigned/running OpenAI request. Owned
+     * by the slot under s->mu so only its continuation waits for publication. */
+    char *openai_producer_identity;
     live_tool_state responses_live;
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
@@ -9377,6 +9554,11 @@ static void tool_memory_free(tool_memory *m) {
 static void live_tool_state_clear_locked(live_tool_state *st) {
     if (!st) return;
     stop_list_clear(&st->call_ids);
+    ds4_tokens_free(&st->frontier);
+    free(st->assistant_text);
+    st->assistant_text = NULL;
+    free(st->assistant_reasoning);
+    st->assistant_reasoning = NULL;
     free(st->visible_text);
     st->visible_text = NULL;
     st->visible_len = 0;
@@ -9456,6 +9638,60 @@ static void anthropic_live_remember(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->tool_mu);
 }
 
+/* Accepted speculative tokens may extend past the emitted tool call. Text-only
+ * repair and internal recovery also need ordinary replay, not this shortcut. */
+static bool openai_live_can_publish(int prompt_tokens, int completion,
+                                    int session_pos, bool output_rewritten) {
+    return !output_rewritten && prompt_tokens >= 0 && completion >= 0 &&
+        (int64_t)prompt_tokens + completion == session_pos;
+}
+
+static void openai_live_remember(server *s, server_slot *slot,
+                                 const char *prefix_text,
+                                 const tool_calls *calls,
+                                 const char *content, const char *reasoning) {
+    if (!s || !slot || !prefix_text || !prefix_text[0] ||
+        !calls || calls->len == 0) return;
+    char *stable_prefix = normalize_server_image_markers(prefix_text);
+    if (!stable_prefix || !stable_prefix[0]) {
+        free(stable_prefix);
+        return;
+    }
+    pthread_mutex_lock(&s->tool_mu);
+    live_tool_state_clear_locked(&slot->openai_live);
+    slot->openai_live.visible_text = stable_prefix;
+    slot->openai_live.assistant_text =
+        openai_live_assistant_identity(content, calls);
+    slot->openai_live.assistant_reasoning = xstrdup(reasoning ? reasoning : "");
+    slot->openai_live.visible_len = strlen(stable_prefix);
+    for (int i = 0; i < calls->len; i++) {
+        id_list_push_unique(&slot->openai_live.call_ids, calls->v[i].id);
+    }
+    const ds4_tokens *live = ds4_session_tokens(slot->session);
+    if (live) ds4_tokens_copy(&slot->openai_live.frontier, live);
+    slot->openai_live.live_tokens = live ? live->len : 0;
+    slot->openai_live.valid = slot->openai_live.call_ids.len > 0 &&
+                              slot->openai_live.frontier.len > 0 &&
+        ds4_session_common_prefix(slot->session, live) == live->len;
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
+static bool openai_live_assistant_matches(const live_tool_state *state,
+                                          const request *req) {
+    return state->assistant_text && req->openai_live_assistant_text &&
+        !strcmp(state->assistant_text, req->openai_live_assistant_text) &&
+        (!req->openai_live_reasoning ||
+         !strcmp(state->assistant_reasoning ? state->assistant_reasoning : "",
+                 req->openai_live_reasoning));
+}
+
+static void openai_live_clear(server *s, server_slot *slot) {
+    if (!s || !slot) return;
+    pthread_mutex_lock(&s->tool_mu);
+    live_tool_state_clear_locked(&slot->openai_live);
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
 static void responses_live_clear(server *s, server_slot *slot) {
     if (!s || !slot) return;
     pthread_mutex_lock(&s->tool_mu);
@@ -9471,6 +9707,7 @@ static void anthropic_live_clear(server *s, server_slot *slot) {
 }
 
 static void request_live_state_clear(server *s, server_slot *slot) {
+    openai_live_clear(s, slot);
     responses_live_clear(s, slot);
     anthropic_live_clear(s, slot);
     thinking_live_clear(s, slot);
@@ -9498,6 +9735,62 @@ static bool anthropic_live_has_call_id(server *s, const char *id) {
     }
     pthread_mutex_unlock(&s->tool_mu);
     return found;
+}
+
+static bool openai_live_state_matches(const live_tool_state *state,
+                                      const stop_list *ids,
+                                      const char *prefix_text,
+                                      const ds4_tokens *live) {
+    const size_t prefix_len = prefix_text ? strlen(prefix_text) : 0;
+    bool ok = state && state->valid &&
+              live && state->live_tokens == live->len &&
+              state->frontier.len == live->len &&
+              ds4_tokens_starts_with(live, &state->frontier) &&
+              state->call_ids.len == ids->len &&
+              state->visible_text &&
+              state->visible_len == prefix_len &&
+              prefix_len > 0 &&
+              !memcmp(state->visible_text, prefix_text, prefix_len);
+    for (int i = 0; ok && i < ids->len; i++) {
+        ok = id_list_contains(&state->call_ids, ids->v[i]);
+    }
+    return ok;
+}
+
+/* Tool-call ids are random continuation capabilities, but never let an
+ * accidental duplicate bind across conversations. Ambiguity disables the
+ * shortcut and leaves the full replay path in charge. tool_mu must be held. */
+static int openai_live_unique_slot_locked(server *s, const stop_list *ids,
+                                          const char *prefix_text) {
+    if (!s || !ids || ids->len == 0 || !prefix_text) return -1;
+    int found = -1;
+    for (int i = 0; i < s->slot_count; i++) {
+        const live_tool_state *state = &s->slots[i].openai_live;
+        if (!openai_live_state_matches(state, ids, prefix_text,
+                                       &state->frontier)) {
+            continue;
+        }
+        if (found >= 0) return -1;
+        found = i;
+    }
+    return found;
+}
+
+static bool openai_live_matches_request(server *s, server_slot *slot,
+                                        const stop_list *ids,
+                                        const char *prefix_text,
+                                        const ds4_tokens *live,
+                                        const request *req) {
+    if (!s || !slot || !ids || ids->len == 0 || !prefix_text ||
+        !live || live->len <= 0 ||
+        ds4_session_common_prefix(slot->session, live) != live->len) return false;
+    pthread_mutex_lock(&s->tool_mu);
+    bool ok = openai_live_unique_slot_locked(s, ids, prefix_text) == slot->id &&
+              openai_live_assistant_matches(&slot->openai_live, req) &&
+              openai_live_state_matches(&slot->openai_live, ids, prefix_text,
+                                        live);
+    pthread_mutex_unlock(&s->tool_mu);
+    return ok;
 }
 
 static bool responses_live_matches_request(server *s, server_slot *slot,
@@ -10088,6 +10381,30 @@ static void build_prompt_from_exact_prefix_and_text_suffix(
         engine, exact_prefix, suffix_text, out);
 }
 
+/* Canonicalized tool-call checkpoints already end in EOS; sampled checkpoints
+ * normally stop just before it. Live result tails begin with EOS so they can
+ * continue either form, but must not append it twice. */
+static int live_tool_suffix_first_token(const ds4_tokens *exact_prefix,
+                                        const ds4_tokens *suffix,
+                                        int eos) {
+    return exact_prefix && suffix && exact_prefix->len > 0 && suffix->len > 0 &&
+           exact_prefix->v[exact_prefix->len - 1] == eos && suffix->v[0] == eos;
+}
+
+static void build_live_tool_prompt_from_exact_prefix_and_text_suffix(
+        ds4_engine *engine,
+        const ds4_tokens *exact_prefix,
+        const char *suffix_text,
+        ds4_tokens *out) {
+    ds4_tokens suffix = {0};
+    ds4_tokens_copy(out, exact_prefix);
+    ds4_tokenize_rendered_chat(engine, suffix_text ? suffix_text : "", &suffix);
+    const int first = live_tool_suffix_first_token(
+        exact_prefix, &suffix, ds4_token_eos(engine));
+    for (int i = first; i < suffix.len; i++) ds4_tokens_push(out, suffix.v[i]);
+    ds4_tokens_free(&suffix);
+}
+
 static int kv_cache_store_len(const kv_disk_cache *kc, int tokens) {
     return ds4_kvstore_store_len(kc, tokens);
 }
@@ -10385,6 +10702,35 @@ static int live_text_prefix_prompt(server *s, server_slot *slot,
         s->engine, live_tokens, req->prompt_text + live_text_len,
         effective_prompt);
     free(live_text);
+    return live_tokens->len;
+}
+
+/* OpenAI chat tool-result continuation.
+ *
+ * The client replays the visible assistant tool call, whose canonical render
+ * can differ from the exact sampled DSML bytes in live KV. The call-id set and
+ * exact pre-call prompt bind this request to one resident slot; append only the
+ * new tool-result suffix to that slot's authoritative token frontier. */
+static int openai_live_continuation_prompt(server *s, server_slot *slot,
+                                           const request *req,
+                                           int live_pos,
+                                           ds4_tokens *effective_prompt,
+                                           int *matched_ids) {
+    if (!s || !slot || !req || !effective_prompt) return 0;
+    if (req->api != API_OPENAI || !req->openai_live_suffix_text) return 0;
+    if (req->openai_live_call_ids.len == 0 ||
+        !req->openai_live_prefix_text) return 0;
+    const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
+    if (!live_tokens || live_tokens->len != live_pos) return 0;
+    if (!openai_live_matches_request(s, slot,
+                                     &req->openai_live_call_ids,
+                                     req->openai_live_prefix_text,
+                                     live_tokens, req)) return 0;
+
+    build_live_tool_prompt_from_exact_prefix_and_text_suffix(
+        s->engine, live_tokens, req->openai_live_suffix_text,
+        effective_prompt);
+    if (matched_ids) *matched_ids = req->openai_live_call_ids.len;
     return live_tokens->len;
 }
 
@@ -11973,29 +12319,46 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     ds4_tokens effective_prompt = {0};
     const ds4_tokens *prompt_for_sync = &j->req.prompt;
     const bool responses_protocol = j->req.api == API_RESPONSES;
+    bool openai_live_continuation = false;
     bool responses_live_continuation = false;
     bool anthropic_live_continuation = false;
     bool thinking_live_continuation = false;
     const char *responses_live_match = NULL;
+    int openai_live_match_ids = 0;
     int responses_live_match_ids = 0;
     int anthropic_live_match_ids = 0;
-    /* Responses gets the first chance to continue from live state.  This is
-     * the whole point of the API shape: a request that is bound to prior live
-     * output by visible transcript or tool call ids does not need to prove an
-     * exact token-prefix match.  Exact token/text/disk matching remains the
-     * fallback when the live state is absent or no longer describes the
+    /* Protocol-bound live continuations get the first chance to keep the
+     * authoritative sampled frontier. Exact token/text/disk matching remains
+     * the fallback when the live state is absent or no longer describes the
      * request. */
-    int cached = live_vision_match ?
-        responses_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
-                                              &effective_prompt) : 0;
-    const char *cache_source = cached > 0 ? "responses-visible" : "none";
+    int cached = 0;
+    const char *cache_source = "none";
+    if (live_vision_match) {
+        cached = openai_live_continuation_prompt(
+            s, slot, &j->req, old_pos, &effective_prompt,
+            &openai_live_match_ids);
+        if (cached > 0) {
+            openai_live_continuation = true;
+            cache_source = "openai-tool-output";
+            prompt_for_sync = &effective_prompt;
+        }
+    }
+    if (cached == 0 && live_vision_match) {
+        cached = responses_live_visible_prefix_prompt(
+            s, slot, &j->req, old_pos, &effective_prompt);
+        if (cached > 0) cache_source = "responses-visible";
+    }
     if (cached > 0) {
-        responses_live_match = "visible-prefix";
-        if (responses_live_matches_request(s, slot,
-                                           &j->req.responses_live_call_ids,
-                                           old_pos))
-        {
-            responses_live_match_ids = j->req.responses_live_call_ids.len;
+        if (!openai_live_continuation) {
+            responses_live_continuation = true;
+            prompt_for_sync = &effective_prompt;
+            responses_live_match = "visible-prefix";
+            if (responses_live_matches_request(s, slot,
+                                               &j->req.responses_live_call_ids,
+                                               old_pos))
+            {
+                responses_live_match_ids = j->req.responses_live_call_ids.len;
+            }
         }
     }
     if (cached == 0 && live_vision_match) {
@@ -12005,10 +12368,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         cache_source = cached > 0 ? "responses-tool-output" : "none";
         if (cached > 0) responses_live_match = "tool-output-ids";
     }
-    if (cached > 0) {
+    if (cached > 0 && !openai_live_continuation) {
         responses_live_continuation = true;
         prompt_for_sync = &effective_prompt;
-    } else if (live_vision_match) {
+    } else if (cached == 0 && live_vision_match) {
         cached = anthropic_live_continuation_prompt(s, slot, &j->req, old_pos,
                                                     &effective_prompt,
                                                     &anthropic_live_match_ids);
@@ -12017,6 +12380,21 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             cache_source = "anthropic-tool-output";
             prompt_for_sync = &effective_prompt;
         }
+    }
+    if (cached == 0 && j->req.api == API_OPENAI &&
+        j->req.openai_live_call_ids.len > 0)
+    {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: openai tool continuation has no unique live binding ids=%d selected_live=%d prompt=%d common=%d vision=%s tool_memory=mem:%d,disk:%d,canonical:%d,missing:%d; using replay cache ladder",
+                   j->req.openai_live_call_ids.len,
+                   old_pos,
+                   j->req.prompt.len,
+                   common,
+                   live_vision_match ? "match" : "mismatch",
+                   j->req.tool_replay.mem,
+                   j->req.tool_replay.disk,
+                   j->req.tool_replay.canonical,
+                   j->req.tool_replay.missing_ids);
     }
     if (cached == 0 && responses_protocol &&
         j->req.responses_requires_live_tool_state)
@@ -12079,6 +12457,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
+    /* A normal replay is about to mutate or replace this slot. Retire the old
+     * OpenAI capability before disk load/sync so a failure cannot leave it
+     * pointing at a different checkpoint. */
+    if (!openai_live_continuation) openai_live_clear(s, slot);
     int disk_cached = 0;
     char *disk_cache_path = NULL;
     uint8_t disk_cache_ext_flags = 0;
@@ -12162,7 +12544,11 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     char req_flags[64];
     log_flags(req_flags, sizeof(req_flags), responses_protocol,
               j->req.has_tools, false, false, false);
-    if (responses_live_continuation) {
+    if (openai_live_continuation) {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: openai live continuation match=tool-call-ids ids=%d cached=%d prompt=%d",
+                   openai_live_match_ids, cached, prompt_tokens);
+    } else if (responses_live_continuation) {
         server_log(DS4_LOG_PREFILL,
                    "ds4-server: responses live continuation RESPPROTO match=%s ids=%d cached=%d prompt=%d",
                    responses_live_match ? responses_live_match : "unknown",
@@ -12252,6 +12638,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                 trace_event(s, trace_id, "cancelled during prefill");
                 return;
             }
+            request_live_state_clear(s, slot);
             trace_event(s, trace_id, "prefill failed: %s", err);
             send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
             return;
@@ -12286,6 +12673,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             trace_event(s, trace_id, "cancelled during prefill");
             return;
         }
+        request_live_state_clear(s, slot);
         trace_event(s, trace_id, "prefill failed: %s", err);
         send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
         return;
@@ -12416,6 +12804,7 @@ decode_again:
     int room = ds4_session_ctx(slot->session) - ds4_session_pos(slot->session);
     bool saw_tool_start = false;
     bool saw_tool_end = false;
+    bool tool_text_repaired = false;
     bool saw_orphan_tool_end = false;
     size_t tool_scan_from = 0;
     int next_tool_progress = 128;
@@ -12744,6 +13133,7 @@ decode_again:
                 text.len = strlen(text.ptr);
                 saw_tool_end = true;
                 completed_truncation = true;
+                tool_text_repaired = true;
                 server_log(DS4_LOG_WARNING,
                            "ds4-server: chat ctx=%s%s%s repaired unterminated tool call (%d calls recovered)",
                            ctx_span,
@@ -13008,6 +13398,10 @@ decode_again:
         }
     }
 
+    const bool openai_frontier_exact = openai_live_can_publish(
+        prompt_tokens, completion, ds4_session_pos(slot->session),
+        tool_text_repaired || dsml_recovery_attempted);
+
     if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
         should_canonicalize_tool_checkpoint(s, &parsed_calls))
@@ -13030,6 +13424,19 @@ decode_again:
                                      parsed_content ? parsed_content : "");
     } else if (!parsed_calls.len) {
         thinking_live_clear(s, slot);
+    }
+
+    /* Canonicalization may rewrite the generated tail. Publish only the final
+     * exact frontier, under the stable pre-tool-memory request identity. */
+    if (j->req.api == API_OPENAI) {
+        if (openai_frontier_exact && parsed_calls.len && strcmp(final_finish, "error") &&
+            strcmp(final_finish, "length"))
+        {
+            openai_live_remember(s, slot, j->req.openai_live_identity_text,
+                                 &parsed_calls, parsed_content, parsed_reasoning);
+        } else {
+            openai_live_clear(s, slot);
+        }
     }
 
     bool response_ok = !job_cancelled(j);
@@ -13194,12 +13601,55 @@ static bool live_state_contains_all(const live_tool_state *state,
     return true;
 }
 
-/* Return the only slot eligible for an explicit live continuation, or -1 when
- * the request has no resident binding. A missing binding is intentionally not
- * treated as ineligible: generate_job() then emits the existing 409 response. */
+#define JOB_SLOT_WAIT (-2)
+
+/* Return the only slot eligible for an explicit live continuation, -1 for
+ * normal routing, or JOB_SLOT_WAIT while a producer may still publish state.
+ * Called with s->mu and tool_mu held. */
 static int job_required_slot_locked(server *s, const job *j) {
     if (!s || !j) return -1;
     const request *r = &j->req;
+    if (r->api == API_OPENAI && r->openai_live_suffix_text &&
+        r->openai_live_call_ids.len > 0)
+    {
+        int owner = openai_live_unique_slot_locked(
+            s, &r->openai_live_call_ids, r->openai_live_prefix_text);
+        if (owner >= 0) {
+            server_slot *slot = &s->slots[owner];
+            if (slot->busy || slot->assigned) return owner;
+            const ds4_tokens *live = ds4_session_tokens(slot->session);
+            if (live && live->len > 0 &&
+                ds4_session_common_prefix(slot->session, live) == live->len &&
+                ds4_session_vision_state_matches(
+                            slot->session, r->images, r->image_count) &&
+                openai_live_assistant_matches(&slot->openai_live, r) &&
+                openai_live_state_matches(&slot->openai_live,
+                                          &r->openai_live_call_ids,
+                                          r->openai_live_prefix_text, live))
+            {
+                return owner;
+            }
+            return -1;
+        }
+        /* A streaming client may submit the result just before the worker
+         * publishes its live binding. Wait only for the in-flight request
+         * whose identity is this continuation's pre-call prefix. */
+        int producer = -1;
+        for (int i = 0; i < s->slot_count; i++) {
+            const server_slot *slot = &s->slots[i];
+            if (!(slot->busy || slot->assigned) ||
+                !slot->openai_producer_identity ||
+                !r->openai_live_prefix_text ||
+                strcmp(slot->openai_producer_identity,
+                       r->openai_live_prefix_text))
+            {
+                continue;
+            }
+            if (producer >= 0) return JOB_SLOT_WAIT;
+            producer = i;
+        }
+        if (producer >= 0) return producer;
+    }
     for (int i = 0; i < s->slot_count; i++) {
         server_slot *slot = &s->slots[i];
         if (r->responses_requires_live_tool_state &&
@@ -13242,6 +13692,7 @@ static void dispatch_jobs_locked(server *s) {
         job *prev = NULL;
         for (job *j = s->head; j; prev = j, j = j->next) {
             int required = job_required_slot_locked(s, j);
+            if (required == JOB_SLOT_WAIT) continue;
             server_slot *best = NULL;
             int best_score = INT_MIN;
             for (int i = 0; i < s->slot_count; i++) {
@@ -13269,6 +13720,11 @@ static void dispatch_jobs_locked(server *s) {
         chosen->next = NULL;
         chosen_slot->assigned = chosen;
         chosen_slot->busy = true;
+        free(chosen_slot->openai_producer_identity);
+        chosen_slot->openai_producer_identity =
+            chosen->req.api == API_OPENAI &&
+            chosen->req.openai_live_identity_text
+                ? xstrdup(chosen->req.openai_live_identity_text) : NULL;
         pthread_cond_broadcast(&s->cv);
     }
 }
@@ -13337,6 +13793,8 @@ static void *slot_worker_main(void *arg) {
         job_complete(j);
 
         pthread_mutex_lock(&s->mu);
+        free(slot->openai_producer_identity);
+        slot->openai_producer_identity = NULL;
         slot->busy = false;
         dispatch_jobs_locked(s);
         pthread_mutex_unlock(&s->mu);
@@ -13573,6 +14031,8 @@ static void server_cancel_job(server *s, job *j) {
             server_slot *slot = &s->slots[i];
             if (slot->assigned != j) continue;
             slot->assigned = NULL;
+            free(slot->openai_producer_identity);
+            slot->openai_producer_identity = NULL;
             slot->busy = false;
             detached = true;
             dispatch_jobs_locked(s);
@@ -13846,9 +14306,11 @@ static void server_close_resources(server *s) {
     tool_memory_free(&s->tool_mem);
     for (int i = 0; i < s->slot_count; i++) {
         server_slot *slot = &s->slots[i];
+        live_tool_state_free(&slot->openai_live);
         live_tool_state_free(&slot->responses_live);
         live_tool_state_free(&slot->anthropic_live);
         visible_live_free(&slot->thinking_live);
+        free(slot->openai_producer_identity);
         if (slot->session) ds4_session_free(slot->session);
     }
     free(s->slot_threads);
@@ -14551,6 +15013,232 @@ static void test_batched_live_continuation_slot_binding(void) {
     request_free(&j.req);
     live_tool_state_free(&slots[1].responses_live);
     live_tool_state_free(&slots[2].anthropic_live);
+}
+
+static void test_openai_live_exact_frontier_and_identity(void) {
+    live_tool_state state = {0};
+    state.valid = true;
+    state.live_tokens = 3;
+    state.visible_text = xstrdup("same prior prompt");
+    state.visible_len = strlen(state.visible_text);
+    id_list_push_unique(&state.call_ids, "call-owner");
+    ds4_tokens_push(&state.frontier, 10);
+    ds4_tokens_push(&state.frontier, 20);
+    ds4_tokens_push(&state.frontier, 30);
+    ds4_tokens live = {0};
+    ds4_tokens_copy(&live, &state.frontier);
+    stop_list ids = {0};
+    id_list_push_unique(&ids, "call-owner");
+
+    TEST_ASSERT(openai_live_state_matches(&state, &ids,
+                                          "same prior prompt", &live));
+    TEST_ASSERT(!openai_live_state_matches(&state, &ids,
+                                           "edited prior prompt", &live));
+    live.v[2] = 99;  /* same-length replacement is not the old frontier */
+    TEST_ASSERT(!openai_live_state_matches(&state, &ids,
+                                           "same prior prompt", &live));
+    live.v[2] = 30;
+    ds4_tokens_push(&live, 40);
+    TEST_ASSERT(!openai_live_state_matches(&state, &ids,
+                                           "same prior prompt", &live));
+    live_tool_state_clear_locked(&state);
+    TEST_ASSERT(!state.valid && state.frontier.len == 0);
+    TEST_ASSERT(!openai_live_state_matches(&state, &ids,
+                                           "same prior prompt", &live));
+    live_tool_state_free(&state);
+    ds4_tokens_free(&live);
+    id_list_free(&ids);
+}
+
+static void test_openai_continuation_waits_only_for_its_producer(void) {
+    server s = {0};
+    server_slot slots[2] = {0};
+    s.slots = slots;
+    s.slot_count = 2;
+    job j = {0};
+    j.req.api = API_OPENAI;
+    j.req.openai_live_prefix_text = xstrdup("producer prompt");
+    j.req.openai_live_suffix_text = xstrdup(" tool-result");
+    id_list_push_unique(&j.req.openai_live_call_ids, "call-racing");
+
+    slots[0].busy = true;
+    slots[0].openai_producer_identity = xstrdup("unrelated prompt");
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == -1);
+    slots[1].busy = true;
+    slots[1].openai_producer_identity = xstrdup("producer prompt");
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == 1);
+    /* Identical concurrent producers are ambiguous until one publishes the
+     * requested random tool-call id. Never guess a slot. */
+    free(slots[0].openai_producer_identity);
+    slots[0].openai_producer_identity = xstrdup("producer prompt");
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == JOB_SLOT_WAIT);
+    slots[0].busy = false;
+    slots[1].busy = false;
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == -1);
+
+    for (int i = 0; i < 2; i++) free(slots[i].openai_producer_identity);
+    request_free(&j.req);
+}
+
+static void test_openai_live_assistant_identity(void) {
+    tool_call entries[] = {
+        {"call-a", "bash", "{ \"command\" : \"pwd\" }"},
+        {"call-b", "bash", "{\"command\":\"true\"}"}
+    };
+    tool_calls calls = {.v = entries, .len = 2};
+    live_tool_state state = {0};
+    state.assistant_text = openai_live_assistant_identity("checking", &calls);
+    state.assistant_reasoning = xstrdup("private reasoning");
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    entries[0].arguments = "{\"command\":\"pwd\"}";
+    r.openai_live_assistant_text =
+        openai_live_assistant_identity("checking", &calls);
+    TEST_ASSERT(openai_live_assistant_matches(&state, &r));
+    r.openai_live_reasoning = xstrdup("private reasoning");
+    TEST_ASSERT(openai_live_assistant_matches(&state, &r));
+    free(r.openai_live_reasoning);
+    r.openai_live_reasoning = xstrdup("edited reasoning");
+    TEST_ASSERT(!openai_live_assistant_matches(&state, &r));
+    free(r.openai_live_reasoning);
+    r.openai_live_reasoning = NULL; /* omitted hidden reasoning is allowed */
+
+    free(r.openai_live_assistant_text);
+    r.openai_live_assistant_text =
+        openai_live_assistant_identity("edited content", &calls);
+    TEST_ASSERT(!openai_live_assistant_matches(&state, &r));
+    entries[0].name = "edited-tool";
+    free(r.openai_live_assistant_text);
+    r.openai_live_assistant_text =
+        openai_live_assistant_identity("checking", &calls);
+    TEST_ASSERT(!openai_live_assistant_matches(&state, &r));
+    entries[0].name = "bash";
+    entries[0].arguments = "{\"command\":\"edited-command\"}";
+    free(r.openai_live_assistant_text);
+    r.openai_live_assistant_text =
+        openai_live_assistant_identity("checking", &calls);
+    TEST_ASSERT(!openai_live_assistant_matches(&state, &r));
+    entries[0].arguments = "{\"command\":\"pwd\"}";
+    tool_call swap = entries[0];
+    entries[0] = entries[1];
+    entries[1] = swap;
+    free(r.openai_live_assistant_text);
+    r.openai_live_assistant_text =
+        openai_live_assistant_identity("checking", &calls);
+    TEST_ASSERT(!openai_live_assistant_matches(&state, &r));
+    entries[1] = entries[0];
+    entries[0] = swap;
+    calls.raw_tool_text = "unrelated sampled spelling";
+    free(r.openai_live_assistant_text);
+    r.openai_live_assistant_text =
+        openai_live_assistant_identity("checking", &calls);
+    TEST_ASSERT(openai_live_assistant_matches(&state, &r));
+    request_free(&r);
+    live_tool_state_free(&state);
+}
+
+static void test_openai_live_publication_boundary(void) {
+    TEST_ASSERT(openai_live_can_publish(100, 7, 107, false));
+    /* An accepted speculative block may contain un-emitted tokens. */
+    TEST_ASSERT(!openai_live_can_publish(100, 7, 108, false));
+    TEST_ASSERT(!openai_live_can_publish(100, 7, 106, false));
+    /* Text-only repair or internal recovery must use ordinary replay. */
+    TEST_ASSERT(!openai_live_can_publish(100, 7, 107, true));
+    TEST_ASSERT(openai_live_can_publish(INT_MAX - 7, 7, INT_MAX, false));
+    TEST_ASSERT(!openai_live_can_publish(INT_MAX, 7, INT_MAX, false));
+}
+
+static void test_live_tool_suffix_deduplicates_canonical_eos(void) {
+    ds4_tokens sampled = {0}, canonical = {0}, suffix = {0};
+    ds4_tokens_push(&sampled, 10);
+    ds4_tokens_push(&sampled, 11);
+    ds4_tokens_push(&canonical, 10);
+    ds4_tokens_push(&canonical, 99);
+    ds4_tokens_push(&suffix, 99);
+    ds4_tokens_push(&suffix, 12);
+    TEST_ASSERT(live_tool_suffix_first_token(&sampled, &suffix, 99) == 0);
+    TEST_ASSERT(live_tool_suffix_first_token(&canonical, &suffix, 99) == 1);
+    TEST_ASSERT(live_tool_suffix_first_token(&canonical, &suffix, 98) == 0);
+    TEST_ASSERT(live_tool_suffix_first_token(NULL, &suffix, 99) == 0);
+    ds4_tokens_free(&sampled);
+    ds4_tokens_free(&canonical);
+    ds4_tokens_free(&suffix);
+}
+
+static void test_openai_live_tail_and_stable_identity(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.has_tools = true;
+    r.think_mode = DS4_THINK_HIGH;
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("run the tools");
+    chat_msgs_push(&msgs, user);
+    openai_prepare_live_identity(&r, &msgs, NULL);
+
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    tool_call a = {0};
+    a.id = xstrdup("call-a");
+    a.name = xstrdup("bash");
+    a.arguments = xstrdup("{\"command\":\"pwd\"}");
+    tool_calls_push(&assistant.calls, a);
+    tool_call b = {0};
+    b.id = xstrdup("call-b");
+    b.name = xstrdup("bash");
+    b.arguments = xstrdup("{\"command\":\"true\"}");
+    tool_calls_push(&assistant.calls, b);
+    chat_msgs_push(&msgs, assistant);
+    chat_msg first = {0};
+    first.role = xstrdup("tool");
+    first.tool_call_id = xstrdup("call-a");
+    first.content = xstrdup("quote=\" slash=\\ newline=\n λ");
+    chat_msgs_push(&msgs, first);
+    chat_msg second = {0};
+    second.role = xstrdup("tool");
+    second.tool_call_id = xstrdup("call-b");
+    second.content = xstrdup("/tmp");
+    chat_msgs_push(&msgs, second);
+
+    openai_prepare_live_continuation(&r, &msgs, NULL);
+    TEST_ASSERT(r.openai_live_call_ids.len == 2);
+    TEST_ASSERT(!strcmp(r.openai_live_identity_text, r.openai_live_prefix_text));
+    TEST_ASSERT(strstr(r.openai_live_suffix_text, "bash") == NULL);
+    TEST_ASSERT(strstr(r.openai_live_suffix_text, "/tmp</tool_result>") != NULL);
+    TEST_ASSERT(strstr(r.openai_live_suffix_text, "<｜Assistant｜><think>") != NULL);
+
+    request partial;
+    request_init(&partial, REQ_CHAT, 128);
+    partial.api = API_OPENAI;
+    msgs.len--;
+    openai_prepare_live_continuation(&partial, &msgs, NULL);
+    TEST_ASSERT(partial.openai_live_call_ids.len == 0);
+    TEST_ASSERT(partial.openai_live_suffix_text == NULL);
+    msgs.len++;
+    request_free(&partial);
+
+    /* Identity is captured before opportunistic exact DSML attachment. */
+    openai_prepare_live_identity(&r, &msgs, NULL);
+    char *before = xstrdup(r.openai_live_identity_text);
+    msgs.v[1].calls.raw_tool_text = xstrdup("sampled DSML spelling");
+    char *after = render_chat_prompt_text_for_syntax(
+        r.model_syntax, &msgs, NULL, &r.tool_orders, r.think_mode);
+    TEST_ASSERT(strcmp(before, after) != 0);
+    TEST_ASSERT(!strcmp(r.openai_live_identity_text, before));
+    free(before);
+    free(after);
+    chat_msgs_free(&msgs);
+    request_free(&r);
+
+    char *na = normalize_server_image_markers(
+        "before\036DS4_IMAGE_000000000000000000000001\037after");
+    char *nb = normalize_server_image_markers(
+        "before\036DS4_IMAGE_abcdefabcdefabcdefabcdef\037after");
+    TEST_ASSERT(na && nb && !strcmp(na, nb));
+    free(na);
+    free(nb);
 }
 
 static void test_tool_schema_order_from_anthropic_schema(void) {
@@ -19407,6 +20095,12 @@ static void ds4_server_unit_tests_run(void) {
     test_mixed_prefill_quantum_option();
     test_multimodal_prefill_resume_frontier();
     test_batched_live_continuation_slot_binding();
+    test_openai_live_exact_frontier_and_identity();
+    test_openai_continuation_waits_only_for_its_producer();
+    test_openai_live_assistant_identity();
+    test_openai_live_publication_boundary();
+    test_live_tool_suffix_deduplicates_canonical_eos();
+    test_openai_live_tail_and_stable_identity();
     test_request_defaults_use_min_p_filtering();
     test_chat_ignore_eos_contract();
     test_reasoning_effort_mapping();
