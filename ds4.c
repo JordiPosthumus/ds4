@@ -74631,7 +74631,12 @@ int ds4_session_cancel_checkpoint_pos(
 static ds4_gpu_tensor *cancel_checkpoint_alloc_like(
         const ds4_gpu_tensor *src, uint64_t bytes) {
     if (!src || bytes == 0) return NULL;
-    return ds4_gpu_tensor_alloc_ptr_on(ds4_gpu_tensor_device(src), bytes);
+    const int tier = ds4_gpu_tensor_device(src);
+    /* Metal is a single-device backend and intentionally reports no logical
+     * CUDA/ROCm tier.  Use its ordinary allocator instead of feeding -1 to
+     * the tiered allocator, which can only reject it. */
+    if (tier < 0) return ds4_gpu_tensor_alloc(bytes);
+    return ds4_gpu_tensor_alloc_ptr_on(tier, bytes);
 }
 
 static bool cancel_checkpoint_copy_raw_to_backup(
