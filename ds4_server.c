@@ -11085,6 +11085,77 @@ static bool speculative_tail_rewind_supported(bool glm_dsa,
     return glm_dsa && block_tokens == 2 && consumed_tokens == 1;
 }
 
+static bool restore_cancelled_request_checkpoint(
+        server *s, server_slot *slot, job *j,
+        const ds4_cancel_checkpoint *checkpoint,
+        const char *checkpoint_err,
+        const char *stage, int completion,
+        int block_start, int block_tokens, int block_consumed,
+        uint64_t trace_id) {
+    char restore_err[160] = {0};
+    const int restore_to = ds4_session_cancel_checkpoint_pos(checkpoint);
+    const bool multimodal = j && j->req.image_count != 0;
+    bool restored = false;
+
+    pthread_mutex_lock(&s->inference_mu);
+    const int before = ds4_session_pos(slot->session);
+    if (checkpoint &&
+        ds4_session_cancel_checkpoint_restore(slot->session, checkpoint,
+                                              restore_err,
+                                              sizeof(restore_err)) == 0) {
+        restored = ds4_session_checkpoint_valid(slot->session) &&
+                   ds4_session_pos(slot->session) == restore_to &&
+                   (!multimodal ||
+                    ds4_session_vision_state_matches(
+                        slot->session, j->req.images, j->req.image_count));
+        if (!restored && !restore_err[0]) {
+            snprintf(restore_err, sizeof(restore_err),
+                     "restored frontier failed validation");
+        }
+    } else if (!checkpoint) {
+        snprintf(restore_err, sizeof(restore_err),
+                 "%s", checkpoint_err && checkpoint_err[0] ? checkpoint_err :
+                       "request checkpoint unavailable");
+    }
+    if (!restored) ds4_session_invalidate(slot->session);
+    pthread_mutex_unlock(&s->inference_mu);
+
+    server_log(restored ? DS4_LOG_KVCACHE : DS4_LOG_WARNING,
+               "ds4-server: slot %d request cancellation stage=%s generated=%d "
+               "block_start=%d block_tokens=%d block_consumed=%d "
+               "prompt_frontier=%d live_before=%d multimodal=%d images=%zu "
+               "direct_speculation=%d disk_fallback=%s action=%s",
+               slot->id,
+               stage ? stage : "unknown",
+               completion,
+               block_start,
+               block_tokens,
+               block_consumed,
+               restore_to,
+               before,
+               multimodal ? 1 : 0,
+               j ? j->req.image_count : 0,
+               server_direct_speculation_allowed(s) &&
+                   ds4_engine_mtp_draft_tokens(s->engine) > 1,
+               (multimodal || !s->kv.enabled) ? "unavailable" : "available",
+               restored ? "restore-prompt" : "invalidate");
+    if (restore_err[0]) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: slot %d cancellation rollback detail=\"%s\"",
+                   slot->id, restore_err);
+    }
+    trace_event(s, trace_id,
+                "cancelled stage=%s generated=%d block=%d/%d start=%d "
+                "prompt_frontier=%d action=%s%s%s",
+                stage ? stage : "unknown", completion,
+                block_consumed, block_tokens, block_start,
+                restore_to,
+                restored ? "restore-prompt" : "invalidate",
+                restore_err[0] ? " error=" : "",
+                restore_err[0] ? restore_err : "");
+    return restored;
+}
+
 typedef struct {
     bool inside;
     char tail[8]; /* Long enough for "</think>". */
@@ -12557,6 +12628,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     anthropic_stream anthropic_live = {0};
     openai_stream openai_live = {0};
     responses_stream responses_live = {0};
+    ds4_cancel_checkpoint *cancel_checkpoint = NULL;
     const bool openai_live_chat = request_uses_openai_live_stream(&j->req);
     const bool responses_live_chat = request_uses_responses_live_stream(&j->req);
     long responses_created_at = (long)time(NULL);
@@ -12624,14 +12696,28 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         }
     }
 
+    char cancel_checkpoint_err[160] = {0};
+    pthread_mutex_lock(&s->inference_mu);
+    (void)ds4_session_cancel_checkpoint_capture(slot->session,
+                                                &cancel_checkpoint,
+                                                cancel_checkpoint_err,
+                                                sizeof(cancel_checkpoint_err));
+    pthread_mutex_unlock(&s->inference_mu);
+
     bool dsml_recovery_attempted = false;
     uint64_t rng = j->req.seed;
     if (!rng && !random_bytes(&rng, sizeof(rng))) {
         rng = ((uint64_t)time(NULL) << 32) ^ (uint64_t)(uintptr_t)j;
     }
     if (!rng) rng = UINT64_C(0x9e3779b97f4a7c15);
+    int cancel_block_start = -1;
+    int cancel_block_tokens = 0;
+    int cancel_block_consumed = 0;
 decode_again:
     ;
+    cancel_block_start = -1;
+    cancel_block_tokens = 0;
+    cancel_block_consumed = 0;
     buf text = {0};
     size_t plain_stream_pos = 0;
     size_t stop_scan_from = 0;
@@ -12735,6 +12821,8 @@ decode_again:
             toks[0] = token;
             ntok = 1;
         }
+        cancel_block_start = block_start;
+        cancel_block_tokens = ntok;
 
         bool stop_decode = false;
         bool block_checkpoint_preserved = true;
@@ -12928,9 +13016,10 @@ decode_again:
                 break;
             }
         }
+        cancel_block_consumed = block_consumed;
         const int tail_rewind_to = speculative_tail_rewind_target(
             block_start, ntok, block_consumed, block_checkpoint_preserved);
-        if (tail_rewind_to >= 0) {
+        if (tail_rewind_to >= 0 && !job_cancelled(j)) {
             bool frontier_restored = false;
             pthread_mutex_lock(&s->inference_mu);
             if (speculative_tail_rewind_supported(
@@ -12966,6 +13055,14 @@ decode_again:
     server_generation_leave(s);
 
     if (job_cancelled(j)) {
+        restore_cancelled_request_checkpoint(
+            s, slot, j, cancel_checkpoint,
+            cancel_checkpoint_err,
+            "generation", completion,
+            cancel_block_start, cancel_block_tokens, cancel_block_consumed,
+            trace_id);
+        ds4_session_cancel_checkpoint_free(cancel_checkpoint);
+        cancel_checkpoint = NULL;
         request_live_state_clear(s, slot);
         trace_event(s, trace_id, "cancelled during generation after %d tokens", completion);
         anthropic_stream_free(&anthropic_live);
@@ -13080,6 +13177,14 @@ decode_again:
         free(tail);
     }
     if (job_cancelled(j)) {
+        restore_cancelled_request_checkpoint(
+            s, slot, j, cancel_checkpoint,
+            cancel_checkpoint_err,
+            "flush", completion,
+            cancel_block_start, cancel_block_tokens, cancel_block_consumed,
+            trace_id);
+        ds4_session_cancel_checkpoint_free(cancel_checkpoint);
+        cancel_checkpoint = NULL;
         request_live_state_clear(s, slot);
         trace_event(s, trace_id, "cancelled while flushing generation");
         anthropic_stream_free(&anthropic_live);
@@ -13195,6 +13300,14 @@ decode_again:
             }
         }
         if (job_cancelled(j)) {
+            restore_cancelled_request_checkpoint(
+                s, slot, j, cancel_checkpoint,
+                cancel_checkpoint_err,
+                "response-parse", completion,
+                cancel_block_start, cancel_block_tokens, cancel_block_consumed,
+                trace_id);
+            ds4_session_cancel_checkpoint_free(cancel_checkpoint);
+            cancel_checkpoint = NULL;
             request_live_state_clear(s, slot);
             trace_event(s, trace_id, "cancelled during response parsing");
             free(parsed_content);
@@ -13219,6 +13332,14 @@ decode_again:
         }
     }
     if (job_cancelled(j)) {
+        restore_cancelled_request_checkpoint(
+            s, slot, j, cancel_checkpoint,
+            cancel_checkpoint_err,
+            "response-publish", completion,
+            cancel_block_start, cancel_block_tokens, cancel_block_consumed,
+            trace_id);
+        ds4_session_cancel_checkpoint_free(cancel_checkpoint);
+        cancel_checkpoint = NULL;
         request_live_state_clear(s, slot);
         trace_event(s, trace_id, "cancelled before publishing response state");
         free(parsed_content);
@@ -13351,6 +13472,14 @@ decode_again:
         job_mark_cancelled(j);
         final_finish = "error";
         snprintf(err, sizeof(err), "client disconnected");
+        restore_cancelled_request_checkpoint(
+            s, slot, j, cancel_checkpoint,
+            cancel_checkpoint_err,
+            "response-write", completion,
+            cancel_block_start, cancel_block_tokens, cancel_block_consumed,
+            trace_id);
+        ds4_session_cancel_checkpoint_free(cancel_checkpoint);
+        cancel_checkpoint = NULL;
         request_live_state_clear(s, slot);
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: %s ctx=%s%s%s client disconnected",
@@ -13425,6 +13554,7 @@ decode_again:
     openai_stream_free(&openai_live);
     responses_stream_free(&responses_live);
     buf_free(&text);
+    ds4_session_cancel_checkpoint_free(cancel_checkpoint);
     ds4_tokens_free(&effective_prompt);
 }
 
