@@ -16,6 +16,7 @@
 #define DS4_KVSTORE_EXT_RESPONSES_VISIBLE (1u << 1)
 #define DS4_KVSTORE_EXT_THINKING_VISIBLE  (1u << 2)
 #define DS4_KVSTORE_EXT_SESSION_TITLE     (1u << 3)
+#define DS4_KVSTORE_EXT_VISION_IDENTITY   (1u << 4)
 
 typedef enum {
     DS4_KVSTORE_REASON_UNKNOWN   = 0,
@@ -34,10 +35,10 @@ typedef enum {
 } ds4_kvstore_log_type;
 
 typedef struct {
-    /* The file name is the rendered byte prefix, not the token sequence. The
-     * payload still carries the exact tokens and graph state; the hash only
-     * answers "does this checkpoint represent the bytes at the front of the
-     * incoming prompt?" */
+    /* The file name is the cache-key byte prefix, not the token sequence. This
+     * is normally rendered text; callers may prepend identity metadata for
+     * state, such as images, that text alone cannot distinguish. The payload
+     * still carries the exact tokens and graph state. */
     char sha[41];
     char *path;
     uint8_t quant_bits;

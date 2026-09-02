@@ -453,8 +453,19 @@ bool ds4_session_vision_prefix_matches(const ds4_session *s,
 bool ds4_session_vision_state_matches(const ds4_session *s,
                                       const ds4_vision_span *images,
                                       size_t image_count);
+/* Inspect the exact image identities that condition the live checkpoint. */
+size_t ds4_session_vision_identity_count(const ds4_session *s);
+bool ds4_session_vision_identity(const ds4_session *s, size_t index,
+                                 uint32_t *token_start,
+                                 uint32_t *token_count,
+                                 uint8_t fingerprint[32]);
+/* Attach already-verified request identities after restoring a disk payload.
+ * Every image must end at or before the restored token frontier. */
+bool ds4_session_restore_vision_identities(ds4_session *s,
+                                           const ds4_vision_span *images,
+                                           size_t image_count);
 /* True while a session contains, or is actively syncing, image-conditioned
- * state. Such state must not be written to the text-keyed disk KV cache. */
+ * state. Such state needs an image-identity-aware disk cache key. */
 bool ds4_session_has_vision_state(const ds4_session *s);
 /* Text-keyed disk payloads deliberately contain no image identity.  Once one
  * replaces a session, discard image metadata left by the slot's prior owner. */

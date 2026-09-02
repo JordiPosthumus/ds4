@@ -184,6 +184,7 @@ uint8_t ds4_kvstore_reason_code(const char *reason) {
 }
 
 const char *ds4_kvstore_key_kind(uint8_t ext_flags) {
+    if (ext_flags & DS4_KVSTORE_EXT_VISION_IDENTITY) return "vision-token-text";
     if (ext_flags & DS4_KVSTORE_EXT_RESPONSES_VISIBLE) return "responses-visible";
     if (ext_flags & DS4_KVSTORE_EXT_THINKING_VISIBLE) return "thinking-visible";
     return "token-text";
@@ -1319,10 +1320,9 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     if (header_ok &&
         ds4_session_load_payload(session, fp, hdr.payload_bytes, err, sizeof(err)) == 0)
     {
-        /* Text-keyed disk entries never carry image identity.  The session may
-         * have belonged to an image-bearing request before this load; retain
-         * its stale fingerprints and ds4_session_sync() will invalidate the
-         * freshly restored text checkpoint and cold-prefill from token zero. */
+        /* The payload does not serialize image identity.  Clear metadata left
+         * by the slot's prior owner after every load; a vision-aware caller
+         * reattaches identities only after its fingerprinted key has matched. */
         ds4_session_clear_text_restore_vision_state(session);
         const ds4_tokens *loaded_tokens = ds4_session_tokens(session);
         if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens) {
