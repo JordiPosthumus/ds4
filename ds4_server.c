@@ -10405,15 +10405,57 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     return loaded;
 }
 
+static int kv_cache_try_load_tokenized_text(server *s, server_slot *slot,
+                                            const char *prompt_text,
+                                            const ds4_tokens *prompt_tokens,
+                                            ds4_tokens *effective_prompt,
+                                            char **loaded_path_out,
+                                            uint8_t *loaded_ext_flags_out,
+                                            bool responses_protocol) {
+    int loaded = kv_cache_try_load_text(s, slot, prompt_text,
+                                        effective_prompt, loaded_path_out,
+                                        loaded_ext_flags_out,
+                                        responses_protocol);
+    if (loaded > 0 || !prompt_tokens) return loaded;
+
+    /* Checkpoints are keyed by decoded token text.  A rendered prompt can
+     * tokenize to the exact saved token vector without being byte-identical
+     * to that decoded text (for example when the tokenizer canonicalizes a
+     * special-token spelling).  Keep the ordinary raw-text lookup fast, then
+     * retry a miss with the same canonical representation used by the writer. */
+    size_t canonical_len = 0;
+    char *canonical = render_tokens_text(s->engine, prompt_tokens,
+                                         &canonical_len);
+    const size_t prompt_len = prompt_text ? strlen(prompt_text) : 0;
+    if (canonical_len == prompt_len &&
+        (canonical_len == 0 || !memcmp(canonical, prompt_text, canonical_len)))
+    {
+        free(canonical);
+        return 0;
+    }
+
+    loaded = kv_cache_try_load_text(s, slot, canonical,
+                                    effective_prompt, loaded_path_out,
+                                    loaded_ext_flags_out,
+                                    responses_protocol);
+    if (loaded > 0) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv cache recovered token-equivalent rendered prompt cached=%d",
+                   loaded);
+    }
+    free(canonical);
+    return loaded;
+}
+
 static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out,
                              uint8_t *loaded_ext_flags_out) {
-    return kv_cache_try_load_text(s, slot, req ? req->prompt_text : NULL,
-                                  effective_prompt,
-                                  loaded_path_out,
-                                  loaded_ext_flags_out,
-                                  req && req->api == API_RESPONSES);
+    return kv_cache_try_load_tokenized_text(
+        s, slot, req ? req->prompt_text : NULL,
+        req ? &req->prompt : NULL, effective_prompt,
+        loaded_path_out, loaded_ext_flags_out,
+        req && req->api == API_RESPONSES);
 }
 
 /* =========================================================================
@@ -11911,9 +11953,9 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
          * a very long conversation from token zero. */
         char *path = NULL;
         ds4_tokens effective = {0};
-        int loaded = kv_cache_try_load_text(s, slot,
-                                            rendered.ptr ? rendered.ptr : "",
-                                            &effective, &path, NULL, false);
+        int loaded = kv_cache_try_load_tokenized_text(
+            s, slot, rendered.ptr ? rendered.ptr : "", &canonical,
+            &effective, &path, NULL, false);
         if (loaded == 0) {
             pthread_mutex_lock(&s->inference_mu);
             ds4_session_invalidate(slot->session);
@@ -19848,8 +19890,10 @@ static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
 
     const char *short_text = "transcript prefix";
     const char *long_text = "transcript prefix with sampled token bytes";
+    const char *canonical_text = "prefix <｜Assistant｜> canonical bytes";
     test_kv_text_stub_file(dir, short_text, KV_REASON_COLD, 512, 0);
     test_kv_text_stub_file(dir, long_text, KV_REASON_COLD, 768, 0);
+    test_kv_text_stub_file(dir, canonical_text, KV_REASON_CONTINUED, 1024, 0);
 
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -19863,20 +19907,30 @@ static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
     TEST_ASSERT(idx >= 0 && kc.entry[idx].tokens == 768);
     TEST_ASSERT(idx >= 0 && kc.entry[idx].text_bytes == strlen(long_text));
     TEST_ASSERT(kv_cache_find_text_prefix(&kc, "transcript prefiX", 2, 32768) < 0);
+    TEST_ASSERT(kv_cache_find_text_prefix(
+        &kc, "prefix <|assistant|> canonical bytes suffix", 2, 32768) < 0);
+    idx = kv_cache_find_text_prefix(
+        &kc, "prefix <｜Assistant｜> canonical bytes suffix", 2, 32768);
+    TEST_ASSERT(idx >= 0 && kc.entry[idx].tokens == 1024);
 
     kv_cache_close(&kc);
-    char short_sha[41], long_sha[41];
+    char short_sha[41], long_sha[41], canonical_sha[41];
     sha1_bytes_hex(short_text, strlen(short_text), short_sha);
     sha1_bytes_hex(long_text, strlen(long_text), long_sha);
-    char short_name[44], long_name[44];
+    sha1_bytes_hex(canonical_text, strlen(canonical_text), canonical_sha);
+    char short_name[44], long_name[44], canonical_name[44];
     snprintf(short_name, sizeof(short_name), "%.40s.kv", short_sha);
     snprintf(long_name, sizeof(long_name), "%.40s.kv", long_sha);
+    snprintf(canonical_name, sizeof(canonical_name), "%.40s.kv", canonical_sha);
     char *short_path = path_join(dir, short_name);
     char *long_path = path_join(dir, long_name);
+    char *canonical_path = path_join(dir, canonical_name);
     unlink(short_path);
     unlink(long_path);
+    unlink(canonical_path);
     free(short_path);
     free(long_path);
+    free(canonical_path);
     rmdir(dir);
 }
 
