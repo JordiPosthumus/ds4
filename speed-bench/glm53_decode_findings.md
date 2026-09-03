@@ -510,7 +510,8 @@ assumed:
   fixture at 8, 513, 1024, 2048, 2051 and 4096 selected rows, with rows at and
   past `cache_cap` and `UINT32_MAX` sentinels in the selection, and requires
   the outputs to match with `memcmp`;
-- greedy generation from this tip is **byte-identical to 110afdd** over 128
+- greedy generation from this tip is **byte-identical to main** (110afdd, and
+  b0a147a after the branch was rebased onto the synced main) over 128
   tokens on a 1,471-token prompt at ctx 4096 (dense window, every row valid),
   a 3,841-token prompt at ctx 8192 (dense window, 3,841 rows) and a
   10,352-token prompt at ctx 16384 (pool selector, 2051 rows with sentinels).
@@ -623,6 +624,22 @@ untouched by this branch's decode work and measures as such.  At ctx 2048 the
 base arm reproduces the 21.16 tok/s measured at the start of this series, so
 machine conditions have not drifted.
 
+Repeated after the branch was rebased onto the synced main (b0a147a, 24
+upstream commits of Metal tensor-parallel and DSpark work), same protocol:
+
+| frontier | main prefill | branch prefill | prefill | main decode | branch decode | decode |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2048 | 429.64 / 430.08 | 429.73 / 429.81 | -0.02% | 20.97 / 21.06 | 27.76 / 27.76 | **+32.10%** |
+| 4096 | 390.20 / 390.55 | 390.10 / 390.14 | -0.07% | 20.67 / 20.73 | 27.06 / 27.05 | **+30.70%** |
+| 8192 | 392.30 / 392.64 | 392.08 / 391.52 | -0.17% | 20.63 / 20.69 | 26.94 / 26.96 | **+30.45%** |
+| 16384 | 389.56 / 389.97 | 389.43 / 389.52 | -0.07% | 20.55 / 20.59 | 26.93 / 26.81 | **+30.63%** |
+
+The synced main decodes GLM 5.3 Flash at the same rate as 110afdd did and
+produces the same greedy output on every prompt used here, so upstream's
+changes did not touch this path; the rebase itself conflicted only in the
+Makefile's test list and in the mHC producer kernel, which upstream had
+refactored into a shared body that the branch now templates.
+
 Contributions, each measured against the baseline current when it landed: the
 mHC producer fusion +5.67%, the KDA gate pairing +0.74%, the three HC-expand
 epilogues +0.46% / +0.11% / +0.14%, the shared-down/HC fusion +0.77%, the gate
@@ -667,7 +684,9 @@ the paths they replaced.  Both are off this branch's default path:
 
 ### Checked end to end against the base commit
 
-Greedy generation (`--raw-prompt --temp 0`, 128 tokens), the tip and 110afdd
+Greedy generation (`--raw-prompt --temp 0`, 128 tokens), the tip and main
+(110afdd when first measured; repeated against b0a147a after the rebase, with
+the same result and the same main output on every prompt)
 each built in its own worktree, byte-compared, both in default mode:
 
 | prompt | ctx | selection | result |
