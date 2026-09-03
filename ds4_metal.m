@@ -45846,7 +45846,6 @@ typedef struct {
     uint32_t in_dim;
     uint32_t out_dim;
     uint32_t n_rows;
-    uint32_t wide;
 } glm53_gpu_bf16_matmul_args;
 
 typedef struct {
@@ -45854,20 +45853,7 @@ typedef struct {
     uint32_t out_dim_ab;
     uint32_t out_dim_c;
     uint32_t n_rows;
-    uint32_t wide;
 } glm53_gpu_bf16_trio_args;
-
-/* The widened BF16 row loads repartition the accumulation across lanes, so
- * their sums are not bit-identical to the scalar path's.  --quality keeps the
- * scalar path; DS4_METAL_DISABLE_GLM53_BF16_WIDE does the same in default
- * mode, for A/B runs. */
-static uint32_t glm53_gpu_bf16_wide(void) {
-    static int disabled = -1;
-    if (disabled < 0) {
-        disabled = getenv("DS4_METAL_DISABLE_GLM53_BF16_WIDE") != NULL;
-    }
-    return (g_quality_mode || disabled) ? 0u : 1u;
-}
 
 int ds4_gpu_glm53_embedding_bf16(
         ds4_gpu_tensor       *out,
@@ -45970,7 +45956,6 @@ int ds4_gpu_glm53_matmul_bf16(
                 .in_dim = in_dim,
                 .out_dim = out_dim,
                 .n_rows = n_rows,
-                .wide = glm53_gpu_bf16_wide(),
             };
             [enc setComputePipelineState:pipeline];
             [enc setBytes:&args length:sizeof(args) atIndex:0];
@@ -46047,7 +46032,6 @@ int ds4_gpu_glm53_matmul_bf16_qkv(
             .in_dim = in_dim,
             .out_dim = out_dim,
             .n_rows = 1u,
-            .wide = glm53_gpu_bf16_wide(),
         };
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
@@ -46117,7 +46101,6 @@ int ds4_gpu_glm53_matmul_bf16_pair(
             .in_dim = in_dim,
             .out_dim = out_dim,
             .n_rows = 1u,
-            .wide = glm53_gpu_bf16_wide(),
         };
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
@@ -46192,7 +46175,6 @@ int ds4_gpu_glm53_matmul_bf16_trio(
             .out_dim_ab = out_dim_ab,
             .out_dim_c = out_dim_c,
             .n_rows = 1u,
-            .wide = glm53_gpu_bf16_wide(),
         };
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
@@ -46265,7 +46247,6 @@ int ds4_gpu_glm53_matmul_bf16_hc_expand4(
             .in_dim = in_dim,
             .out_dim = out_dim,
             .n_rows = 1u,
-            .wide = glm53_gpu_bf16_wide(),
         };
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);

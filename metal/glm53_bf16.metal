@@ -4,18 +4,10 @@ static inline float glm53_bf16_to_f32(ushort value) {
     return as_type<float>((uint)value << 16);
 }
 
-static inline float4 glm53_bf16x4_to_f32x4(ushort4 v) {
-    return float4(as_type<float>((uint)v.x << 16),
-                  as_type<float>((uint)v.y << 16),
-                  as_type<float>((uint)v.z << 16),
-                  as_type<float>((uint)v.w << 16));
-}
-
 struct glm53_bf16_matmul_args {
     uint in_dim;
     uint out_dim;
     uint n_rows;
-    uint wide;      /* 0: scalar accumulation only, the --quality path */
 };
 
 kernel void kernel_glm53_embedding_bf16(
@@ -38,7 +30,6 @@ kernel void kernel_glm53_embedding_bf16(
  * before it is stored.  Callers must range-check out_row and token first. */
 static inline float glm53_mul_mv_bf16_f32_row_sum(
         uint                             in_dim,
-        bool                             wide,
         device const ushort             *weights,
         device const float              *x,
         uint                             out_row,
@@ -47,75 +38,6 @@ static inline float glm53_mul_mv_bf16_f32_row_sum(
     device const ushort *w = weights + (ulong)out_row * in_dim;
     device const float *xr = x + (ulong)token * in_dim;
     float sum = 0.0f;
-    /*
-     * Wide path: each lane takes four adjacent bf16 weights, so one
-     * simdgroup-wide load moves 256 bytes instead of the scalar path's 64.
-     * Four are in flight before the first fma, so memory-level parallelism is
-     * at least what the scalar path had (32 bytes per lane vs 16).  The tiling
-     * is exact -- lane L, step i, sub-load s covers [4L + 512i + 128s ..+3],
-     * which over s=0..3 and all lanes covers [512i, 512i+511] with no gap or
-     * overlap -- so this needs in_dim to be a multiple of 512.  GLM 5.3 uses
-     * 4096 (q/k/v) and 8192 (output).  Row bases are 32-byte aligned from the
-     * GGUF alignment and every offset is a multiple of 4, so the vector loads
-     * are aligned.
-     *
-     * NOTE: this changes which lane accumulates which k, so the partial sums
-     * differ from the scalar path and results are NOT bit-identical to it.
-     * The host clears `wide` under --quality, which keeps the scalar path
-     * below and its original reduction order.
-     */
-    if (wide && (in_dim & 1023u) == 0u) {
-        float4 acc = float4(0.0f);
-        const uint stride = 128u;
-        for (uint kk = (uint)lane * 4u; kk < in_dim; kk += 8u * stride) {
-            const ushort4 w0 = *((device const ushort4 *)(w + kk));
-            const ushort4 w1 = *((device const ushort4 *)(w + kk + 1u * stride));
-            const ushort4 w2 = *((device const ushort4 *)(w + kk + 2u * stride));
-            const ushort4 w3 = *((device const ushort4 *)(w + kk + 3u * stride));
-            const ushort4 w4 = *((device const ushort4 *)(w + kk + 4u * stride));
-            const ushort4 w5 = *((device const ushort4 *)(w + kk + 5u * stride));
-            const ushort4 w6 = *((device const ushort4 *)(w + kk + 6u * stride));
-            const ushort4 w7 = *((device const ushort4 *)(w + kk + 7u * stride));
-            const float4 x0 = *((device const float4 *)(xr + kk));
-            const float4 x1 = *((device const float4 *)(xr + kk + 1u * stride));
-            const float4 x2 = *((device const float4 *)(xr + kk + 2u * stride));
-            const float4 x3 = *((device const float4 *)(xr + kk + 3u * stride));
-            const float4 x4 = *((device const float4 *)(xr + kk + 4u * stride));
-            const float4 x5 = *((device const float4 *)(xr + kk + 5u * stride));
-            const float4 x6 = *((device const float4 *)(xr + kk + 6u * stride));
-            const float4 x7 = *((device const float4 *)(xr + kk + 7u * stride));
-            acc = fma(glm53_bf16x4_to_f32x4(w0), x0, acc);
-            acc = fma(glm53_bf16x4_to_f32x4(w1), x1, acc);
-            acc = fma(glm53_bf16x4_to_f32x4(w2), x2, acc);
-            acc = fma(glm53_bf16x4_to_f32x4(w3), x3, acc);
-            acc = fma(glm53_bf16x4_to_f32x4(w4), x4, acc);
-            acc = fma(glm53_bf16x4_to_f32x4(w5), x5, acc);
-            acc = fma(glm53_bf16x4_to_f32x4(w6), x6, acc);
-            acc = fma(glm53_bf16x4_to_f32x4(w7), x7, acc);
-        }
-        sum = (acc.x + acc.y) + (acc.z + acc.w);
-        return simd_sum(sum);
-    }
-    if (wide && (in_dim & 511u) == 0u) {
-        float4 acc = float4(0.0f);
-        const uint stride = 128u;
-        for (uint kk = (uint)lane * 4u; kk < in_dim; kk += 4u * stride) {
-            const ushort4 w0 = *((device const ushort4 *)(w + kk));
-            const ushort4 w1 = *((device const ushort4 *)(w + kk + stride));
-            const ushort4 w2 = *((device const ushort4 *)(w + kk + 2u * stride));
-            const ushort4 w3 = *((device const ushort4 *)(w + kk + 3u * stride));
-            const float4 x0 = *((device const float4 *)(xr + kk));
-            const float4 x1 = *((device const float4 *)(xr + kk + stride));
-            const float4 x2 = *((device const float4 *)(xr + kk + 2u * stride));
-            const float4 x3 = *((device const float4 *)(xr + kk + 3u * stride));
-            acc = fma(glm53_bf16x4_to_f32x4(w0), x0, acc);
-            acc = fma(glm53_bf16x4_to_f32x4(w1), x1, acc);
-            acc = fma(glm53_bf16x4_to_f32x4(w2), x2, acc);
-            acc = fma(glm53_bf16x4_to_f32x4(w3), x3, acc);
-        }
-        sum = (acc.x + acc.y) + (acc.z + acc.w);
-        return simd_sum(sum);
-    }
     uint k = lane;
     for (; k + 224u < in_dim; k += 256u) {
         const ushort w0 = w[k];
@@ -162,8 +84,7 @@ static inline void glm53_mul_mv_bf16_f32_row(
     const uint token = tgpig.y;
     if (out_row >= args.out_dim || token >= args.n_rows) return;
     const float sum =
-        glm53_mul_mv_bf16_f32_row_sum(args.in_dim, args.wide != 0u,
-                                      weights, x, out_row, token, lane);
+        glm53_mul_mv_bf16_f32_row_sum(args.in_dim, weights, x, out_row, token, lane);
     if (lane == 0u) out[(ulong)token * args.out_dim + out_row] = sum;
 }
 
@@ -210,8 +131,7 @@ kernel void kernel_glm53_mul_mv_bf16_f32_hc_expand4(
     const uint token = tgpig.y;
     if (out_row >= args.out_dim || token >= args.n_rows) return;
     const float sum =
-        glm53_mul_mv_bf16_f32_row_sum(args.in_dim, args.wide != 0u,
-                                      weights, x, out_row, token, lane);
+        glm53_mul_mv_bf16_f32_row_sum(args.in_dim, weights, x, out_row, token, lane);
     if (lane != 0u) return;
     out[(ulong)token * args.out_dim + out_row] = sum;
 
@@ -235,7 +155,6 @@ struct glm53_bf16_trio_args {
     uint out_dim_ab;
     uint out_dim_c;
     uint n_rows;
-    uint wide;
 };
 
 /*
@@ -270,8 +189,7 @@ kernel void kernel_glm53_mul_mv_bf16_f32_trio(
     const uint token = tgpig.y;
     if (out_row >= out_dim || token >= args.n_rows) return;
     const float sum =
-        glm53_mul_mv_bf16_f32_row_sum(args.in_dim, args.wide != 0u,
-                                      w, x, out_row, token, lane);
+        glm53_mul_mv_bf16_f32_row_sum(args.in_dim, w, x, out_row, token, lane);
     if (lane == 0u) out[(ulong)token * out_dim + out_row] = sum;
 }
 

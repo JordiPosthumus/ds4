@@ -94,14 +94,10 @@ static float f16_to_f32(uint16_t value) {
     return b.f;
 }
 
-/* Exercises ds4_gpu_glm53_matmul_bf16 at one width.  in_dim picks the path
- * inside the shared row helper in metal/glm53_bf16.metal: a multiple of 1024
- * takes the eight-load branch, a multiple of 512 the four-load branch, and
- * anything else the scalar fallback.  The wide branches repartition which lane
- * accumulates which k, so they are deliberately not bit-identical to the
- * scalar path; the reference is accumulated in double and compared with a
- * relative tolerance.  A tiling or indexing error moves a result far more than
- * that, which is what this is here to catch. */
+/* Exercises ds4_gpu_glm53_matmul_bf16 at one width.  The reference is
+ * accumulated in double and compared with a relative tolerance; a stride or
+ * indexing error moves a result far more than that, which is what this is
+ * here to catch. */
 static void check_bf16_matmul(const uint8_t *model, size_t model_bytes,
                               uint64_t offset, uint32_t in_dim,
                               uint32_t out_dim, uint32_t rows,
@@ -467,9 +463,8 @@ int main(void) {
         Q4_OUT = 37,
         Q4_ROWS = 3,
         Q8_OFFSET = 60000,
-        /* Widths that reach the two wide branches of the BF16 row helper.
-         * 4096 is the real GLM 5.3 kda_{q,k,v} width; 8192 (kda_output) is
-         * covered by the same eight-load branch that 1024 and 4096 take. */
+        /* Real GLM 5.3 widths: 4096 is kda_{q,k,v}, and 512/1024 the
+         * low-rank gate projections. */
         WIDE512_OFFSET = 65536,   WIDE512_IN = 512,   WIDE512_OUT = 4,
         WIDE1024_OFFSET = 73728,  WIDE1024_IN = 1024, WIDE1024_OUT = 4,
         WIDE4096_OFFSET = 90112,  WIDE4096_IN = 4096, WIDE4096_OUT = 2,
@@ -573,25 +568,13 @@ int main(void) {
     for (uint32_t i = 0; i < BF16_ROWS * BF16_OUT; i++)
         require_close("BF16 prefill matmul", bf16_actual[i], bf16_expected[i], 2e-4f);
 
-    /* BF16_IN above is 64, so the case just checked only ever runs the scalar
-     * fallback.  These three reach the widened paths. */
+    /* BF16_IN above is 64; these cover the widths the model actually runs. */
     check_bf16_matmul(model, MODEL_BYTES, WIDE512_OFFSET, WIDE512_IN,
-                      WIDE512_OUT, WIDE_ROWS, "BF16 matmul in_dim=512 (four-load path)");
+                      WIDE512_OUT, WIDE_ROWS, "BF16 matmul in_dim=512");
     check_bf16_matmul(model, MODEL_BYTES, WIDE1024_OFFSET, WIDE1024_IN,
-                      WIDE1024_OUT, WIDE_ROWS, "BF16 matmul in_dim=1024 (eight-load path)");
+                      WIDE1024_OUT, WIDE_ROWS, "BF16 matmul in_dim=1024");
     check_bf16_matmul(model, MODEL_BYTES, WIDE4096_OFFSET, WIDE4096_IN,
-                      WIDE4096_OUT, WIDE_ROWS, "BF16 matmul in_dim=4096 (eight-load path)");
-
-    /* --quality keeps the scalar accumulation at every width, so the scalar
-     * path is checked at the widths that would otherwise take a wide branch. */
-    ds4_gpu_set_quality(true);
-    check_bf16_matmul(model, MODEL_BYTES, WIDE512_OFFSET, WIDE512_IN,
-                      WIDE512_OUT, WIDE_ROWS, "BF16 matmul in_dim=512 (--quality scalar path)");
-    check_bf16_matmul(model, MODEL_BYTES, WIDE1024_OFFSET, WIDE1024_IN,
-                      WIDE1024_OUT, WIDE_ROWS, "BF16 matmul in_dim=1024 (--quality scalar path)");
-    check_bf16_matmul(model, MODEL_BYTES, WIDE4096_OFFSET, WIDE4096_IN,
-                      WIDE4096_OUT, WIDE_ROWS, "BF16 matmul in_dim=4096 (--quality scalar path)");
-    ds4_gpu_set_quality(false);
+                      WIDE4096_OUT, WIDE_ROWS, "BF16 matmul in_dim=4096");
 
     /*
      * Compound HC producer: the f16 and bf16 kernels share one templated body
