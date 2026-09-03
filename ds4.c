@@ -41969,6 +41969,42 @@ static uint32_t glm_graph_indexed_decode_split_blocks(void) {
     return (top_k + block_rows - 1u) / block_rows;
 }
 
+/* Every GLM 5.3 Flash decode optimisation on this branch is behind its own
+ * rollback switch, and DS4_METAL_DISABLE_GLM53_FLASH_TUNING turns all of them
+ * off at once, so one variable restores the pre-branch paths for an A/B run.
+ * The table is the list; each entry is read once and cached. */
+typedef enum {
+    GLM53_FLASH_HC_PRODUCER_FUSE,
+    GLM53_FLASH_KDA_GATE_PAIR,
+    GLM53_FLASH_KDA_GATE_TRIO,
+    GLM53_FLASH_KDA_OUT_HC_EXPAND,
+    GLM53_FLASH_ATTN_OUT_HC_EXPAND,
+    GLM53_FLASH_FFN_HC_EXPAND_ADD,
+    GLM53_FLASH_SHARED_DOWN_HC_EXPAND,
+    GLM53_FLASH_DSA_EXACT,
+    GLM53_FLASH_FEATURE_COUNT
+} glm53_flash_feature;
+
+static bool glm53_flash_feature_enabled(glm53_flash_feature feature) {
+    static const char *const switches[GLM53_FLASH_FEATURE_COUNT] = {
+        [GLM53_FLASH_HC_PRODUCER_FUSE]     = "DS4_METAL_DISABLE_GLM53_HC_PRODUCER_FUSE",
+        [GLM53_FLASH_KDA_GATE_PAIR]        = "DS4_METAL_DISABLE_GLM53_KDA_GATE_PAIR",
+        [GLM53_FLASH_KDA_GATE_TRIO]        = "DS4_METAL_DISABLE_GLM53_KDA_GATE_TRIO",
+        [GLM53_FLASH_KDA_OUT_HC_EXPAND]    = "DS4_METAL_DISABLE_GLM53_KDA_OUT_HC_EXPAND",
+        [GLM53_FLASH_ATTN_OUT_HC_EXPAND]   = "DS4_METAL_DISABLE_GLM53_ATTN_OUT_HC_EXPAND",
+        [GLM53_FLASH_FFN_HC_EXPAND_ADD]    = "DS4_METAL_DISABLE_GLM53_FFN_HC_EXPAND_ADD",
+        [GLM53_FLASH_SHARED_DOWN_HC_EXPAND] = "DS4_METAL_DISABLE_GLM53_SHARED_DOWN_HC_EXPAND",
+        [GLM53_FLASH_DSA_EXACT]            = "DS4_METAL_DISABLE_GLM53_DSA_EXACT",
+    };
+    static int8_t state[GLM53_FLASH_FEATURE_COUNT];   /* 0 unread, 1 on, -1 off */
+    if (state[feature] == 0) {
+        state[feature] =
+            getenv("DS4_METAL_DISABLE_GLM53_FLASH_TUNING") == NULL &&
+            getenv(switches[feature]) == NULL ? 1 : -1;
+    }
+    return state[feature] > 0;
+}
+
 /* Rows per split block for indexed decode attention.  The 32/128 step at 1024
  * selected rows was never swept; DS4_GLM_DECODE_SPLIT_BLOCK_ROWS forces one
  * value so it can be.  A value the split path cannot honour is rejected by the
@@ -42037,11 +42073,7 @@ static bool glm_graph_indexed_decode_exact_available(
     (void)tp_split_heads;
     return false;
 #else
-    static int disabled = -1;
-    if (disabled < 0) {
-        disabled = getenv("DS4_METAL_DISABLE_GLM53_DSA_EXACT") != NULL;
-    }
-    return !disabled &&
+    return glm53_flash_feature_enabled(GLM53_FLASH_DSA_EXACT) &&
            g->glm53 &&
            !tp_split_heads &&
            g->attn_exact_scores && g->attn_exact_lora && g->attn_exact_denom &&
@@ -44341,7 +44373,7 @@ static bool glm53_graph_hc_pre(
         hc_dim == 16384u && hc_mix == 24u &&
         DS4_N_EMBD == 4096u && DS4_N_HC == 4u &&
         !metal_graph_use_reference_hc_decode() &&
-        getenv("DS4_METAL_DISABLE_GLM53_HC_PRODUCER_FUSE") == NULL &&
+        glm53_flash_feature_enabled(GLM53_FLASH_HC_PRODUCER_FUSE) &&
         /* Same rollback switches as the DeepSeek F16 producer this shares a
          * kernel with, so DS4_METAL_DISABLE_PRE_M5_DECODE_PORTS and the two
          * producer-specific variables disable both paths rather than leaving
@@ -44525,12 +44557,12 @@ static bool glm53_graph_kda_attention(
         l->kda_g_a->type == DS4_TENSOR_BF16 &&
         l->kda_f_b->type == DS4_TENSOR_BF16 &&
         l->kda_g_b->type == DS4_TENSOR_BF16 &&
-        getenv("DS4_METAL_DISABLE_GLM53_KDA_GATE_PAIR") == NULL) {
+        glm53_flash_feature_enabled(GLM53_FLASH_KDA_GATE_PAIR)) {
         /* beta reads the same attn_norm row as f_a and g_a, only at a
          * shorter output width, so the trio kernel carries all three and the
          * chain drops from three dispatches to two. */
         bool beta_fused = l->kda_beta->type == DS4_TENSOR_BF16 &&
-            getenv("DS4_METAL_DISABLE_GLM53_KDA_GATE_TRIO") == NULL &&
+            glm53_flash_feature_enabled(GLM53_FLASH_KDA_GATE_TRIO) &&
             ds4_gpu_glm53_matmul_bf16_trio(
                 g->kda_lowrank, g->kda_lowrank_g, g->kda_raw_beta,
                 model->map, model->size,
@@ -44655,7 +44687,7 @@ static bool glm53_graph_kda_attention(
             l->kda_output->type == DS4_TENSOR_BF16 &&
             g->directional_steering_attn_scale == 0.0f &&
             g->hc_after_attn && g->hc_cur && g->hc_post && g->hc_comb &&
-            getenv("DS4_METAL_DISABLE_GLM53_KDA_OUT_HC_EXPAND") == NULL) {
+            glm53_flash_feature_enabled(GLM53_FLASH_KDA_OUT_HC_EXPAND)) {
             if (ds4_gpu_glm53_matmul_bf16_hc_expand4(
                     g->attn_out, g->hc_after_attn,
                     model->map, model->size, l->kda_output->abs_offset,
@@ -45718,7 +45750,7 @@ static bool glm_graph_encode_sparse_ffn_one(
             !g->ssd_streaming &&
             l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 &&
             g->hc_next && g->hc_after_attn && g->hc_split &&
-            getenv("DS4_METAL_DISABLE_GLM53_SHARED_DOWN_HC_EXPAND") == NULL &&
+            glm53_flash_feature_enabled(GLM53_FLASH_SHARED_DOWN_HC_EXPAND) &&
             ds4_gpu_shared_down_hc_expand_q8_0_tensor(
                 g->hc_next, ffn_sum,
                 model->map, model->size,
@@ -46000,7 +46032,7 @@ static bool glm53_graph_encode_ffn_tail_one(
         g->hc_after_attn && g->hc_post && g->hc_comb &&
         g->directional_steering_ffn_scale == 0.0f &&
         !metal_graph_debug_wants("ffn_out", il, pos) &&
-        getenv("DS4_METAL_DISABLE_GLM53_FFN_HC_EXPAND_ADD") == NULL;
+        glm53_flash_feature_enabled(GLM53_FLASH_FFN_HC_EXPAND_ADD);
 #endif
     bool ok = glm_graph_encode_ffn_one_normed_from(g,
                                                    model,
@@ -52907,7 +52939,7 @@ static bool glm_graph_forward_token(
                     l->attn_output->type == DS4_TENSOR_Q8_0 &&
                     g->directional_steering_attn_scale == 0.0f &&
                     g->hc_after_attn && g->hc_cur && g->hc_split &&
-                    getenv("DS4_METAL_DISABLE_GLM53_ATTN_OUT_HC_EXPAND") == NULL &&
+                    glm53_flash_feature_enabled(GLM53_FLASH_ATTN_OUT_HC_EXPAND) &&
                     ds4_gpu_matmul_q8_0_hc_expand_tensor(
                         g->hc_after_attn, g->attn_out,
                         model->map, model->size,

@@ -739,6 +739,55 @@ protocol, and byte-compared on greedy generation (128 tokens, 1,471- and
   differ by 0.55%); if any of it is real it is at most 0.4%, against the 2%
   before the change.  Output stays byte-identical to main.
 
+## Rollback switches, and what PR #954 does that this branch could use
+
+antirez/ds4#954 (pre-M5 DeepSeek decode and prefill, bit-exact) puts every
+optimisation behind its own `DS4_..._DISABLE_...` switch with an aggregate
+that turns the whole set off, and measures each against its rollback.  This
+branch has the same shape now.  Each switch restores the pre-branch path for
+one change, and `DS4_METAL_DISABLE_GLM53_FLASH_TUNING` restores all of them:
+
+| switch | restores |
+|---|---|
+| `DS4_METAL_DISABLE_GLM53_HC_PRODUCER_FUSE` | four dispatches per mHC producer site instead of the fused BF16 kernel |
+| `DS4_METAL_DISABLE_GLM53_KDA_GATE_PAIR` | separate f_a / g_a and f_b / g_b projections |
+| `DS4_METAL_DISABLE_GLM53_KDA_GATE_TRIO` | beta as its own projection beside the pair |
+| `DS4_METAL_DISABLE_GLM53_KDA_OUT_HC_EXPAND` | a separate HC expand after kda_output |
+| `DS4_METAL_DISABLE_GLM53_ATTN_OUT_HC_EXPAND` | a separate HC expand after attn_output |
+| `DS4_METAL_DISABLE_GLM53_FFN_HC_EXPAND_ADD` | a separate routed+shared add and HC expand in the FFN tail |
+| `DS4_METAL_DISABLE_GLM53_SHARED_DOWN_HC_EXPAND` | the shared down-projection without the routed add and expand |
+| `DS4_METAL_DISABLE_GLM53_DSA_EXACT` | the generic DSA attention kernel |
+| `DS4_METAL_DISABLE_GLM53_FLASH_TUNING` | every path above at once |
+
+Not switchable: the KDA decay hoist, a kernel-internal cleanup that is
+bit-identical (the KDA prefill/decode consistency test) and worth nothing
+measurable, and the prefill constants, which are knobs with their defaults
+unchanged.  `DS4_METAL_DISABLE_GLM53_DSA_SPLIT` belongs to the GLM 5.2 path.
+
+With the aggregate set, greedy output is byte-identical to main and decodes the 1,471-token prompt at 22.28 tok/s against main's 22.21, with 146,046 encoder acquisitions over the run against 86,610 on the default path -- the unfused dispatch structure is back, so the switch restores the paths and not just the numbers.
+
+Two of #954's pieces could in principle apply to GLM 5.3 Flash; neither
+does in practice:
+
+- **Greedy chain decode** keeps the token id on the GPU so the host's
+  `waitUntilCompleted`, logits readback, argmax and re-encode leave the
+  per-token critical path; #954 measures the boundary at about 0.5 ms of GPU
+  idle per DeepSeek token and gains 1.75%.  Here `DS4_METAL_GPU_BUSY_PROFILE`
+  over 16 decode tokens accumulates 35.2 ms of GPU time per 35.3 ms token:
+  the GLM decode loop already flushes command buffers every four layers, so
+  the GPU idles about 0.1 ms per token, a 0.3% ceiling.  Not worth the
+  device-resident token ring, GPU argmax and session plumbing it takes.
+- **Batch indexer-query pruning** skips the indexer query projection, RoPE,
+  QAT and weight projection for prefill batches whose attention is entirely
+  within the dense window; #954 gains 1.3-1.8% of prefill.  GLM's indexed
+  prefill already does this: `use_causal_range_select` is true while the
+  chunk's rows fit the 4096-row window, and the query projection is inside
+  `if (!use_causal_range_select)`.
+
+The rest of #954 is DeepSeek attention and MoE kernels (raw-layer gathered
+attention, packed32, RB4-staged prefill rows, sum6/attn-out HC fusions) with
+no GLM 5.3 Flash counterpart on the same shapes.
+
 ## A trap when verifying a decode-path change
 
 `ds4-bench --dump-frontier-logits-dir` writes one file per **frontier**, which
