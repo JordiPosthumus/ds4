@@ -429,28 +429,17 @@ that is 409 GB/s, **56% of ceiling** -- real headroom, but not the collapse the
 old figure implied.  `qk_low` accounts for 0.55 ms of the stage, leaving 7.23
 ms in the kernel proper.
 
-### The fix was already written
+### The split kernel was tried first, and is not what ships
 
-`kernel_glm_attention_indexed_decode_split_group8_partial` is exactly the
-design this needed: 8 heads per threadgroup so a loaded cache row serves eight
-of them, 16 rows staged in threadgroup memory so scoring and the weighted sum
-read device memory once, and row blocking so the work is split across many more
-threadgroups than the generic kernel's 64.  GLM 5.2 decode has been running
-it all along; two guards kept GLM 5.3 out:
-
-- `args.qk_rope != 64u` in the kernel and in the dispatch.  Everything rope in
-  that kernel is driven by `rope_vecs = qk_rope >> 2`, so at 0 the staging loop
-  runs no iterations, `rope_shared` is never touched and the per-lane rope dot
-  is skipped.  The scratch sizing already drops the rope term at 0, and the
-  `freq_base`/`freq_scale` validation is already written as `qk_rope != 0 &&
-  ...`.  The kernel was correct for this case; only the guard excluded it.
-- `glm_graph_indexed_decode_split_blocks() <= 64u`, which checks the worst-case
-  **buffer sizing** (65 for GLM 5.3's 2051-row limit) rather than the runtime
-  block count the reduce kernel actually limits (16 here).  The partial buffers
-  are allocated for 65 blocks regardless, so relaxing this to `needed_blocks <=
-  64u` is the check that was intended.
-
-Relaxing both, at ctx 2048, interleaved:
+`kernel_glm_attention_indexed_decode_split_group8_partial` is the obvious
+candidate: 8 heads per threadgroup so a loaded cache row serves eight of them,
+16 rows staged in threadgroup memory so scoring and the weighted sum read
+device memory once, and row blocking so the work spreads over many more
+threadgroups than the generic kernel's 64.  GLM 5.2 decode has been running it
+all along; two guards kept GLM 5.3 out (`qk_rope != 64`, every rope path of
+which is zero-trip at GLM 5.3's `n_rot = 0`, and a block-count check against
+worst-case buffer sizing rather than the runtime count).  Relaxing both, at
+ctx 2048, interleaved:
 
 | | tok/s | ms/token |
 |---|---:|---:|
@@ -458,82 +447,109 @@ Relaxing both, at ctx 2048, interleaved:
 | split group8 | **28.318** | **35.31** |
 | | **+16.86%** | |
 
-**This is the largest single gain in the branch**, and it came from deleting
-two guard clauses rather than writing a kernel.
+It is not bit-exact against the generic kernel, though: it scores with
+lane-split dots and reduces with an online softmax across row blocks, and the
+DSA attention outputs differ by 3.06e-05 of range.  That is float reordering,
+and every quality measurement taken -- greedy generation identical over 128 to
+256 tokens on six prompts, long-context NLL within 0.002% -- says it is
+harmless.  It still fails the standard this branch holds itself to, which is
+that a faster path must reproduce the path it replaces, so **on this branch
+GLM 5.3 does not use it.**  It remains what it was before, GLM 5.2's kernel,
+now selectable off under `--quality` (the generic kernel is the exact one) and
+via `DS4_METAL_DISABLE_GLM53_DSA_SPLIT`, and covered by `tests/test_glm53_kda`
+against a double-precision reference with out-of-range and `UINT32_MAX` rows
+in the selection.
 
-### The 1.04% deviation, and what the row check is and is not
+One thing about its call site was wrong and is fixed regardless: it passed
+`selected_rows_valid = true`, selecting the kernel variant that skips the `row
+< cache_cap` test.  GLM 5.2's selections are always in range.  GLM 5.3's are
+not once more than the 4096-row full-attention window is visible (8192 under
+SSD streaming): beyond it the pool selector supplies 2051 rows padded with
+`UINT32_MAX` sentinels, and the unchecked variant reads those out of bounds.
+On this machine those reads returned values whose effect stayed below the
+greedy threshold -- a build with the check skipped was byte-identical over 128
+tokens on prompts of 1,471, 3,841 and 10,352 tokens -- and the 1.04% deviation
+an earlier revision attributed to them could not be reproduced.  An
+out-of-bounds read is a bug whatever it returns, so the call site passes
+`false` for every GLM model; on all-valid selections the two variants perform
+the same arithmetic in the same order, which the test asserts bit for bit, so
+GLM 5.2 is unchanged.
 
-The split path reduces with an online softmax across blocks, so some deviation
-from the generic single-pass softmax is expected.  The first measurement showed
-**1.04% of range** on the DSA attention outputs, with greedy generation
-diverging after 60-130 tokens.  It was written up as acceptable
-online-softmax noise, then re-attributed to the call site passing
-`selected_rows_valid = true` -- which selects the kernel variant that skips the
-`row < cache_cap` test on every selected row -- after switching it to `false`
-measured 3.06e-05 of range and identical greedy output.
+### The kernel that ships: the generic arithmetic, staged and shared
 
-Neither explanation survives a direct check.  On the resident decode path the
-selection is always the dense range `0..visible-1`:
-`glm_graph_dense_compact_attention_limit` returns the whole allocated context
-for GLM 5.3, so the top-k/pool path -- the only one that emits `UINT32_MAX`
-tail sentinels -- is never taken by single-token decode.  A build that passes
-`true` produces greedy output **byte-identical** to the `false` build over 128
-tokens on a 1,471-token prompt at ctx 4096 and a 3,841-token prompt at ctx
-8192, and `tests/test_glm53_kda` shows the two kernel variants are
-bit-identical on any all-valid selection.  Whatever produced the 1.04% figure
--- the same commit records a stale binary confusing a later re-measurement --
-it was not the row check, and 3.06e-05 is what the split kernel costs on its
-own.
+The generic kernel's cost is structural, not arithmetic: one threadgroup per
+head, each walking every selected row twice.  The arithmetic can be kept to
+the operation and reorganised around it.
+`kernel_glm_attention_indexed_decode_exact_*` computes the same thing in four
+phased dispatches:
 
-The call site keeps `false`.  The kernel's contract admits arbitrary row ids,
-the batch selection path pads with `pad_row`, and the pool expansion emits
-sentinels; the check makes the kernel correct under its contract rather than
-under today's caller, and it costs **0.24%** of decode.  GLM 5.2, which had
-been running the unchecked variant since before this branch (its RoPE tail is
-64 wide, so the guards above never excluded it), is unchanged: the test asserts
-the two variants agree bit for bit on an all-valid selection.
+- **scores**: one thread per (head, row) running the generic kernel's
+  sequential 512-term dot, with 16 selected rows staged in threadgroup memory
+  per threadgroup for all 64 heads at once (1024 threads), so each cache row
+  is read from device memory once per token instead of 128 times;
+- **weights**: one 256-thread threadgroup per head -- the generic kernel's
+  threadgroup -- running its per-thread row partition and its 128/64/../1
+  reduction tree for the max and the denominator, and turning scores into
+  softmax weights in place;
+- **lora**: one thread per (head, column pair) walking rows 0..n-1 in
+  selection order with the generic kernel's `acc += w * kv` chain, over 8
+  heads x 64 columns per threadgroup so a row slice is loaded once for eight
+  heads.  Rows are consumed in stages of 32: every thread fetches 16 bytes and
+  one weight three stages ahead into double-buffered threadgroup memory, so
+  the scattered row reads are in flight while the fma chains run.  A row past
+  `cache_cap` contributes `fma(0, kv[0], acc)`, which leaves `acc` unchanged
+  bit for bit, where the generic kernel skips it;
+- **value**: the generic kernel's quantised row dot from threadgroup memory,
+  one thread per output element, over 256 threadgroups instead of 64.
 
-What the split kernel costs against the generic one, rows bounds-checked:
+Every floating-point operation, operand and ordering is the generic kernel's,
+so the output is bit-identical to it, and that is asserted rather than
+assumed:
 
-- DSA attention outputs differ by **3.06e-05 of range**;
-- greedy generation is **identical** over 128 tokens on two prompts
-  (1,471 and 3,841 tokens, ctx 4096 and 8192) and over 256 tokens on four
-  prompts of about 2,900 tokens at ctx 8192, with no repetition in either arm;
-- long-context teacher-forced NLL over 1,797 tokens is **1.833376 against the
-  generic path's 1.833405, a delta of -0.0016%**.
+- `tests/test_glm53_kda` runs the exact kernels and the generic kernel on one
+  fixture at 8, 513, 1024, 2048, 2051 and 4096 selected rows, with rows at and
+  past `cache_cap` and `UINT32_MAX` sentinels in the selection, and requires
+  the outputs to match with `memcmp`;
+- greedy generation from this tip is **byte-identical to 110afdd** over 128
+  tokens on a 1,471-token prompt at ctx 4096 (dense window, every row valid),
+  a 3,841-token prompt at ctx 8192 (dense window, 3,841 rows) and a
+  10,352-token prompt at ctx 16384 (pool selector, 2051 rows with sentinels).
+  No switches and no quality mode: the default path reproduces the base
+  commit.
 
-Greedy decoding amplifies any difference at a near-tie, so continuations will
-diverge eventually on some prompt; that is why `--quality` exists, not a
-quality result.
+What the phases cost at about 1,500 selected rows, each measured by dropping
+its dispatch and reading the change in decode time:
 
-The lesson is worth keeping, with its own correction.  "This optimisation is
-not bit-exact, and here is a quality run showing the difference is small" is a
-comfortable story that can absorb a real bug -- and "we found the bug" is an
-equally comfortable story that can absorb a measurement error.  The durable
-evidence is a direct comparison of the two variants on the same inputs, which
-is what the unit test and the byte-compared greedy runs now are.
+| phase | ms/token |
+|---|---:|
+| scores | 0.33 |
+| weights | 0.18 |
+| lora, first version: row ids and weights read from device per row | 2.60 |
+| lora, pipelined | 0.64 |
+| value | 0.39 |
 
-### What guards the split path now
+The first lora version was slower than the generic kernel it replaced -- two
+serialised device loads per row instead of one.  Staging and prefetching is
+what made the phase cheap; the arithmetic never changed.
 
-- **`--quality` selects the generic kernel**, as it does for every other
-  fast-versus-exact pair in the engine, so quality mode reproduces the
-  pre-branch DSA arithmetic exactly.  `DS4_METAL_DISABLE_GLM53_DSA_SPLIT` does
-  the same in default mode, for A/B runs.
-- **`tests/test_glm53_kda` compares the two kernels directly.**  Both run
-  against a double-precision reference at 8, 513, 1024, 2048 and 2051 selected
-  rows, covering the 1-, 17-, 32-, 16- and 33-block reductions and the
-  fixed-count 16-block reduce, with rows at and past `cache_cap` and
-  `UINT32_MAX` sentinels placed in the selection and rows just past
-  `cache_cap` filled with values that would dominate any softmax they leaked
-  into.  It also checks the wrapper refuses a 65-block request, that the split
-  output is repeatable, and the all-valid equivalence above.  Observed
-  deviations are about 1e-5 of the output scale for both kernels against a
-  1e-4 tolerance; passing `true` at the call site fails the first case by ten
-  times the output scale, because this fixture, unlike today's decode caller,
-  does hand the kernel rows past `cache_cap`.
-- **The two-host tensor-parallel head split keeps the generic kernel for GLM
-  5.3.**  Only the single-host configuration has been measured; GLM 5.2 under
-  tensor parallelism ran the split kernel before this branch and is unchanged.
+Decode from the CLI, greedy, 128 tokens, single runs (the interleaved
+benchmark below is the figure to quote):
+
+| prompt | ctx | main | this tip | non-exact split kernel |
+|---|---:|---:|---:|---:|
+| 1,471 tokens | 4096 | 22.21 | **28.25** | 28.67 |
+| 3,841 tokens | 8192 | 19.05 | **27.23** | 28.35 |
+| 10,352 tokens | 16384 | 20.91 | **27.07** | 27.8 |
+
+The exact kernels give back nearly all of what the split kernel offered --
+within 1.5% at the short prompt -- while reproducing the base commit's output
+bit for bit.  Three more dispatches per DSA layer (four instead of one) account
+for about 0.15 ms/token of the gap.
+
+`--quality` keeps the exact kernels, since they are exact;
+`DS4_METAL_DISABLE_GLM53_DSA_EXACT` selects the generic kernel for A/B runs.
+The two-host tensor-parallel head split keeps the generic kernel until that
+configuration has been run.
 
 ## The shared-down fusion, after a second look
 
@@ -589,29 +605,41 @@ Individual commits report gains against whatever baseline was current when they
 landed, which does not compose into a branch number.  This is the direct
 measurement: the pre-series commit and the branch tip, each built in its own
 tree so each reads its own `metal/*.metal`, run against the **same unchanged
-GGUF** with the same harness, contexts and interleaving.
+GGUF** with the same harness, in the order main / branch / branch / main so
+that drift lands on both arms alike.
 
-    ctx 2048, 128 generated tokens, arms interleaved, 3 pairs
+    ds4-bench, promessi_sposi.txt, 128 greedy tokens per frontier,
+    frontiers 2048, 4096, 8192, 16384; four runs, main / branch / branch / main
 
-    base (110afdd)   21.160 tok/s   47.26 ms/token
-    tip              28.300 tok/s   35.34 ms/token
-    engine-only      +33.74%
+| frontier | main prefill | branch prefill | prefill | main decode | branch decode | decode |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2048 | 429.98 / 429.52 | 429.71 / 429.89 | +0.01% | 21.09 / 21.12 | 27.82 / 27.84 | **+31.86%** |
+| 4096 | 390.14 / 390.08 | 389.93 / 390.03 | -0.03% | 20.75 / 20.76 | 27.12 / 27.13 | **+30.69%** |
+| 8192 | 392.23 / 392.08 | 392.01 / 392.00 | -0.04% | 20.71 / 20.69 | 26.99 / 27.04 | **+30.51%** |
+| 16384 | 389.49 / 389.54 | 389.33 / 389.45 | -0.03% | 20.65 / 20.58 | 26.88 / 26.98 | **+30.63%** |
+
+Both runs of each arm are shown; the deltas compare the means.  Prefill is
+untouched by this branch's decode work and measures as such.  At ctx 2048 the
+base arm reproduces the 21.16 tok/s measured at the start of this series, so
+machine conditions have not drifted.
 
 Contributions, each measured against the baseline current when it landed: the
-widened BF16 loads ~+5.4%, the mHC producer fusion +5.67%, the KDA gate pairing
-+0.74%, the three HC-expand epilogues +0.46% / +0.11% / +0.14%, the
-shared-down/HC fusion +0.77%, the gate trio +0.30%, and the grouped/split DSA
-kernel +16.86%.
+mHC producer fusion +5.67%, the KDA gate pairing +0.74%, the three HC-expand
+epilogues +0.46% / +0.11% / +0.14%, the shared-down/HC fusion +0.77%, the gate
+trio +0.30%, and the exact phased DSA kernels (see above).  The widened BF16
+loads (~+5.4%) and the split DSA kernel for GLM 5.3 (+16.86%) were measured on
+the way and are not on this branch's default path, for the reason in the next
+section.
 
 Note the base reproduces the 21.19 tok/s of the original budget almost exactly,
 which is a useful check that machine conditions have not drifted between the
 first measurements in this document and the last.
 
 Stacking the model-artifact changes on the engine, all at ctx 2048.  **This
-table predates the grouped/split DSA kernel**: it was taken at d5b7895, when
-the engine-only tip measured 23.99 tok/s, and has not been re-measured since,
-so its rows are not comparable with the 28.300 figure above.  What it still
-shows is the artifact effect on top of one engine state:
+table predates the exact DSA kernels**: it was taken at d5b7895, when the
+engine-only tip measured 23.99 tok/s, and has not been re-measured since, so
+its rows are not comparable with the figure above.  What it still shows is the
+artifact effect on top of one engine state:
 
 | model file | tok/s at d5b7895 | vs base engine + original artifact |
 |---|---:|---:|
@@ -622,49 +650,38 @@ shows is the artifact effect on top of one engine state:
 Only the first row is an engine result.  The other two combine it with the
 requantized artifacts and should never be quoted as engine tuning.
 
-## Two changes are not bit-exact, and `--quality` restores both
+## Nothing on the default path is left that is not bit-exact
 
-Every fusion in this branch is bit-exact against the path it replaces, with
-two exceptions.  Each is deterministic, but each reduces in a different order
-from the kernel it displaced:
+Two changes made on the way here were deterministic but not bit-identical to
+the paths they replaced.  Both are off this branch's default path:
 
-- **the widened BF16 matvec loads** -- `kernel_glm53_mul_mv_bf16_f32` and the
-  fused qkv/pair/trio/HC-expand variants that share its row helper --
-  repartition which lane accumulates which k;
-- **the grouped/split DSA attention kernel** scores with lane-split dots and
-  reduces with an online softmax across row blocks.
-
-`--quality` keeps the scalar BF16 accumulation and the generic DSA kernel, so
-quality mode runs the pre-branch arithmetic for both.  In default mode,
-`DS4_METAL_DISABLE_GLM53_BF16_WIDE` and `DS4_METAL_DISABLE_GLM53_DSA_SPLIT`
-isolate each one for A/B runs.  `tests/test_glm53_kda` checks the scalar BF16
-path in quality mode at the 512/1024/4096 widths that would otherwise take a
-wide branch, and the split kernel against the generic one directly.
+- **The widened BF16 matvec loads** (about +5.4%) repartitioned which lane
+  accumulates which k.  An exact wide variant would have to redistribute every
+  lane's strided elements with cross-lane shuffles, two per element, which
+  costs roughly what the widening saved, so the scalar accumulation -- the
+  pre-branch kernel -- is the only path.  The fused qkv/pair/trio/HC-expand
+  kernels share its row helper unchanged, so they stay exact.
+- **The grouped/split DSA kernel** (+16.86%) is replaced for GLM 5.3 by the
+  exact phased kernels.  GLM 5.2 keeps it as before, with `--quality`
+  selecting the generic kernel there.
 
 ### Checked end to end against the base commit
 
 Greedy generation (`--raw-prompt --temp 0`, 128 tokens), the tip and 110afdd
-each built in its own worktree, byte-compared on a 1,471-token prompt at ctx
-4096 and a 3,841-token prompt at ctx 8192, both from `promessi_sposi.txt`:
+each built in its own worktree, byte-compared, both in default mode:
 
-| tip arm | base arm | result |
-|---|---|---|
-| `--quality` | `--quality` | **byte-identical**, both prompts |
-| default, both `DS4_METAL_DISABLE_GLM53_*` set | default | **byte-identical**, both prompts |
-| default | default | byte-identical on both, which is coincidence at 128 tokens, not a property |
+| prompt | ctx | selection | result |
+|---|---:|---|---|
+| 1,471 tokens | 4096 | dense, 1,472+ rows | **byte-identical** |
+| 3,841 tokens | 8192 | dense, 3,842+ rows | **byte-identical** |
+| 10,352 tokens | 16384 | pool top-k, 2051 rows with sentinels | **byte-identical** |
 
-The first row is what `--quality` promises.  The second is the stronger
-statement about the rest of the branch: with the two non-exact kernels
-switched off, every other change reproduces the base commit's output exactly,
-so the "bit-exact" claims made commit by commit hold end to end.  Encoder
-counts confirm which kernel ran in each arm (the split path adds one dispatch
-per DSA layer per token: 11 x 127 = 1,397 more acquisitions than the generic
-arm; the `--quality` arm has none of them).
-
-The split kernel under `--ssd-streaming`, same prompt, 32 tokens: split and
-generic arms byte-identical to each other, and to the resident run's first 32
-tokens, at 7.5 tok/s against 7.4.  Tensor parallelism was not run; the split
-kernel stays off there for GLM 5.3.
+Encoder counts confirm the exact path ran: it adds three dispatches per DSA
+layer per token, 33 x 127 = 4,191 more acquisitions than the generic arm,
+which is itself byte-identical to the base.  Under `--ssd-streaming`, same
+prompt, 32 tokens, the exact and generic arms are byte-identical to each
+other and to the resident run.  Tensor parallelism was not run; the exact
+kernels stay off there.
 
 ## A trap when verifying a decode-path change
 
