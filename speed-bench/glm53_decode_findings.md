@@ -641,6 +641,31 @@ isolate each one for A/B runs.  `tests/test_glm53_kda` checks the scalar BF16
 path in quality mode at the 512/1024/4096 widths that would otherwise take a
 wide branch, and the split kernel against the generic one directly.
 
+### Checked end to end against the base commit
+
+Greedy generation (`--raw-prompt --temp 0`, 128 tokens), the tip and 110afdd
+each built in its own worktree, byte-compared on a 1,471-token prompt at ctx
+4096 and a 3,841-token prompt at ctx 8192, both from `promessi_sposi.txt`:
+
+| tip arm | base arm | result |
+|---|---|---|
+| `--quality` | `--quality` | **byte-identical**, both prompts |
+| default, both `DS4_METAL_DISABLE_GLM53_*` set | default | **byte-identical**, both prompts |
+| default | default | byte-identical on both, which is coincidence at 128 tokens, not a property |
+
+The first row is what `--quality` promises.  The second is the stronger
+statement about the rest of the branch: with the two non-exact kernels
+switched off, every other change reproduces the base commit's output exactly,
+so the "bit-exact" claims made commit by commit hold end to end.  Encoder
+counts confirm which kernel ran in each arm (the split path adds one dispatch
+per DSA layer per token: 11 x 127 = 1,397 more acquisitions than the generic
+arm; the `--quality` arm has none of them).
+
+The split kernel under `--ssd-streaming`, same prompt, 32 tokens: split and
+generic arms byte-identical to each other, and to the resident run's first 32
+tokens, at 7.5 tok/s against 7.4.  Tensor parallelism was not run; the split
+kernel stays off there for GLM 5.3.
+
 ## A trap when verifying a decode-path change
 
 `ds4-bench --dump-frontier-logits-dir` writes one file per **frontier**, which
