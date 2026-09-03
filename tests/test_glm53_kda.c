@@ -184,8 +184,8 @@ static void check_split_dsa_attention(uint8_t *model, size_t model_bytes,
         SA_LORA = 512,
         SA_NOPE = 64,
         SA_VALUE = 8,
-        SA_MAX_SELECTED = 2051,
-        SA_CAP = 2115,          /* > SA_MAX_SELECTED and coprime with 7919 */
+        SA_MAX_SELECTED = 4096,
+        SA_CAP = 4163,          /* > SA_MAX_SELECTED and coprime with 7919 */
         SA_POISON_ROWS = 16,    /* allocated past cache_cap, never to be read */
         SA_ROWS = SA_CAP + SA_POISON_ROWS,
         SA_MAX_BLOCKS = 65,
@@ -202,6 +202,7 @@ static void check_split_dsa_attention(uint8_t *model, size_t model_bytes,
         {2048, 128, true},   /* 16 blocks: the fixed-count reduce */
         {2051, 128, true},   /* 17 blocks: GLM 5.3's selection limit */
         {2051, 64,  true},   /* 33 blocks */
+        {4096, 128, true},   /* 32 blocks: the resident dense window */
         {2051, 32,  false},  /* 65 blocks: more than the reduce walks */
     };
 
@@ -223,8 +224,9 @@ static void check_split_dsa_attention(uint8_t *model, size_t model_bytes,
     float *gen = malloc((size_t)SA_HEADS * SA_VALUE * sizeof(*gen));
     float *spl = malloc((size_t)SA_HEADS * SA_VALUE * sizeof(*spl));
     float *spl2 = malloc((size_t)SA_HEADS * SA_VALUE * sizeof(*spl2));
+    float *exact = malloc((size_t)SA_HEADS * SA_VALUE * sizeof(*exact));
     require_ok(kv_bits && kv && low && q && sel && ref && lora &&
-               gen && spl && spl2, "split attention host allocation");
+               gen && spl && spl2 && exact, "split attention host allocation");
     for (uint32_t row = 0; row < SA_ROWS; row++) {
         const float a = row < SA_CAP
             ? (float)((int)(row % 23u) - 11) / 22.0f
@@ -273,8 +275,13 @@ static void check_split_dsa_attention(uint8_t *model, size_t model_bytes,
     ds4_gpu_tensor *kv_gpu = ds4_gpu_tensor_alloc((uint64_t)SA_ROWS * SA_LORA * sizeof(uint16_t));
     ds4_gpu_tensor *rope_gpu = ds4_gpu_tensor_alloc(sizeof(float));
     ds4_gpu_tensor *sel_gpu = ds4_gpu_tensor_alloc((uint64_t)SA_MAX_SELECTED * sizeof(uint32_t));
+    ds4_gpu_tensor *exact_scores_gpu = ds4_gpu_tensor_alloc(
+        (uint64_t)SA_HEADS * SA_MAX_SELECTED * sizeof(float));
+    ds4_gpu_tensor *exact_lora_gpu = ds4_gpu_tensor_alloc((uint64_t)SA_HEADS * SA_LORA * sizeof(float));
+    ds4_gpu_tensor *exact_denom_gpu = ds4_gpu_tensor_alloc((uint64_t)SA_HEADS * sizeof(float));
     require_ok(heads_gpu && partial_lora_gpu && partial_ms_gpu && q_gpu &&
-               low_gpu && kv_gpu && rope_gpu && sel_gpu,
+               low_gpu && kv_gpu && rope_gpu && sel_gpu && exact_scores_gpu &&
+               exact_lora_gpu && exact_denom_gpu,
                "split attention GPU allocation");
     require_ok(ds4_gpu_tensor_write(q_gpu, 0, q, (uint64_t)SA_HEADS * SA_NOPE * sizeof(float)) &&
                ds4_gpu_tensor_write(low_gpu, 0, low, (uint64_t)SA_HEADS * SA_LORA * sizeof(float)) &&
@@ -367,6 +374,26 @@ static void check_split_dsa_attention(uint8_t *model, size_t model_bytes,
         require_ok(ds4_gpu_tensor_read(heads_gpu, 0, gen, (uint64_t)SA_HEADS * SA_VALUE * sizeof(float)),
                    "generic attention output read");
 
+        /* The phased exact kernels claim the generic kernel's arithmetic
+         * operation for operation, so their output must match it bit for
+         * bit -- including the excluded rows and sentinels. */
+        require_ok(ds4_gpu_glm_attention_indexed_decode_exact_tensor(
+            heads_gpu, exact_scores_gpu, exact_lora_gpu, exact_denom_gpu,
+            low_gpu, kv_gpu, model, model_bytes, value_offset, sel_gpu, n,
+            SA_CAP, true, SA_HEADS, SA_LORA, SA_NOPE, 0, SA_VALUE),
+            "exact indexed decode attention");
+        require_ok(ds4_gpu_tensor_read(heads_gpu, 0, exact, (uint64_t)SA_HEADS * SA_VALUE * sizeof(float)),
+                   "exact attention output read");
+        if (memcmp(exact, gen, (size_t)SA_HEADS * SA_VALUE * sizeof(float)) != 0) {
+            double worst = 0.0;
+            for (uint32_t i = 0; i < SA_HEADS * SA_VALUE; i++) {
+                worst = fmax(worst, fabs((double)exact[i] - (double)gen[i]));
+            }
+            fprintf(stderr, "%s: exact kernels differ from the generic kernel (max |delta| %.3g)\n",
+                    what, worst);
+            exit(1);
+        }
+
         double gen_err = 0.0, spl_err = 0.0, pair_err = 0.0;
         for (uint32_t i = 0; i < SA_HEADS * SA_VALUE; i++) {
             if (!isfinite(gen[i]) || !isfinite(spl[i])) {
@@ -386,7 +413,7 @@ static void check_split_dsa_attention(uint8_t *model, size_t model_bytes,
          * of ref_scale, orders of magnitude past this. */
         const double tol = 1e-4 * ref_scale;
         fprintf(stderr,
-                "%s: ref_scale %.3g, generic %.3g, split %.3g, split-vs-generic %.3g (tol %.3g)\n",
+                "%s: ref_scale %.3g, generic %.3g, split %.3g, split-vs-generic %.3g (tol %.3g), exact == generic\n",
                 what, ref_scale, gen_err, spl_err, pair_err, tol);
         if (gen_err > tol || spl_err > tol || pair_err > tol) {
             fprintf(stderr, "%s: attention diverged\n", what);
@@ -418,6 +445,9 @@ static void check_split_dsa_attention(uint8_t *model, size_t model_bytes,
         exit(1);
     }
 
+    ds4_gpu_tensor_free(exact_denom_gpu);
+    ds4_gpu_tensor_free(exact_lora_gpu);
+    ds4_gpu_tensor_free(exact_scores_gpu);
     ds4_gpu_tensor_free(sel_gpu);
     ds4_gpu_tensor_free(rope_gpu);
     ds4_gpu_tensor_free(kv_gpu);
@@ -426,6 +456,7 @@ static void check_split_dsa_attention(uint8_t *model, size_t model_bytes,
     ds4_gpu_tensor_free(partial_ms_gpu);
     ds4_gpu_tensor_free(partial_lora_gpu);
     ds4_gpu_tensor_free(heads_gpu);
+    free(exact);
     free(spl2);
     free(spl);
     free(gen);

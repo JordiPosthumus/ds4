@@ -41195,6 +41195,9 @@ typedef struct ds4_glm_gpu_graph {
     ds4_gpu_tensor *qk_low;
     ds4_gpu_tensor *attn_partial_lora;
     ds4_gpu_tensor *attn_partial_ms;
+    ds4_gpu_tensor *attn_exact_scores;
+    ds4_gpu_tensor *attn_exact_lora;
+    ds4_gpu_tensor *attn_exact_denom;
     ds4_gpu_tensor *batch_indexer_k;
     ds4_gpu_tensor *batch_indexer_gate;
     ds4_gpu_tensor *batch_indexer_q;
@@ -41989,11 +41992,9 @@ static uint32_t glm_graph_indexed_decode_split_block_rows_for(uint32_t n_selecte
  * DS4_METAL_DISABLE_GLM53_DSA_SPLIT selects the generic kernel for A/B runs. */
 static bool glm_graph_indexed_decode_split_group8_available(
         const ds4_glm_gpu_graph *g,
-        bool tp_split_heads,
         uint32_t n_selected) {
 #ifndef __APPLE__
     (void)g;
-    (void)tp_split_heads;
     (void)n_selected;
     return false;
 #else
@@ -42002,11 +42003,6 @@ static bool glm_graph_indexed_decode_split_group8_available(
         block_rows != 0u ? (n_selected + block_rows - 1u) / block_rows : 0u;
     if (g->quality) return false;
     if (getenv("DS4_METAL_DISABLE_GLM53_DSA_SPLIT") != NULL) return false;
-    /* GLM 5.3 on this kernel has been verified on a single host only.  Under
-     * the two-host tensor-parallel head split it keeps the generic kernel
-     * until that configuration is tested; GLM 5.2 ran the split kernel under
-     * tensor parallelism before GLM 5.3 was admitted and is unchanged. */
-    if (tp_split_heads && g->glm53) return false;
     return n_selected > 512u &&
            block_rows > 0 &&
            needed_blocks > 0 &&
@@ -42018,7 +42014,37 @@ static bool glm_graph_indexed_decode_split_group8_available(
            needed_blocks <= 64u &&
            (DS4_N_HEAD % 8u) == 0 &&
            DS4_N_KV_LORA == 512u &&
-           (DS4_N_ROT == 64u || DS4_N_ROT == 0u) &&
+           DS4_N_ROT == 64u &&
+           glm_graph_compact_cache_is_f16();
+#endif
+}
+
+/* GLM 5.3 decode attention runs the phased kernels that reproduce
+ * kernel_glm_attention_indexed_decode's arithmetic operation for operation
+ * while sharing each cache row across heads (see the kernel comment in
+ * metal/dsv4_misc.metal).  Their output is bit-identical to the generic
+ * kernel's, so --quality keeps them; DS4_METAL_DISABLE_GLM53_DSA_EXACT selects
+ * the generic kernel for A/B runs.  The two-host tensor-parallel head split
+ * keeps the generic kernel until that configuration has been run. */
+static bool glm_graph_indexed_decode_exact_available(
+        const ds4_glm_gpu_graph *g,
+        bool tp_split_heads) {
+#ifndef __APPLE__
+    (void)g;
+    (void)tp_split_heads;
+    return false;
+#else
+    static int disabled = -1;
+    if (disabled < 0) {
+        disabled = getenv("DS4_METAL_DISABLE_GLM53_DSA_EXACT") != NULL;
+    }
+    return !disabled &&
+           g->glm53 &&
+           !tp_split_heads &&
+           g->attn_exact_scores && g->attn_exact_lora && g->attn_exact_denom &&
+           DS4_N_ROT == 0u &&
+           DS4_N_KV_LORA == 512u &&
+           DS4_N_HEAD <= 64u &&
            glm_graph_compact_cache_is_f16();
 #endif
 }
@@ -43144,6 +43170,9 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
     ds4_gpu_tensor_free(g->k_nope);
     ds4_gpu_tensor_free(g->kv_norm);
     ds4_gpu_tensor_free(g->kv_raw);
+    ds4_gpu_tensor_free(g->attn_exact_denom);
+    ds4_gpu_tensor_free(g->attn_exact_lora);
+    ds4_gpu_tensor_free(g->attn_exact_scores);
     ds4_gpu_tensor_free(g->attn_partial_ms);
     ds4_gpu_tensor_free(g->attn_partial_lora);
     ds4_gpu_tensor_free(g->qk_low);
@@ -43530,6 +43559,19 @@ static bool glm_graph_alloc_slice(
     DS4_GLM_GRAPH_ALLOC_TENSOR(g->qk_low, qk_low_bytes);
     DS4_GLM_GRAPH_ALLOC_TENSOR(g->attn_partial_lora, attn_partial_lora_bytes);
     DS4_GLM_GRAPH_ALLOC_TENSOR(g->attn_partial_ms, attn_partial_ms_bytes);
+    if (g->glm53) {
+        /* Scratch for the phased exact attention kernels: one score per
+         * (head, selected row), and decode selects at most the dense window
+         * (ctx_cap) or the pool selector's limit. */
+        const uint32_t selected_limit = glm53_graph_indexer_selected_limit();
+        const uint32_t exact_rows =
+            g->ctx_cap > selected_limit ? g->ctx_cap : selected_limit;
+        DS4_GLM_GRAPH_ALLOC_TENSOR(g->attn_exact_scores,
+                                   (uint64_t)DS4_N_HEAD * exact_rows * sizeof(float));
+        DS4_GLM_GRAPH_ALLOC_TENSOR(g->attn_exact_lora, qk_low_bytes);
+        DS4_GLM_GRAPH_ALLOC_TENSOR(g->attn_exact_denom,
+                                   (uint64_t)DS4_N_HEAD * sizeof(float));
+    }
     DS4_GLM_GRAPH_ALLOC_TENSOR(g->kv_raw, kv_raw_bytes);
     DS4_GLM_GRAPH_ALLOC_TENSOR(g->kv_norm, kv_norm_bytes);
     DS4_GLM_GRAPH_ALLOC_TENSOR(g->k_nope, k_nope_bytes);
@@ -52646,8 +52688,30 @@ static bool glm_graph_forward_token(
                  * rest of the layer stays finite (timing-only). */
                 ok = ds4_gpu_tensor_fill_f32(g->heads, 0.0f,
                                              (uint64_t)g->heads_dim) != 0;
+            } else if (ok && l->attn_v_b->type == DS4_TENSOR_Q8_0 &&
+                       glm_graph_indexed_decode_exact_available(g, tp_split_layer_heads)) {
+                ok = ds4_gpu_glm_attention_indexed_decode_exact_typed_tensor(
+                         g->heads,
+                         g->attn_exact_scores,
+                         g->attn_exact_lora,
+                         g->attn_exact_denom,
+                         g->qk_low,
+                         g->layer_kv_lora_cache[il],
+                         model->map,
+                         model->size,
+                         l->attn_v_b->abs_offset,
+                         l->attn_v_b->type,
+                         last_indexer_selected,
+                         last_indexer_selected_count,
+                         g->compact_cache_cap,
+                         glm_graph_compact_cache_is_f16(),
+                         DS4_N_HEAD,
+                         DS4_N_KV_LORA,
+                         (uint32_t)g->q_nope,
+                         DS4_N_ROT,
+                         DS4_N_VALUE_MLA) != 0;
             } else if (ok && glm_graph_indexed_decode_split_group8_available(
-                                     g, tp_split_layer_heads, last_indexer_selected_count)) {
+                                     g, last_indexer_selected_count)) {
                 const uint32_t split_block_rows =
                     glm_graph_indexed_decode_split_block_rows_for(last_indexer_selected_count);
                 const uint32_t split_blocks =
