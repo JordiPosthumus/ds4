@@ -351,20 +351,23 @@ comparable with the earlier 15.99.
 ### How much launch overhead is left in total
 
 Chasing the residual stage by stage has diminishing returns, so
-`DS4_METAL_ENCODER_COUNT` counts compute encoders instead -- one per dispatch
-for essentially every primitive here.  Differencing two runs of different
-decode length removes prefill and setup:
+`DS4_METAL_ENCODER_COUNT` counts compute-encoder acquisitions instead -- one
+per dispatch for essentially every primitive here.  (It is acquisitions, not
+encoder objects: inside a batch the same encoder is handed back for every
+dispatch, so the count is a dispatch proxy.)  Differencing two runs of
+different decode length removes prefill and setup:
 
-    6,605 encoders over 8 decode tokens
+    6,605 acquisitions over 8 decode tokens
     26,989 over 40
     (26989 - 6605) / 32 = **637 dispatches per decode token**
 
-At the 4.6 us launch cost measured from the gate pairing, that is **2.93
-ms/token, about 7% of the 41.31 ms step**, spread across every stage rather
-than concentrated in the residual.  It is the floor that all remaining
-dispatch-count work is competing for, and it bounds the fusion approach as a
-whole: no arrangement of the current graph gets under it without removing
-launches.
+If the 4.6 us launch cost measured on the gate pairing transfers to the other
+kernels and command-buffer arrangements -- which has not been checked, so treat
+this as an estimate rather than a measured floor -- that is about **2.93
+ms/token, 7% of the 41.31 ms step**, spread across every stage rather than
+concentrated in the residual.  It is roughly what the remaining dispatch-count
+work is competing for: no arrangement of the current graph gets under the
+launch overhead without removing launches, whatever its exact size.
 
 For scale, the fusions in this branch have already taken roughly 3.5 ms of
 dispatch and intermediate-traffic cost out of the step, so what is left is
@@ -604,18 +607,17 @@ Note the base reproduces the 21.19 tok/s of the original budget almost exactly,
 which is a useful check that machine conditions have not drifted between the
 first measurements in this document and the last.
 
-Stacking the model-artifact changes on top of the same tip, all at ctx 2048:
+Stacking the model-artifact changes on the engine, all at ctx 2048.  **This
+table predates the grouped/split DSA kernel**: it was taken at d5b7895, when
+the engine-only tip measured 23.99 tok/s, and has not been re-measured since,
+so its rows are not comparable with the 28.300 figure above.  What it still
+shows is the artifact effect on top of one engine state:
 
-| model file | tok/s | vs base engine + original artifact |
+| model file | tok/s at d5b7895 | vs base engine + original artifact |
 |---|---:|---:|
 | GLM-5.3-Flash-Q4_K | 23.99 | +13.2% |
 | GLM-5.3-Flash-Q4_K-kdaQ8 | 27.50 | +29.8% |
 | GLM-5.3-Flash-Q4_K-kdaHeadQ8 | 28.23 | +33.2% |
-
-All three re-measured on the current tip with the same harness as the
-engine-only figure above, so the first row agrees with it.  An earlier revision
-of this table was taken several commits back and disagreed with the headline by
-0.4 tok/s for that reason.
 
 Only the first row is an engine result.  The other two combine it with the
 requantized artifacts and should never be quoted as engine tuning.
