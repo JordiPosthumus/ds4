@@ -41982,22 +41982,43 @@ static uint32_t glm_graph_indexed_decode_split_block_rows_for(uint32_t n_selecte
     return n_selected <= 1024u ? 32u : 128u;
 }
 
-static bool glm_graph_indexed_decode_split_group8_available(uint32_t n_selected) {
+/* The grouped/split kernel scores with lane-split dots and reduces with an
+ * online softmax across row blocks, so its output is deterministic but not
+ * bit-identical to the generic kernel's.  --quality keeps the generic kernel,
+ * as it does for every other exact-versus-fast pair; in default mode
+ * DS4_METAL_DISABLE_GLM53_DSA_SPLIT selects the generic kernel for A/B runs. */
+static bool glm_graph_indexed_decode_split_group8_available(
+        const ds4_glm_gpu_graph *g,
+        bool tp_split_heads,
+        uint32_t n_selected) {
 #ifndef __APPLE__
+    (void)g;
+    (void)tp_split_heads;
     (void)n_selected;
     return false;
 #else
     const uint32_t block_rows = glm_graph_indexed_decode_split_block_rows_for(n_selected);
     const uint32_t needed_blocks =
         block_rows != 0u ? (n_selected + block_rows - 1u) / block_rows : 0u;
+    if (g->quality) return false;
+    if (getenv("DS4_METAL_DISABLE_GLM53_DSA_SPLIT") != NULL) return false;
+    /* GLM 5.3 on this kernel has been verified on a single host only.  Under
+     * the two-host tensor-parallel head split it keeps the generic kernel
+     * until that configuration is tested; GLM 5.2 ran the split kernel under
+     * tensor parallelism before GLM 5.3 was admitted and is unchanged. */
+    if (tp_split_heads && g->glm53) return false;
     return n_selected > 512u &&
            block_rows > 0 &&
            needed_blocks > 0 &&
            needed_blocks <= glm_graph_indexed_decode_split_blocks() &&
-           glm_graph_indexed_decode_split_blocks() <= 64u &&
+           /* The reduce kernel walks one thread per block and refuses more
+            * than 64, so the runtime block count is what has to fit -- not
+            * split_blocks(), which is the worst-case buffer sizing and is 65
+            * for GLM 5.3's 2051-row selection limit. */
+           needed_blocks <= 64u &&
            (DS4_N_HEAD % 8u) == 0 &&
            DS4_N_KV_LORA == 512u &&
-           DS4_N_ROT == 64u &&
+           (DS4_N_ROT == 64u || DS4_N_ROT == 0u) &&
            glm_graph_compact_cache_is_f16();
 #endif
 }
@@ -52625,7 +52646,8 @@ static bool glm_graph_forward_token(
                  * rest of the layer stays finite (timing-only). */
                 ok = ds4_gpu_tensor_fill_f32(g->heads, 0.0f,
                                              (uint64_t)g->heads_dim) != 0;
-            } else if (ok && glm_graph_indexed_decode_split_group8_available(last_indexer_selected_count)) {
+            } else if (ok && glm_graph_indexed_decode_split_group8_available(
+                                     g, tp_split_layer_heads, last_indexer_selected_count)) {
                 const uint32_t split_block_rows =
                     glm_graph_indexed_decode_split_block_rows_for(last_indexer_selected_count);
                 const uint32_t split_blocks =
@@ -52654,7 +52676,7 @@ static bool glm_graph_forward_token(
                                                                                     l->attn_v_b->type,
                                                                                     last_indexer_selected,
                                                                                     last_indexer_selected_count,
-                                                                                    true,
+                                                                                    false,
                                                                                     g->compact_cache_cap,
                                                                                     glm_graph_compact_cache_is_f16(),
                                                                                     tp_split_layer_heads ? tp_head_count : DS4_N_HEAD,

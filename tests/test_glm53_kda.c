@@ -163,6 +163,286 @@ static void check_bf16_matmul(const uint8_t *model, size_t model_bytes,
     free(actual);
 }
 
+#ifdef __APPLE__
+/*
+ * Split-versus-generic indexed decode attention.
+ *
+ * GLM 5.3 decode runs kernel_glm_attention_indexed_decode_split_group8 once
+ * more than 512 rows are selected; the generic kernel is what --quality and
+ * every other backend run.  The two score and reduce in different orders, so
+ * each is checked against a double-precision reference and they are checked
+ * against each other with a tolerance rather than bit for bit.
+ *
+ * The selection holds what the GLM 5.3 indexer actually emits: rows at and
+ * past cache_cap and UINT32_MAX tail sentinels, which both kernels must
+ * exclude.  The rows just past cache_cap exist in memory and hold values that
+ * would dominate every softmax, so a kernel that skips the bounds test fails
+ * this loudly rather than by luck.  The row counts cover one partial block,
+ * the 17-, 32-, 16- and 33-block reductions decode can request, the
+ * fixed-count 16-block reduce, and a 65-block request the wrapper must refuse.
+ */
+static void check_split_dsa_attention(uint8_t *model, size_t model_bytes,
+                                      uint64_t value_offset) {
+    enum {
+        SA_HEADS = 16,
+        SA_LORA = 512,
+        SA_NOPE = 64,
+        SA_VALUE = 8,
+        SA_MAX_SELECTED = 2051,
+        SA_CAP = 2115,          /* > SA_MAX_SELECTED and coprime with 7919 */
+        SA_POISON_ROWS = 16,    /* allocated past cache_cap, never to be read */
+        SA_ROWS = SA_CAP + SA_POISON_ROWS,
+        SA_MAX_BLOCKS = 65,
+        SA_Q8_ROW_BYTES = (SA_LORA / 32) * 34,
+    };
+    static const struct {
+        uint32_t n_selected;
+        uint32_t block_rows;
+        bool     accepted;
+    } cases[] = {
+        {8,    32,  true},   /* one partial block */
+        {513,  32,  true},   /* 17 blocks: the first count decode splits */
+        {1024, 32,  true},   /* 32 blocks */
+        {2048, 128, true},   /* 16 blocks: the fixed-count reduce */
+        {2051, 128, true},   /* 17 blocks: GLM 5.3's selection limit */
+        {2051, 64,  true},   /* 33 blocks */
+        {2051, 32,  false},  /* 65 blocks: more than the reduce walks */
+    };
+
+    /* Scores need a spread of tens, not a flat softmax, or the running-max
+     * rescale in the split kernel is never exercised.  Each row and head
+     * carries a multiple of one shared basis vector plus small noise, so
+     * scores land in about [-17, 17] with many near-maximal rows. */
+    float base[SA_LORA];
+    for (uint32_t j = 0; j < SA_LORA; j++) {
+        base[j] = (float)((int)((j * 13u) % 17u) - 8) / 8.0f;
+    }
+    uint16_t *kv_bits = malloc((size_t)SA_ROWS * SA_LORA * sizeof(*kv_bits));
+    float *kv = malloc((size_t)SA_ROWS * SA_LORA * sizeof(*kv));
+    float *low = malloc((size_t)SA_HEADS * SA_LORA * sizeof(*low));
+    float *q = calloc((size_t)SA_HEADS * SA_NOPE, sizeof(*q));
+    uint32_t *sel = malloc((size_t)SA_MAX_SELECTED * sizeof(*sel));
+    double *ref = malloc((size_t)SA_HEADS * SA_VALUE * sizeof(*ref));
+    double *lora = malloc((size_t)SA_LORA * sizeof(*lora));
+    float *gen = malloc((size_t)SA_HEADS * SA_VALUE * sizeof(*gen));
+    float *spl = malloc((size_t)SA_HEADS * SA_VALUE * sizeof(*spl));
+    float *spl2 = malloc((size_t)SA_HEADS * SA_VALUE * sizeof(*spl2));
+    require_ok(kv_bits && kv && low && q && sel && ref && lora &&
+               gen && spl && spl2, "split attention host allocation");
+    for (uint32_t row = 0; row < SA_ROWS; row++) {
+        const float a = row < SA_CAP
+            ? (float)((int)(row % 23u) - 11) / 22.0f
+            : 8.0f;   /* poison: would dominate any softmax it leaked into */
+        for (uint32_t j = 0; j < SA_LORA; j++) {
+            const float noise = row < SA_CAP
+                ? (float)((int)((row * 7u + j * 3u + (row ^ j)) % 97u) - 48) / 256.0f
+                : 0.0f;
+            const uint16_t bits = f32_to_f16(a * base[j] + noise);
+            kv_bits[(size_t)row * SA_LORA + j] = bits;
+            kv[(size_t)row * SA_LORA + j] = f16_to_f32(bits);
+        }
+    }
+    for (uint32_t h = 0; h < SA_HEADS; h++) {
+        for (uint32_t j = 0; j < SA_LORA; j++) {
+            low[(size_t)h * SA_LORA + j] =
+                (0.5f + (float)h / 16.0f) * base[j] +
+                (float)((int)((h * 11u + j * 5u) % 61u) - 30) / 240.0f;
+        }
+    }
+    /* Q8_0 value rows with unit scales, so a dequantized weight is its int8. */
+    require_ok(value_offset + (uint64_t)SA_HEADS * SA_VALUE * SA_Q8_ROW_BYTES <= model_bytes,
+               "split attention value rows fit the fixture model");
+    for (uint32_t h = 0; h < SA_HEADS; h++) {
+        for (uint32_t d = 0; d < SA_VALUE; d++) {
+            uint8_t *row = model + value_offset +
+                (size_t)(h * SA_VALUE + d) * SA_Q8_ROW_BYTES;
+            for (uint32_t b = 0; b < SA_LORA / 32u; b++) {
+                const uint16_t one = 0x3c00u;
+                memcpy(row + b * 34u, &one, sizeof(one));
+                int8_t *qs = (int8_t *)(row + b * 34u + 2u);
+                for (uint32_t i = 0; i < 32u; i++) {
+                    qs[i] = (int8_t)((int)((h * 5u + d * 3u + (b * 32u + i) * 7u) % 15u) - 7);
+                }
+            }
+        }
+    }
+
+    ds4_gpu_tensor *heads_gpu = ds4_gpu_tensor_alloc((uint64_t)SA_HEADS * SA_VALUE * sizeof(float));
+    ds4_gpu_tensor *partial_lora_gpu = ds4_gpu_tensor_alloc(
+        (uint64_t)SA_MAX_BLOCKS * SA_HEADS * SA_LORA * sizeof(float));
+    ds4_gpu_tensor *partial_ms_gpu = ds4_gpu_tensor_alloc(
+        (uint64_t)SA_MAX_BLOCKS * SA_HEADS * 2u * sizeof(float));
+    ds4_gpu_tensor *q_gpu = ds4_gpu_tensor_alloc((uint64_t)SA_HEADS * SA_NOPE * sizeof(float));
+    ds4_gpu_tensor *low_gpu = ds4_gpu_tensor_alloc((uint64_t)SA_HEADS * SA_LORA * sizeof(float));
+    ds4_gpu_tensor *kv_gpu = ds4_gpu_tensor_alloc((uint64_t)SA_ROWS * SA_LORA * sizeof(uint16_t));
+    ds4_gpu_tensor *rope_gpu = ds4_gpu_tensor_alloc(sizeof(float));
+    ds4_gpu_tensor *sel_gpu = ds4_gpu_tensor_alloc((uint64_t)SA_MAX_SELECTED * sizeof(uint32_t));
+    require_ok(heads_gpu && partial_lora_gpu && partial_ms_gpu && q_gpu &&
+               low_gpu && kv_gpu && rope_gpu && sel_gpu,
+               "split attention GPU allocation");
+    require_ok(ds4_gpu_tensor_write(q_gpu, 0, q, (uint64_t)SA_HEADS * SA_NOPE * sizeof(float)) &&
+               ds4_gpu_tensor_write(low_gpu, 0, low, (uint64_t)SA_HEADS * SA_LORA * sizeof(float)) &&
+               ds4_gpu_tensor_write(kv_gpu, 0, kv_bits, (uint64_t)SA_ROWS * SA_LORA * sizeof(uint16_t)),
+               "split attention input write");
+
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        const uint32_t n = cases[c].n_selected;
+        const uint32_t block_rows = cases[c].block_rows;
+        const uint32_t n_blocks = (n + block_rows - 1u) / block_rows;
+        char what[96];
+        snprintf(what, sizeof(what), "split attention %u rows x %u/block",
+                 n, block_rows);
+
+        /* A permutation of valid rows, with the indexer's failure shapes
+         * scattered through it: rows at and just past cache_cap, and the
+         * UINT32_MAX tail sentinels GLM 5.3's pool expansion emits. */
+        for (uint32_t s = 0; s < n; s++) sel[s] = (s * 7919u) % SA_CAP;
+        sel[0] = SA_CAP;
+        sel[1] = SA_CAP - 1u;
+        for (uint32_t s = 50; s < n; s += 97u) sel[s] = SA_CAP + s % 5u;
+        for (uint32_t s = n >= 3u ? n - 3u : 0u; s < n; s++) sel[s] = UINT32_MAX;
+        require_ok(ds4_gpu_tensor_write(sel_gpu, 0, sel, (uint64_t)n * sizeof(uint32_t)),
+                   "split attention selection write");
+
+        /* The reference follows the generic kernel: score valid rows, drop
+         * the rest, softmax, weighted lora sum, then the value projection. */
+        double ref_scale = 0.0;
+        for (uint32_t h = 0; h < SA_HEADS; h++) {
+            const float *lh = low + (size_t)h * SA_LORA;
+            double max_score = -DBL_MAX;
+            for (uint32_t s = 0; s < n; s++) {
+                if (sel[s] >= SA_CAP) continue;
+                const float *row = kv + (size_t)sel[s] * SA_LORA;
+                double dot = 0.0;
+                for (uint32_t j = 0; j < SA_LORA; j++) dot += (double)lh[j] * row[j];
+                const double score = dot * 0.125;   /* 1/sqrt(SA_NOPE) */
+                if (score > max_score) max_score = score;
+            }
+            double denom = 0.0;
+            for (uint32_t j = 0; j < SA_LORA; j++) lora[j] = 0.0;
+            for (uint32_t s = 0; s < n; s++) {
+                if (sel[s] >= SA_CAP) continue;
+                const float *row = kv + (size_t)sel[s] * SA_LORA;
+                double dot = 0.0;
+                for (uint32_t j = 0; j < SA_LORA; j++) dot += (double)lh[j] * row[j];
+                const double w = exp(dot * 0.125 - max_score);
+                denom += w;
+                for (uint32_t j = 0; j < SA_LORA; j++) lora[j] += w * row[j];
+            }
+            if (denom < 1e-20) denom = 1e-20;
+            for (uint32_t d = 0; d < SA_VALUE; d++) {
+                const uint8_t *row = model + value_offset +
+                    (size_t)(h * SA_VALUE + d) * SA_Q8_ROW_BYTES;
+                double out = 0.0;
+                for (uint32_t j = 0; j < SA_LORA; j++) {
+                    const int8_t qv = (int8_t)row[(j / 32u) * 34u + 2u + j % 32u];
+                    out += (double)qv * (lora[j] / denom);
+                }
+                ref[h * SA_VALUE + d] = out;
+                if (fabs(out) > ref_scale) ref_scale = fabs(out);
+            }
+        }
+
+        const int split_rc = ds4_gpu_glm_attention_indexed_decode_split_group8_tensor(
+            heads_gpu, partial_lora_gpu, partial_ms_gpu, q_gpu, low_gpu,
+            kv_gpu, rope_gpu, model, model_bytes, value_offset, sel_gpu, n,
+            false, SA_CAP, true, SA_HEADS, SA_LORA, SA_NOPE, 0, SA_VALUE, 0,
+            block_rows, n_blocks, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        if (!cases[c].accepted) {
+            require_ok(split_rc == 0 && n_blocks > 64u,
+                       "split attention refuses more blocks than the reduce walks");
+            continue;
+        }
+        require_ok(split_rc, what);
+        require_ok(ds4_gpu_tensor_read(heads_gpu, 0, spl, (uint64_t)SA_HEADS * SA_VALUE * sizeof(float)),
+                   "split attention output read");
+        require_ok(ds4_gpu_glm_attention_indexed_decode_split_group8_tensor(
+            heads_gpu, partial_lora_gpu, partial_ms_gpu, q_gpu, low_gpu,
+            kv_gpu, rope_gpu, model, model_bytes, value_offset, sel_gpu, n,
+            false, SA_CAP, true, SA_HEADS, SA_LORA, SA_NOPE, 0, SA_VALUE, 0,
+            block_rows, n_blocks, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f), what);
+        require_ok(ds4_gpu_tensor_read(heads_gpu, 0, spl2, (uint64_t)SA_HEADS * SA_VALUE * sizeof(float)),
+                   "split attention repeat read");
+        require_ok(ds4_gpu_glm_attention_indexed_decode_tensor(
+            heads_gpu, q_gpu, low_gpu, kv_gpu, rope_gpu, model, model_bytes,
+            value_offset, sel_gpu, n, SA_CAP, true, SA_HEADS, SA_LORA,
+            SA_NOPE, 0, SA_VALUE, 0, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f),
+            "generic indexed decode attention");
+        require_ok(ds4_gpu_tensor_read(heads_gpu, 0, gen, (uint64_t)SA_HEADS * SA_VALUE * sizeof(float)),
+                   "generic attention output read");
+
+        double gen_err = 0.0, spl_err = 0.0, pair_err = 0.0;
+        for (uint32_t i = 0; i < SA_HEADS * SA_VALUE; i++) {
+            if (!isfinite(gen[i]) || !isfinite(spl[i])) {
+                fprintf(stderr, "%s: non-finite output at %u\n", what, i);
+                exit(1);
+            }
+            gen_err = fmax(gen_err, fabs((double)gen[i] - ref[i]));
+            spl_err = fmax(spl_err, fabs((double)spl[i] - ref[i]));
+            pair_err = fmax(pair_err, fabs((double)spl[i] - (double)gen[i]));
+        }
+        if (memcmp(spl, spl2, (size_t)SA_HEADS * SA_VALUE * sizeof(float)) != 0) {
+            fprintf(stderr, "%s: split output changed on repeat\n", what);
+            exit(1);
+        }
+        /* Both kernels accumulate in f32 over up to 2051 rows and 512 lanes;
+         * a tiling, block or bounds error moves a result by a large fraction
+         * of ref_scale, orders of magnitude past this. */
+        const double tol = 1e-4 * ref_scale;
+        fprintf(stderr,
+                "%s: ref_scale %.3g, generic %.3g, split %.3g, split-vs-generic %.3g (tol %.3g)\n",
+                what, ref_scale, gen_err, spl_err, pair_err, tol);
+        if (gen_err > tol || spl_err > tol || pair_err > tol) {
+            fprintf(stderr, "%s: attention diverged\n", what);
+            exit(1);
+        }
+    }
+
+    /* GLM 5.2's selections are always in range and it ran the unchecked
+     * variant before GLM 5.3 was admitted; decode now passes false for every
+     * GLM model, which is free of numerical consequence only if the two
+     * variants perform identical arithmetic on valid rows. */
+    for (uint32_t s = 0; s < 2048u; s++) sel[s] = (s * 7919u) % SA_CAP;
+    require_ok(ds4_gpu_tensor_write(sel_gpu, 0, sel, 2048u * sizeof(uint32_t)),
+               "all-valid selection write");
+    for (int assume_valid = 0; assume_valid < 2; assume_valid++) {
+        require_ok(ds4_gpu_glm_attention_indexed_decode_split_group8_tensor(
+            heads_gpu, partial_lora_gpu, partial_ms_gpu, q_gpu, low_gpu,
+            kv_gpu, rope_gpu, model, model_bytes, value_offset, sel_gpu, 2048u,
+            assume_valid != 0, SA_CAP, true, SA_HEADS, SA_LORA, SA_NOPE, 0,
+            SA_VALUE, 0, 128u, 16u, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f),
+            "split attention on an all-valid selection");
+        require_ok(ds4_gpu_tensor_read(heads_gpu, 0, assume_valid ? spl2 : spl,
+                                       (uint64_t)SA_HEADS * SA_VALUE * sizeof(float)),
+                   "all-valid split output read");
+    }
+    if (memcmp(spl, spl2, (size_t)SA_HEADS * SA_VALUE * sizeof(float)) != 0) {
+        fprintf(stderr, "split attention: bounds-checked and unchecked "
+                        "variants differ on an all-valid selection\n");
+        exit(1);
+    }
+
+    ds4_gpu_tensor_free(sel_gpu);
+    ds4_gpu_tensor_free(rope_gpu);
+    ds4_gpu_tensor_free(kv_gpu);
+    ds4_gpu_tensor_free(low_gpu);
+    ds4_gpu_tensor_free(q_gpu);
+    ds4_gpu_tensor_free(partial_ms_gpu);
+    ds4_gpu_tensor_free(partial_lora_gpu);
+    ds4_gpu_tensor_free(heads_gpu);
+    free(spl2);
+    free(spl);
+    free(gen);
+    free(lora);
+    free(ref);
+    free(sel);
+    free(q);
+    free(low);
+    free(kv);
+    free(kv_bits);
+}
+#endif
+
 int main(void) {
     enum {
         D = 128,
@@ -206,6 +486,9 @@ int main(void) {
         /* BF16 matvec + HC-expand epilogue fixture */
         FUSED_W_OFFSET = 1720448,   /* FUSED_IN * FUSED_OUT * 2 = 131072 */
         FUSED_IN = 1024, FUSED_OUT = 64, FUSED_HC = 4,
+        /* Q8_0 value rows for the split-vs-generic attention check:
+         * 16 heads x 8 values x 544 bytes = 69632 */
+        SPLIT_V_OFFSET = 1851520,
         MODEL_BYTES = 2097152,
     };
 
@@ -797,6 +1080,8 @@ int main(void) {
     free(f32_attn_cache);
     free(f32_attn_q);
     free(f32_attn_low);
+
+    check_split_dsa_attention(model, MODEL_BYTES, SPLIT_V_OFFSET);
 #endif
 
 #ifdef DS4_ROCM_BUILD

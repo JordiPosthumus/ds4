@@ -406,57 +406,131 @@ fused via `ds4_gpu_shared_mid_swiglu_q8_0_tensor`.  Closing the remaining gap
 to 707 GB/s would be worth about 0.45 ms, 1.1%, not the large win the 38%
 figure implied.
 
-## The DSA attention core: corrected
+## The DSA attention core: corrected, then fixed
 
-An earlier revision of this section priced this stage at 135.4 MB/token and
-2.4% of the memory ceiling, and concluded that ~7.5 ms of its 7.7 was "not data
-movement".  **That was wrong by 23x on bytes**, for three reasons worth
-recording because each one is a trap:
+An earlier revision priced this stage at 135.4 MB/token and 2.4% of the memory
+ceiling.  **That was wrong by 23x on bytes**, for three reasons each worth
+recording:
 
-- **`n_rot` is 0 for GLM 5.3** (`DS4_SHAPE_GLM53`), so a compact cache row is
-  the 512-wide lora part alone, 1024 B in f16 -- not 1152 B with a 64-wide
-  rope tail.
+- **`n_rot` is 0 for GLM 5.3**, so a compact cache row is the 512-wide lora
+  part alone, 1024 B in f16 -- not 1152 B with a 64-wide rope tail.
 - **There are 11 DSA layers in the trunk, not 12.**  `attn_v_b` appears 12
-  times because the MTP layer has one, and it is not in the decode path.
+  times because the MTP layer has one, which is not in the decode path.
 - **The cache is not read once per layer.**  The generic kernel dispatches one
-  threadgroup per head -- 64 of them -- and each independently walks all
-  selected rows twice, once to score and once for the weighted sum.
+  threadgroup per head -- 64 of them -- each independently walking all selected
+  rows twice, once to score and once for the weighted sum.
 
-So the real traffic is:
+Corrected traffic: 2051 rows x 1024 B x 2 passes x 64 heads x 11 layers is
+2.96 GB, plus 0.20 GB of `attn_k_b`/`attn_v_b`, so 3.15 GB/token.  At 7.7 ms
+that is 409 GB/s, **56% of ceiling** -- real headroom, but not the collapse the
+old figure implied.  `qk_low` accounts for 0.55 ms of the stage, leaving 7.23
+ms in the kernel proper.
 
-    compact cache  2051 rows x 1024 B x 2 passes x 64 heads x 11 layers  2.96 GB
-    attn_k_b + attn_v_b, Q8_0                                            0.20 GB
-    total                                                                3.15 GB
+### The fix was already written
 
-At 7.7 ms that is **409 GB/s, 56% of ceiling** -- real headroom, but nothing
-like the collapse the earlier figure implied, and the "7.5 ms of non-data work"
-budget it produced does not exist.
+`kernel_glm_attention_indexed_decode_split_group8_partial` is exactly the
+design this needed: 8 heads per threadgroup so a loaded cache row serves eight
+of them, 16 rows staged in threadgroup memory so scoring and the weighted sum
+read device memory once, and row blocking so the work is split across many more
+threadgroups than the generic kernel's 64.  GLM 5.2 decode has been running
+it all along; two guards kept GLM 5.3 out:
 
-The corrected number points at the same structural fix for a better reason.
-Every one of the 64 heads reloads the same 2051 cache rows, twice.  Loading
-each row once and sharing it across heads would take the cache term from
-2.96 GB to about 46 MB; that is where the 56% comes from, not from latency.
+- `args.qk_rope != 64u` in the kernel and in the dispatch.  Everything rope in
+  that kernel is driven by `rope_vecs = qk_rope >> 2`, so at 0 the staging loop
+  runs no iterations, `rope_shared` is never touched and the per-lane rope dot
+  is skipped.  The scratch sizing already drops the rope term at 0, and the
+  `freq_base`/`freq_scale` validation is already written as `qk_rope != 0 &&
+  ...`.  The kernel was correct for this case; only the guard excluded it.
+- `glm_graph_indexed_decode_split_blocks() <= 64u`, which checks the worst-case
+  **buffer sizing** (65 for GLM 5.3's 2051-row limit) rather than the runtime
+  block count the reduce kernel actually limits (16 here).  The partial buffers
+  are allocated for 65 blocks regardless, so relaxing this to `needed_blocks <=
+  64u` is the check that was intended.
 
-**The split-row sweep recorded in this document was a no-op.**
-`glm_graph_indexed_decode_split_group8_available()` requires `DS4_N_ROT == 64`,
-which GLM 5.3 never satisfies, so every arm of that sweep ran the same generic
-kernel.  The flat result was measuring nothing.  `DS4_GLM_DECODE_SPLIT_BLOCK_
-ROWS` remains as instrumentation but does not reach this model.
+Relaxing both, at ctx 2048, interleaved:
 
-What the work actually is, none of it started:
+| | tok/s | ms/token |
+|---|---:|---:|
+| generic kernel | 24.232 | 41.27 |
+| split group8 | **28.318** | **35.31** |
+| | **+16.86%** | |
 
-- **A no-rope grouped DSA kernel.**  Adapt the group8 path for `n_rot == 0`,
-  split the 2051 rows across blocks, and share each loaded cache row across
-  several heads.  This is what lifts the dispatch above the current 64
-  threadgroups and removes the repeated loads at once.
-- **`qk_low` is 0.55 ms of the 7.78 ms**, now measured.  The `attn_core`
-  ablation suppresses it too, so it had never been separated.  Both instruments
-  agree (`DS4_GLM_DECODE_ABLATE=qklow` 0.51-0.55 ms, `DS4_GLM_DECODE_REPEAT=
-  qklow` 0.56-0.58 ms), which leaves **7.23 ms in the indexed-attention kernel
-  itself** -- that is the figure the grouped-kernel work is competing for.
-- **Sort the selected row ids on GPU.**  Neighbouring lanes currently gather
-  unrelated rows.  Sorting changes the softmax reduction order, so it needs
-  numerical validation, not just a benchmark.
+**This is the largest single gain in the branch**, and it came from deleting
+two guard clauses rather than writing a kernel.
+
+### The 1.04% deviation, and what the row check is and is not
+
+The split path reduces with an online softmax across blocks, so some deviation
+from the generic single-pass softmax is expected.  The first measurement showed
+**1.04% of range** on the DSA attention outputs, with greedy generation
+diverging after 60-130 tokens.  It was written up as acceptable
+online-softmax noise, then re-attributed to the call site passing
+`selected_rows_valid = true` -- which selects the kernel variant that skips the
+`row < cache_cap` test on every selected row -- after switching it to `false`
+measured 3.06e-05 of range and identical greedy output.
+
+Neither explanation survives a direct check.  On the resident decode path the
+selection is always the dense range `0..visible-1`:
+`glm_graph_dense_compact_attention_limit` returns the whole allocated context
+for GLM 5.3, so the top-k/pool path -- the only one that emits `UINT32_MAX`
+tail sentinels -- is never taken by single-token decode.  A build that passes
+`true` produces greedy output **byte-identical** to the `false` build over 128
+tokens on a 1,471-token prompt at ctx 4096 and a 3,841-token prompt at ctx
+8192, and `tests/test_glm53_kda` shows the two kernel variants are
+bit-identical on any all-valid selection.  Whatever produced the 1.04% figure
+-- the same commit records a stale binary confusing a later re-measurement --
+it was not the row check, and 3.06e-05 is what the split kernel costs on its
+own.
+
+The call site keeps `false`.  The kernel's contract admits arbitrary row ids,
+the batch selection path pads with `pad_row`, and the pool expansion emits
+sentinels; the check makes the kernel correct under its contract rather than
+under today's caller, and it costs **0.24%** of decode.  GLM 5.2, which had
+been running the unchecked variant since before this branch (its RoPE tail is
+64 wide, so the guards above never excluded it), is unchanged: the test asserts
+the two variants agree bit for bit on an all-valid selection.
+
+What the split kernel costs against the generic one, rows bounds-checked:
+
+- DSA attention outputs differ by **3.06e-05 of range**;
+- greedy generation is **identical** over 128 tokens on two prompts
+  (1,471 and 3,841 tokens, ctx 4096 and 8192) and over 256 tokens on four
+  prompts of about 2,900 tokens at ctx 8192, with no repetition in either arm;
+- long-context teacher-forced NLL over 1,797 tokens is **1.833376 against the
+  generic path's 1.833405, a delta of -0.0016%**.
+
+Greedy decoding amplifies any difference at a near-tie, so continuations will
+diverge eventually on some prompt; that is why `--quality` exists, not a
+quality result.
+
+The lesson is worth keeping, with its own correction.  "This optimisation is
+not bit-exact, and here is a quality run showing the difference is small" is a
+comfortable story that can absorb a real bug -- and "we found the bug" is an
+equally comfortable story that can absorb a measurement error.  The durable
+evidence is a direct comparison of the two variants on the same inputs, which
+is what the unit test and the byte-compared greedy runs now are.
+
+### What guards the split path now
+
+- **`--quality` selects the generic kernel**, as it does for every other
+  fast-versus-exact pair in the engine, so quality mode reproduces the
+  pre-branch DSA arithmetic exactly.  `DS4_METAL_DISABLE_GLM53_DSA_SPLIT` does
+  the same in default mode, for A/B runs.
+- **`tests/test_glm53_kda` compares the two kernels directly.**  Both run
+  against a double-precision reference at 8, 513, 1024, 2048 and 2051 selected
+  rows, covering the 1-, 17-, 32-, 16- and 33-block reductions and the
+  fixed-count 16-block reduce, with rows at and past `cache_cap` and
+  `UINT32_MAX` sentinels placed in the selection and rows just past
+  `cache_cap` filled with values that would dominate any softmax they leaked
+  into.  It also checks the wrapper refuses a 65-block request, that the split
+  output is repeatable, and the all-valid equivalence above.  Observed
+  deviations are about 1e-5 of the output scale for both kernels against a
+  1e-4 tolerance; passing `true` at the call site fails the first case by ten
+  times the output scale, because this fixture, unlike today's decode caller,
+  does hand the kernel rows past `cache_cap`.
+- **The two-host tensor-parallel head split keeps the generic kernel for GLM
+  5.3.**  Only the single-host configuration has been measured; GLM 5.2 under
+  tensor parallelism ran the split kernel before this branch and is unchanged.
 
 ## The shared-down fusion, after a second look
 
@@ -516,14 +590,15 @@ GGUF** with the same harness, contexts and interleaving.
 
     ctx 2048, 128 generated tokens, arms interleaved, 3 pairs
 
-    base (110afdd)   21.127 tok/s   47.33 ms/token
-    tip              24.180 tok/s   41.36 ms/token
-    engine-only      +14.45%
+    base (110afdd)   21.160 tok/s   47.26 ms/token
+    tip              28.300 tok/s   35.34 ms/token
+    engine-only      +33.74%
 
 Contributions, each measured against the baseline current when it landed: the
 widened BF16 loads ~+5.4%, the mHC producer fusion +5.67%, the KDA gate pairing
 +0.74%, the three HC-expand epilogues +0.46% / +0.11% / +0.14%, the
-shared-down/HC fusion +0.77%, and the gate trio +0.30%.
+shared-down/HC fusion +0.77%, the gate trio +0.30%, and the grouped/split DSA
+kernel +16.86%.
 
 Note the base reproduces the 21.19 tok/s of the original budget almost exactly,
 which is a useful check that machine conditions have not drifted between the
