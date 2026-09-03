@@ -552,6 +552,24 @@ for about 0.15 ms/token of the gap.
 The two-host tensor-parallel head split keeps the generic kernel until that
 configuration has been run.
 
+Where the phased path starts to pay, decode from the CLI at ctx 4096, 128
+greedy tokens, exact kernels against the generic kernel on the same prompt:
+
+| selected rows | generic | exact | delta |
+|---:|---:|---:|---:|
+| ~36 (a one-line chat prompt) | 29.04 | 28.93 | -0.4% |
+| ~134 | 28.79 | 28.89 | +0.3% |
+| ~207 | 28.51 | 28.83 | +1.1% |
+| ~308 | 28.25 | 28.87 | +2.2% |
+| ~603 | 27.52 | 28.71 | +4.3% |
+| ~992 | 26.57 | 28.57 | +7.5% |
+| ~1,500 | 25.51 | 28.25 | +10.7% |
+
+Below 128 rows the generic kernel's row traffic is a few megabytes per layer
+and the three extra dispatches cost more than they save, so the exact path
+engages from 128 selected rows.  Both kernels are exact, so crossing the
+threshold as a generation grows changes nothing but speed.
+
 ## The shared-down fusion, after a second look
 
 An earlier revision of this document said this could not be done without a

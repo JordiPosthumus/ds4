@@ -42064,16 +42064,25 @@ static bool glm_graph_indexed_decode_split_group8_available(
  * metal/dsv4_misc.metal).  Their output is bit-identical to the generic
  * kernel's, so --quality keeps them; DS4_METAL_DISABLE_GLM53_DSA_EXACT selects
  * the generic kernel for A/B runs.  The two-host tensor-parallel head split
- * keeps the generic kernel until that configuration has been run. */
+ * keeps the generic kernel until that configuration has been run.
+ *
+ * Below 128 selected rows the generic kernel's row traffic is a few megabytes
+ * per layer and the phased path's three extra dispatches cost more than they
+ * save: measured -0.4% at 36 rows, +0.3% at 134, +2.2% at 308 and +11% at
+ * 1,500.  Since both kernels are exact, crossing the threshold mid-generation
+ * changes nothing but speed. */
 static bool glm_graph_indexed_decode_exact_available(
         const ds4_glm_gpu_graph *g,
-        bool tp_split_heads) {
+        bool tp_split_heads,
+        uint32_t n_selected) {
 #ifndef __APPLE__
     (void)g;
     (void)tp_split_heads;
+    (void)n_selected;
     return false;
 #else
     return glm53_flash_feature_enabled(GLM53_FLASH_DSA_EXACT) &&
+           n_selected >= 128u &&
            g->glm53 &&
            !tp_split_heads &&
            g->attn_exact_scores && g->attn_exact_lora && g->attn_exact_denom &&
@@ -52724,7 +52733,8 @@ static bool glm_graph_forward_token(
                 ok = ds4_gpu_tensor_fill_f32(g->heads, 0.0f,
                                              (uint64_t)g->heads_dim) != 0;
             } else if (ok && l->attn_v_b->type == DS4_TENSOR_Q8_0 &&
-                       glm_graph_indexed_decode_exact_available(g, tp_split_layer_heads)) {
+                       glm_graph_indexed_decode_exact_available(
+                               g, tp_split_layer_heads, last_indexer_selected_count)) {
                 ok = ds4_gpu_glm_attention_indexed_decode_exact_typed_tensor(
                          g->heads,
                          g->attn_exact_scores,
