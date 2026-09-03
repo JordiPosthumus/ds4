@@ -42001,8 +42001,11 @@ static bool glm_graph_indexed_decode_split_group8_available(
     const uint32_t block_rows = glm_graph_indexed_decode_split_block_rows_for(n_selected);
     const uint32_t needed_blocks =
         block_rows != 0u ? (n_selected + block_rows - 1u) / block_rows : 0u;
-    if (g->quality) return false;
-    if (getenv("DS4_METAL_DISABLE_GLM53_DSA_SPLIT") != NULL) return false;
+    static int disabled = -1;
+    if (disabled < 0) {
+        disabled = getenv("DS4_METAL_DISABLE_GLM53_DSA_SPLIT") != NULL;
+    }
+    if (g->quality || disabled) return false;
     return n_selected > 512u &&
            block_rows > 0 &&
            needed_blocks > 0 &&
@@ -52740,7 +52743,14 @@ static bool glm_graph_forward_token(
                                                                                     l->attn_v_b->type,
                                                                                     last_indexer_selected,
                                                                                     last_indexer_selected_count,
-                                                                                    false,
+                                                                                    /* GLM 5.2's selections are a dense range or a
+                                                                                     * top-k over visible rows, always in range, so
+                                                                                     * it keeps the unchecked variant it always ran;
+                                                                                     * the checked one costs about 2% of its decode.
+                                                                                     * GLM 5.3 pads with UINT32_MAX sentinels and
+                                                                                     * must not skip the check, should it ever get
+                                                                                     * here. */
+                                                                                    !g->glm53,
                                                                                     g->compact_cache_cap,
                                                                                     glm_graph_compact_cache_is_f16(),
                                                                                     tp_split_layer_heads ? tp_head_count : DS4_N_HEAD,

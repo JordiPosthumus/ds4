@@ -683,6 +683,62 @@ prompt, 32 tokens, the exact and generic arms are byte-identical to each
 other and to the resident run.  Tensor parallelism was not run; the exact
 kernels stay off there.
 
+## Other models: nothing broke, and one thing had slowed
+
+Two models that take none of the GLM 5.3 Flash paths were run through the
+full test suite and the same main / branch / branch / main `ds4-bench`
+protocol, and byte-compared on greedy generation (128 tokens, 1,471- and
+3,841-token prompts):
+
+- **DeepSeek V4 Flash** (`MXFP4Experts-F16HC-...-chat-v2-mxfp4-0731`): every
+  suite OK on the branch; output byte-identical to main; prefill and decode
+  within 0.25% of main at every frontier, in both directions.  The only
+  shared code it touches is the templated HC producer, whose f16
+  instantiation is the kernel it always ran.
+
+  | frontier | main decode | branch decode | decode | prefill |
+  |---:|---:|---:|---:|---:|
+  | 2048 | 42.67 / 42.58 | 42.61 / 42.54 | -0.12% | -0.01% |
+  | 4096 | 38.87 / 38.73 | 38.69 / 38.72 | -0.24% | -0.04% |
+  | 8192 | 38.19 / 38.26 | 38.17 / 38.30 | +0.03% | +0.05% |
+  | 16384 | 37.30 / 37.40 | 37.31 / 37.45 | +0.08% | -0.13% |
+
+- **GLM 5.3 (`glm-dsa`, `UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K`)**: the full
+  model, 79 layers with a 64-wide RoPE tail, so it takes the GLM 5.2 path
+  and the split DSA kernel, not the exact kernels.  Output byte-identical to
+  main.  Five suites fail on the branch -- and fail identically on main, with
+  the same 55 assertions and the same golden-vector statistics: they are
+  DeepSeek official-vector fixtures and a 30k-token recall test this quant
+  does not pass on either tree.  The benchmark found a real regression:
+
+  | frontier | main decode | branch decode | decode | prefill |
+  |---:|---:|---:|---:|---:|
+  | 2048 | 16.32 / 16.26 | 15.96 / 15.95 | **-2.06%** | -0.01% |
+  | 4096 | 16.24 / 16.22 | 15.91 / 15.90 | **-2.00%** | +0.04% |
+  | 8192 | 16.02 / 16.03 | 15.68 / 15.70 | **-2.09%** | +0.04% |
+  | 16384 | 15.64 / 15.62 | 15.32 / 15.33 | **-1.95%** | +0.07% |
+
+  The cause is the split kernel's bounds-checked variant, which the branch had
+  switched every GLM model to.  On Flash it cost 0.24% of decode, with DSA
+  attention in 11 of 45 layers; here the split kernel runs in 76 of 79 layers
+  and the same per-call cost is 2% of the step.  This model's selections are a
+  dense range or a top-k over visible rows, always in range, so it goes back
+  to the unchecked variant it always ran -- main's kernel, bit for bit, as
+  the all-valid equivalence case in `tests/test_glm53_kda` asserts -- and
+  only a GLM 5.3 Flash graph, which pads with sentinels, would pass `false`
+  should it ever reach that call.  Re-measured with that change:
+
+  | frontier | main decode | branch decode | decode | prefill |
+  |---:|---:|---:|---:|---:|
+  | 2048 | 16.42 / 16.33 | 16.32 / 16.30 | -0.40% | +0.03% |
+  | 4096 | 16.32 / 16.21 | 16.20 / 16.19 | -0.43% | +0.08% |
+  | 8192 | 16.01 / 16.01 | 16.01 / 15.93 | -0.25% | +0.01% |
+  | 16384 | 15.66 / 15.66 | 15.64 / 15.62 | -0.19% | +0.04% |
+
+  What remains is inside main's own run-to-run spread (its two ctx 2048 runs
+  differ by 0.55%); if any of it is real it is at most 0.4%, against the 2%
+  before the change.  Output stays byte-identical to main.
+
 ## A trap when verifying a decode-path change
 
 `ds4-bench --dump-frontier-logits-dir` writes one file per **frontier**, which
