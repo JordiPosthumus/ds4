@@ -211,6 +211,14 @@ typedef struct {
     uint64_t cap;
 } ds4_session_snapshot;
 
+/* Opaque, request-local Metal rollback state captured after prompt
+ * synchronization. Unlike ds4_session_snapshot this preserves only the
+ * mutable decode frontier, so servers can discard a cancelled generation
+ * without rewinding a different request or copying the full compressed KV
+ * history. The checkpoint remains valid across append-only decode/prefill;
+ * callers must discard it before loading or rebuilding compressed history. */
+typedef struct ds4_cancel_checkpoint ds4_cancel_checkpoint;
+
 typedef struct {
     char *path;
     uint64_t bytes;
@@ -530,6 +538,14 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
                               char *err, size_t errlen);
 void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
+int ds4_session_cancel_checkpoint_capture(ds4_session *s,
+                                          ds4_cancel_checkpoint **out,
+                                          char *err, size_t errlen);
+int ds4_session_cancel_checkpoint_restore(ds4_session *s,
+                                          const ds4_cancel_checkpoint *checkpoint,
+                                          char *err, size_t errlen);
+int ds4_session_cancel_checkpoint_pos(const ds4_cancel_checkpoint *checkpoint);
+void ds4_session_cancel_checkpoint_free(ds4_cancel_checkpoint *checkpoint);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
