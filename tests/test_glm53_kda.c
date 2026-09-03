@@ -582,6 +582,17 @@ int main(void) {
     check_bf16_matmul(model, MODEL_BYTES, WIDE4096_OFFSET, WIDE4096_IN,
                       WIDE4096_OUT, WIDE_ROWS, "BF16 matmul in_dim=4096 (eight-load path)");
 
+    /* --quality keeps the scalar accumulation at every width, so the scalar
+     * path is checked at the widths that would otherwise take a wide branch. */
+    ds4_gpu_set_quality(true);
+    check_bf16_matmul(model, MODEL_BYTES, WIDE512_OFFSET, WIDE512_IN,
+                      WIDE512_OUT, WIDE_ROWS, "BF16 matmul in_dim=512 (--quality scalar path)");
+    check_bf16_matmul(model, MODEL_BYTES, WIDE1024_OFFSET, WIDE1024_IN,
+                      WIDE1024_OUT, WIDE_ROWS, "BF16 matmul in_dim=1024 (--quality scalar path)");
+    check_bf16_matmul(model, MODEL_BYTES, WIDE4096_OFFSET, WIDE4096_IN,
+                      WIDE4096_OUT, WIDE_ROWS, "BF16 matmul in_dim=4096 (--quality scalar path)");
+    ds4_gpu_set_quality(false);
+
     /*
      * Compound HC producer: the f16 and bf16 kernels share one templated body
      * and differ only in how the mix weights are widened.  Weights are drawn

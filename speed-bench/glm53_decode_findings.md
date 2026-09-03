@@ -620,6 +620,25 @@ of this table was taken several commits back and disagreed with the headline by
 Only the first row is an engine result.  The other two combine it with the
 requantized artifacts and should never be quoted as engine tuning.
 
+## Two changes are not bit-exact, and `--quality` restores both
+
+Every fusion in this branch is bit-exact against the path it replaces, with
+two exceptions.  Each is deterministic, but each reduces in a different order
+from the kernel it displaced:
+
+- **the widened BF16 matvec loads** -- `kernel_glm53_mul_mv_bf16_f32` and the
+  fused qkv/pair/trio/HC-expand variants that share its row helper --
+  repartition which lane accumulates which k;
+- **the grouped/split DSA attention kernel** scores with lane-split dots and
+  reduces with an online softmax across row blocks.
+
+`--quality` keeps the scalar BF16 accumulation and the generic DSA kernel, so
+quality mode runs the pre-branch arithmetic for both.  In default mode,
+`DS4_METAL_DISABLE_GLM53_BF16_WIDE` and `DS4_METAL_DISABLE_GLM53_DSA_SPLIT`
+isolate each one for A/B runs.  `tests/test_glm53_kda` checks the scalar BF16
+path in quality mode at the 512/1024/4096 widths that would otherwise take a
+wide branch, and the split kernel against the generic one directly.
+
 ## A trap when verifying a decode-path change
 
 `ds4-bench --dump-frontier-logits-dir` writes one file per **frontier**, which
