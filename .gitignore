@@ -41,3 +41,9 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+/*.bak-*
+/metal/*.bak-*
+/tests/*.bak-*
+/tests/test_indexer_scorers
+/tests/test_topk_ab
+/local-performance/
