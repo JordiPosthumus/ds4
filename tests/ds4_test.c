@@ -322,10 +322,16 @@ cleanup:
 }
 
 static void test_cancel_checkpoint_roundtrip(void) {
-    /* raw_cap=256 makes the first pass wrap and overwrite prompt-era ring
-     * slots.  A correct restore must therefore recover both the compressor
-     * frontier and the saved raw window, not merely counters and logits. */
-    enum { STEPS = 300 };
+    /* A 512-row ring holds the previous SWA window plus a 256-token prefill
+     * chunk; 607 decode steps then overwrite every prompt-era ring slot.
+     * Start beyond the sparse-index threshold at a non-ratio-aligned frontier.
+     * Restore must recover the indexer/compressor state and raw window. */
+    enum { PROMPT_TOKENS = 4609, STEPS = 607, CONTEXT = 6144 };
+    if (test_model_backend() != DS4_BACKEND_METAL) {
+        fprintf(stderr,
+                "ds4-test: cancellation checkpoint requires Metal; skipped\n");
+        return;
+    }
     ds4_engine *engine = test_get_engine(false);
     ds4_session *session = NULL;
     ds4_session *other_session = NULL;
@@ -336,6 +342,7 @@ static void test_cancel_checkpoint_roundtrip(void) {
     float *restored_logits = NULL;
     int reference_tokens[STEPS] = {0};
     char *saved_raw_cap = NULL;
+    char *saved_prefill_chunk = NULL;
     bool raw_cap_overridden = false;
 
     if (!engine) return;
@@ -354,16 +361,24 @@ static void test_cancel_checkpoint_roundtrip(void) {
     if (!reference_logits || !restored_logits) goto cleanup;
 
     saved_raw_cap = test_save_env("DS4_METAL_GRAPH_RAW_CAP");
-    setenv("DS4_METAL_GRAPH_RAW_CAP", "256", 1);
+    saved_prefill_chunk = test_save_env("DS4_METAL_PREFILL_CHUNK");
+    setenv("DS4_METAL_GRAPH_RAW_CAP", "512", 1);
+    setenv("DS4_METAL_PREFILL_CHUNK", "256", 1);
     raw_cap_overridden = true;
-    TEST_ASSERT(ds4_session_create(&session, engine, 1024) == 0);
+    TEST_ASSERT(ds4_session_create(&session, engine, CONTEXT) == 0);
     if (!session) goto cleanup;
     ds4_chat_begin(engine, &prompt);
     ds4_chat_append_message(
         engine, &prompt, "user",
         "Count upward in words, one number per line, without commentary.");
     ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
-    TEST_ASSERT(ds4_session_sync(session, &prompt, err, sizeof(err)) == 0);
+    TEST_ASSERT(prompt.len > 0);
+    while (prompt.len < PROMPT_TOKENS) {
+        ds4_tokens_push(&prompt, prompt.v[prompt.len - 1]);
+    }
+    int sync_rc = ds4_session_sync(session, &prompt, err, sizeof(err));
+    TEST_ASSERT(sync_rc == 0);
+    if (sync_rc != 0) goto cleanup;
     const int prompt_pos = ds4_session_pos(session);
     TEST_ASSERT(prompt_pos == prompt.len);
     TEST_ASSERT(ds4_session_cancel_checkpoint_capture(
@@ -371,7 +386,7 @@ static void test_cancel_checkpoint_roundtrip(void) {
     TEST_ASSERT(checkpoint != NULL);
     TEST_ASSERT(ds4_session_cancel_checkpoint_pos(checkpoint) == prompt_pos);
     if (!checkpoint) goto cleanup;
-    TEST_ASSERT(ds4_session_create(&other_session, engine, 1024) == 0);
+    TEST_ASSERT(ds4_session_create(&other_session, engine, CONTEXT) == 0);
     if (!other_session) goto cleanup;
     TEST_ASSERT(ds4_session_cancel_checkpoint_restore(
                     other_session, checkpoint, err, sizeof(err)) != 0);
@@ -414,6 +429,7 @@ cleanup:
     free(reference_logits);
     if (raw_cap_overridden) {
         test_restore_env("DS4_METAL_GRAPH_RAW_CAP", saved_raw_cap);
+        test_restore_env("DS4_METAL_PREFILL_CHUNK", saved_prefill_chunk);
     }
 }
 

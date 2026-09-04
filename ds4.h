@@ -211,10 +211,12 @@ typedef struct {
     uint64_t cap;
 } ds4_session_snapshot;
 
-/* Opaque, request-local rollback state captured after prompt synchronization.
- * Unlike ds4_session_snapshot this preserves only the mutable decode frontier,
- * so servers can cheaply discard a cancelled generation without rewinding a
- * different request or copying the full compressed KV history. */
+/* Opaque, request-local Metal rollback state captured after prompt
+ * synchronization. Unlike ds4_session_snapshot this preserves only the
+ * mutable decode frontier, so servers can discard a cancelled generation
+ * without rewinding a different request or copying the full compressed KV
+ * history. The checkpoint remains valid across append-only decode/prefill;
+ * callers must discard it before loading or rebuilding compressed history. */
 typedef struct ds4_cancel_checkpoint ds4_cancel_checkpoint;
 
 typedef struct {

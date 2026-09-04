@@ -565,6 +565,36 @@ static bool server_image_inputs_push_data_uri(
     return false;
 }
 
+/* Image markers are random parser sentinels, not prompt identity. Normalize
+ * only their nonce so a replay can compare surrounding text and marker
+ * placement while ds4_session_vision_state_matches() separately verifies the
+ * exact encoded images and token spans. */
+static char *normalize_server_image_markers(const char *text) {
+    static const char prefix[] = "\036DS4_IMAGE_";
+    static const char stable[] = "\036DS4_IMAGE\037";
+    buf out = {0};
+    const char *p = text ? text : "";
+    while (*p) {
+        if (!strncmp(p, prefix, sizeof(prefix) - 1)) {
+            const char *hex = p + sizeof(prefix) - 1;
+            bool marker = true;
+            for (int i = 0; i < 24; i++) {
+                if (!hex[i] || !isxdigit((unsigned char)hex[i])) {
+                    marker = false;
+                    break;
+                }
+            }
+            if (marker && hex[24] == '\x1f') {
+                buf_append(&out, stable, sizeof(stable) - 1);
+                p = hex + 25;
+                continue;
+            }
+        }
+        buf_putc(&out, *p++);
+    }
+    return buf_take(&out);
+}
+
 static void append_owned_text(char **dst, const char *text) {
     buf b = {0};
     buf_puts(&b, *dst ? *dst : "");
@@ -795,6 +825,7 @@ typedef struct {
     stop_list stops;
     char *raw_body;
     char *prompt_text;
+    char *retry_identity;
     tool_schema_orders tool_orders;
     int max_tokens;
     int top_k;
@@ -820,6 +851,17 @@ typedef struct {
      * client opted in via reasoning.summary. Other APIs leave this false; the
      * field is ignored on those code paths. */
     bool reasoning_summary_emit;
+    /* OpenAI chat/completions replays the full visible assistant tool-call
+     * message, but its tool_call_id still names the unique live slot that
+     * sampled that call. Keep the final tool-result tail separately so the
+     * scheduler can bind an immediate continuation even when exact DSML tool
+     * memory was not attached while the request was being parsed. */
+    stop_list openai_live_call_ids;
+    char *openai_live_identity_text;
+    char *openai_live_prefix_text;
+    char *openai_live_suffix_text;
+    char *openai_live_assistant_text;
+    char *openai_live_reasoning;
     /* Responses continuation contract:
      *
      * A live Responses tool loop is not a normal "new prompt with a long
@@ -994,6 +1036,14 @@ static void request_free(request *r) {
     free(r->stops.v);
     free(r->raw_body);
     free(r->prompt_text);
+    stop_list_clear(&r->openai_live_call_ids);
+    free(r->openai_live_call_ids.v);
+    free(r->openai_live_identity_text);
+    free(r->openai_live_prefix_text);
+    free(r->openai_live_suffix_text);
+    free(r->openai_live_assistant_text);
+    free(r->openai_live_reasoning);
+    free(r->retry_identity);
     stop_list_clear(&r->responses_live_call_ids);
     free(r->responses_live_call_ids.v);
     free(r->responses_live_suffix_text);
@@ -2553,6 +2603,62 @@ bad:
     return true;
 }
 
+/* An exact retry must describe the original messages, not opportunistically
+ * attached tool-memory text. Sampling and transport options do not affect KV.
+ * Image nonces are parser sentinels; image bytes/spans are checked separately
+ * against the session. Use only this request's actual markers, not patterns
+ * that could also occur in user text. */
+static char *chat_retry_identity(const chat_msgs *msgs) {
+    buf out = {0};
+    buf_putc(&out, '[');
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (i) buf_putc(&out, ',');
+        buf_putc(&out, '[');
+        json_escape(&out, m->role);
+        buf_putc(&out, ',');
+        /* Split around actual image markers. A text-only imitation cannot
+         * compare equal to the resulting array of text/image boundaries. */
+        buf_putc(&out, '[');
+        const char *cursor = m->content ? m->content : "";
+        for (size_t k = 0; k < m->images.len; k++) {
+            const char *marker = strstr(cursor, m->images.v[k].marker);
+            if (!marker) { buf_free(&out); return NULL; }
+            char *prefix = xstrndup(cursor, (size_t)(marker - cursor));
+            json_escape(&out, prefix);
+            free(prefix);
+            buf_putc(&out, ',');
+            cursor = marker + strlen(m->images.v[k].marker);
+        }
+        json_escape(&out, cursor);
+        buf_puts(&out, "],");
+        if (m->reasoning) json_escape(&out, m->reasoning);
+        else buf_puts(&out, "null");
+        buf_putc(&out, ',');
+        json_escape(&out, m->tool_call_id ? m->tool_call_id : "");
+        buf_puts(&out, ",[");
+        for (int k = 0; k < m->tool_call_ids_len; k++) {
+            if (k) buf_putc(&out, ',');
+            json_escape(&out, m->tool_call_ids[k]);
+        }
+        buf_puts(&out, "],[");
+        for (int k = 0; k < m->calls.len; k++) {
+            const tool_call *tc = &m->calls.v[k];
+            if (k) buf_putc(&out, ',');
+            buf_putc(&out, '[');
+            json_escape(&out, tc->id ? tc->id : "");
+            buf_putc(&out, ',');
+            json_escape(&out, tc->name ? tc->name : "");
+            buf_putc(&out, ',');
+            json_escape(&out, tc->arguments ? tc->arguments : "");
+            buf_putc(&out, ']');
+        }
+        buf_puts(&out, "]]");
+    }
+    buf_putc(&out, ']');
+    return buf_take(&out);
+}
+
 static bool append_glm_tool_schema_json(buf *b, const char *json,
                                         bool *emitted) {
     json_args args = {0};
@@ -3321,6 +3427,122 @@ static void chat_msg_collect_tool_call_ids(const chat_msg *m, stop_list *ids) {
     }
 }
 
+/* Compare the assistant message the client actually replays, independently of
+ * the sampled DSML spelling. IDs locate a checkpoint; they do not authorize
+ * edits to its content, tool names, argument values, or call order. */
+static char *openai_live_assistant_identity(const char *content,
+                                           const tool_calls *calls) {
+    buf out = {0};
+    buf_putc(&out, '[');
+    json_escape(&out, content ? content : "");
+    for (int i = 0; calls && i < calls->len; i++) {
+        const tool_call *tc = &calls->v[i];
+        buf_puts(&out, ",[");
+        json_escape(&out, tc->id ? tc->id : "");
+        buf_putc(&out, ',');
+        json_escape(&out, tc->name ? tc->name : "");
+        buf_putc(&out, ',');
+        json_args args = {0};
+        if (json_args_parse(tc->arguments, &args)) {
+            buf_putc(&out, '{');
+            for (int k = 0; k < args.len; k++) {
+                if (k) buf_putc(&out, ',');
+                append_json_arg_pair(&out, &args.v[k]);
+            }
+            buf_putc(&out, '}');
+        } else {
+            json_escape(&out, tc->arguments ? tc->arguments : "");
+        }
+        json_args_free(&args);
+        buf_putc(&out, ']');
+    }
+    buf_putc(&out, ']');
+    return buf_take(&out);
+}
+
+static bool openai_msg_is_tool_result_tail(const chat_msg *m) {
+    return m && (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) &&
+           ((m->tool_call_id && m->tool_call_id[0]) ||
+            m->tool_call_ids_len > 0);
+}
+
+/* Stable client-visible identity for the request that may produce a tool call.
+ * Compute this before opportunistic exact-DSML attachment so an entry arriving
+ * in tool memory between consecutive turns cannot change the binding key. */
+static void openai_prepare_live_identity(request *r, const chat_msgs *msgs,
+                                         const char *tool_schemas) {
+    if (!r || r->api != API_OPENAI || !r->has_tools || !msgs) return;
+    char *rendered = render_chat_prompt_text_for_syntax(
+        r->model_syntax, msgs, tool_schemas,
+        &r->tool_orders, r->think_mode);
+    free(r->openai_live_identity_text);
+    r->openai_live_identity_text = normalize_server_image_markers(rendered);
+    free(rendered);
+}
+
+/* Prepare an OpenAI chat tool-result continuation without consulting live
+ * state. A request can arrive while the generating slot is still publishing
+ * its final SSE event; collecting the protocol IDs now and resolving their
+ * owner only at dispatch closes that parse-time race. The full replay remains
+ * available as the ordinary safe fallback when no exact live binding exists. */
+static void openai_prepare_live_continuation(request *r,
+                                             const chat_msgs *msgs,
+                                             const char *tool_schemas) {
+    if (!r || r->api != API_OPENAI || !msgs || msgs->len == 0) return;
+
+    int tail_start = msgs->len;
+    while (tail_start > 0 &&
+           openai_msg_is_tool_result_tail(&msgs->v[tail_start - 1]))
+    {
+        tail_start--;
+    }
+    if (tail_start == msgs->len || tail_start == 0) return;
+
+    const int anchor = tail_start - 1;
+    const chat_msg *assistant = &msgs->v[anchor];
+    if (strcmp(assistant->role, "assistant") || assistant->calls.len == 0) return;
+
+    free(r->openai_live_assistant_text);
+    r->openai_live_assistant_text =
+        openai_live_assistant_identity(assistant->content, &assistant->calls);
+    free(r->openai_live_reasoning);
+    r->openai_live_reasoning =
+        assistant->reasoning ? xstrdup(assistant->reasoning) : NULL;
+
+    stop_list_clear(&r->openai_live_call_ids);
+    for (int i = tail_start; i < msgs->len; i++) {
+        chat_msg_collect_tool_call_ids(&msgs->v[i],
+                                       &r->openai_live_call_ids);
+    }
+    if (r->openai_live_call_ids.len != assistant->calls.len) goto reject;
+    for (int i = 0; i < assistant->calls.len; i++) {
+        const char *id = assistant->calls.v[i].id;
+        if (!id || !id_list_contains(&r->openai_live_call_ids, id)) goto reject;
+    }
+
+    chat_msgs prefix_msgs = *msgs;
+    prefix_msgs.len = anchor;
+    free(r->openai_live_prefix_text);
+    char *rendered_prefix = render_chat_prompt_text_for_syntax(
+        r->model_syntax, &prefix_msgs, tool_schemas,
+        &r->tool_orders, r->think_mode);
+    r->openai_live_prefix_text =
+        normalize_server_image_markers(rendered_prefix);
+    free(rendered_prefix);
+    if (!r->openai_live_prefix_text) goto reject;
+
+    free(r->openai_live_suffix_text);
+    r->openai_live_suffix_text =
+        render_live_tool_tail_for_syntax(r->model_syntax, msgs, tail_start,
+                                         &r->tool_orders, r->think_mode);
+    return;
+
+reject:
+    stop_list_clear(&r->openai_live_call_ids);
+    free(r->openai_live_prefix_text);
+    r->openai_live_prefix_text = NULL;
+}
+
 /* Validate Responses tool outputs before rendering.
  *
  * A tool output with a call_id is meaningful only if either:
@@ -3702,9 +3924,15 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    r->retry_identity = chat_retry_identity(&msgs);
+    const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
+    /* Capture protocol-visible identity before exact sampled DSML is restored
+     * opportunistically from RAM or disk.  That restoration is an internal
+     * replay optimization and must not change the key that binds two requests. */
+    openai_prepare_live_identity(r, &msgs, active_tool_schemas);
+    openai_prepare_live_continuation(r, &msgs, active_tool_schemas);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
-    const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text_for_syntax(
@@ -9067,9 +9295,17 @@ typedef struct {
      * point preserves hidden thinking and sampled DSML bytes that are not
      * necessarily present in the client-visible replay. */
     int live_tokens;
+    /* Exact token spelling at publication time. OpenAI validates this before
+     * appending a result so a stale ID binding can never authorize reuse of a
+     * different same-length checkpoint. Other protocols leave it empty. */
+    ds4_tokens frontier;
+    char *assistant_text; /* OpenAI client-visible content and canonical calls */
+    char *assistant_reasoning;
     /* Optional rendered conversation text that the client is expected to replay.
-     * Responses uses this because visible replay can omit hidden reasoning.
-     * Anthropic currently uses only the call-id side of the state. */
+     * Responses uses the post-turn visible transcript because replay can omit
+     * hidden reasoning. OpenAI uses the exact pre-tool-call prompt so a reused
+     * call id cannot smuggle edits to prior history or tool schemas. Anthropic
+     * currently uses only the call-id side of the state. */
     char *visible_text;
     size_t visible_len;
     /* Tool-call ids generated at the same live frontier. A following tool
@@ -9087,12 +9323,24 @@ typedef struct {
     int live_tokens;
     char *visible_text;
     size_t visible_len;
+    /* A restored request is an exact retry, not a visible-prefix extension.
+     * Keep its original rendered tokens and the exact restored frontier so
+     * same-length replacement or tool-memory changes cannot authorize reuse.
+     * This binding is resident-only, never exported as a disk text key. */
+    char *retry_identity;
+    ds4_tokens retry_prompt;
+    ds4_tokens retry_frontier;
 } visible_live_state;
 
 struct server_slot {
     server *srv;
     int id;
     ds4_session *session;
+    live_tool_state openai_live;
+    /* Stable identity of the OpenAI request currently assigned/running on
+     * this slot. Owned by the slot and protected by s->mu; lets a tool result
+     * wait for its specific producer before the live binding is published. */
+    char *openai_producer_identity;
     live_tool_state responses_live;
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
@@ -9180,6 +9428,12 @@ struct job {
     request req;
     bool done;
     bool cancelled;
+    /* The watcher may observe EOF immediately after a successful terminal
+     * write.  While that write is in flight, its return value owns the commit
+     * decision; after success, a late FIN must not turn a delivered response
+     * into a cancellation rollback. */
+    bool response_write_active;
+    bool response_committed;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     job *next;
@@ -9197,7 +9451,30 @@ static bool job_cancelled(void *ud) {
 static void job_mark_cancelled(job *j) {
     if (!j) return;
     pthread_mutex_lock(&j->mu);
-    j->cancelled = true;
+    if (!j->response_write_active && !j->response_committed) {
+        j->cancelled = true;
+    }
+    pthread_mutex_unlock(&j->mu);
+}
+
+static bool job_begin_response_write(job *j) {
+    if (!j) return false;
+    pthread_mutex_lock(&j->mu);
+    bool ok = !j->cancelled && !j->response_write_active &&
+              !j->response_committed;
+    if (ok) j->response_write_active = true;
+    pthread_mutex_unlock(&j->mu);
+    return ok;
+}
+
+static void job_finish_response_write(job *j, bool ok) {
+    if (!j) return;
+    pthread_mutex_lock(&j->mu);
+    if (j->response_write_active) {
+        j->response_write_active = false;
+        if (ok) j->response_committed = true;
+        else j->cancelled = true;
+    }
     pthread_mutex_unlock(&j->mu);
 }
 
@@ -9410,6 +9687,11 @@ static void tool_memory_free(tool_memory *m) {
 static void live_tool_state_clear_locked(live_tool_state *st) {
     if (!st) return;
     stop_list_clear(&st->call_ids);
+    ds4_tokens_free(&st->frontier);
+    free(st->assistant_text);
+    st->assistant_text = NULL;
+    free(st->assistant_reasoning);
+    st->assistant_reasoning = NULL;
     free(st->visible_text);
     st->visible_text = NULL;
     st->visible_len = 0;
@@ -9431,6 +9713,10 @@ static void visible_live_clear_locked(visible_live_state *st) {
     st->visible_len = 0;
     st->live_tokens = 0;
     st->valid = false;
+    free(st->retry_identity);
+    st->retry_identity = NULL;
+    ds4_tokens_free(&st->retry_prompt);
+    ds4_tokens_free(&st->retry_frontier);
 }
 
 static void visible_live_free(visible_live_state *st) {
@@ -9489,6 +9775,60 @@ static void anthropic_live_remember(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->tool_mu);
 }
 
+/* Accepted speculative tokens may extend past the emitted tool call. Text-only
+ * repair and internal recovery also need ordinary replay, not this shortcut. */
+static bool openai_live_can_publish(int prompt_tokens, int completion,
+                                    int session_pos, bool output_rewritten) {
+    return !output_rewritten && prompt_tokens >= 0 && completion >= 0 &&
+        (int64_t)prompt_tokens + completion == session_pos;
+}
+
+static void openai_live_remember(server *s, server_slot *slot,
+                                 const char *prefix_text,
+                                 const tool_calls *calls,
+                                 const char *content, const char *reasoning) {
+    if (!s || !slot || !prefix_text || !prefix_text[0] ||
+        !calls || calls->len == 0) return;
+    char *stable_prefix = normalize_server_image_markers(prefix_text);
+    if (!stable_prefix || !stable_prefix[0]) {
+        free(stable_prefix);
+        return;
+    }
+    pthread_mutex_lock(&s->tool_mu);
+    live_tool_state_clear_locked(&slot->openai_live);
+    slot->openai_live.visible_text = stable_prefix;
+    slot->openai_live.assistant_text =
+        openai_live_assistant_identity(content, calls);
+    slot->openai_live.assistant_reasoning = xstrdup(reasoning ? reasoning : "");
+    slot->openai_live.visible_len = strlen(stable_prefix);
+    for (int i = 0; i < calls->len; i++) {
+        id_list_push_unique(&slot->openai_live.call_ids, calls->v[i].id);
+    }
+    const ds4_tokens *live = ds4_session_tokens(slot->session);
+    if (live) ds4_tokens_copy(&slot->openai_live.frontier, live);
+    slot->openai_live.live_tokens = live ? live->len : 0;
+    slot->openai_live.valid = slot->openai_live.call_ids.len > 0 &&
+                              slot->openai_live.frontier.len > 0 &&
+                              ds4_session_checkpoint_valid(slot->session);
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
+static bool openai_live_assistant_matches(const live_tool_state *state,
+                                          const request *req) {
+    return state->assistant_text && req->openai_live_assistant_text &&
+        !strcmp(state->assistant_text, req->openai_live_assistant_text) &&
+        (!req->openai_live_reasoning ||
+         !strcmp(state->assistant_reasoning ? state->assistant_reasoning : "",
+                 req->openai_live_reasoning));
+}
+
+static void openai_live_clear(server *s, server_slot *slot) {
+    if (!s || !slot) return;
+    pthread_mutex_lock(&s->tool_mu);
+    live_tool_state_clear_locked(&slot->openai_live);
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
 static void responses_live_clear(server *s, server_slot *slot) {
     if (!s || !slot) return;
     pthread_mutex_lock(&s->tool_mu);
@@ -9504,9 +9844,62 @@ static void anthropic_live_clear(server *s, server_slot *slot) {
 }
 
 static void request_live_state_clear(server *s, server_slot *slot) {
+    openai_live_clear(s, slot);
     responses_live_clear(s, slot);
     anthropic_live_clear(s, slot);
     thinking_live_clear(s, slot);
+}
+
+/* Called only after rollback/preservation validated the prompt. Ordinary
+ * visible-prefix state is separate: an exact retry must not append
+ * already-consumed tool results. tool_mu is held. */
+static void cancelled_retry_remember_locked(visible_live_state *st,
+                                            const request *req,
+                                            const ds4_tokens *live) {
+    visible_live_clear_locked(st);
+    if (!req || req->api != API_OPENAI || req->kind != REQ_CHAT ||
+        !req->retry_identity || !live || live->len <= 0) return;
+    st->retry_identity = xstrdup(req->retry_identity);
+    ds4_tokens_copy(&st->retry_prompt, &req->prompt);
+    ds4_tokens_copy(&st->retry_frontier, live);
+    st->live_tokens = live->len;
+    st->valid = true;
+}
+
+static bool cancelled_retry_matches(const visible_live_state *st,
+                                     const request *req,
+                                     const ds4_tokens *live) {
+    return st && st->valid && req && req->api == API_OPENAI &&
+        req->kind == REQ_CHAT && st->retry_identity && req->retry_identity &&
+        !strcmp(st->retry_identity, req->retry_identity) &&
+        req->prompt.len == st->retry_prompt.len &&
+        ds4_tokens_starts_with(&req->prompt, &st->retry_prompt) &&
+        live && live->len > 0 && live->len == st->live_tokens &&
+        live->len == st->retry_frontier.len &&
+        ds4_tokens_starts_with(live, &st->retry_frontier);
+}
+
+/* Metadata only: busy sessions are mutable. Ambiguous bindings must not
+ * choose one conversation's hidden frontier by slot order. tool_mu is held. */
+static int cancelled_retry_owner_locked(server *s, const request *req) {
+    int owner = -1;
+    for (int i = 0; i < s->slot_count; i++) {
+        const visible_live_state *st = &s->slots[i].thinking_live;
+        if (!cancelled_retry_matches(st, req, &st->retry_frontier)) continue;
+        if (owner >= 0) return -1;
+        owner = i;
+    }
+    return owner;
+}
+
+/* tool_mu is held; the slot is idle or owned by this worker. */
+static bool cancelled_retry_slot_matches(server_slot *slot,
+                                          const request *req) {
+    const ds4_tokens *live = ds4_session_tokens(slot->session);
+    return cancelled_retry_matches(&slot->thinking_live, req, live) &&
+        ds4_session_common_prefix(slot->session, live) == live->len &&
+        ds4_session_vision_state_matches(slot->session,
+                                         req->images, req->image_count);
 }
 
 static bool responses_live_has_call_id(server *s, const char *id) {
@@ -9543,6 +9936,52 @@ static bool responses_live_matches_request_locked(server_slot *slot,
         ok = id_list_contains(&slot->responses_live.call_ids, ids->v[i]);
     }
     return ok;
+}
+
+static bool openai_live_matches_request_locked(server_slot *slot,
+                                               const stop_list *ids,
+                                               const char *prefix_text,
+                                               const ds4_tokens *live) {
+    const size_t prefix_len = prefix_text ? strlen(prefix_text) : 0;
+    bool ok = slot->openai_live.valid &&
+              live &&
+              slot->openai_live.live_tokens == live->len &&
+              slot->openai_live.frontier.len == live->len &&
+              ds4_tokens_starts_with(live, &slot->openai_live.frontier) &&
+              slot->openai_live.call_ids.len == ids->len &&
+              slot->openai_live.visible_text &&
+              slot->openai_live.visible_len == prefix_len &&
+              prefix_len > 0 &&
+              !memcmp(slot->openai_live.visible_text,
+                      prefix_text, prefix_len);
+    for (int i = 0; ok && i < ids->len; i++) {
+        ok = id_list_contains(&slot->openai_live.call_ids, ids->v[i]);
+    }
+    return ok;
+}
+
+/* Tool-call ids are random continuation capabilities, but never let an
+ * accidental duplicate bind across conversations. Ambiguity disables the
+ * shortcut and leaves the full replay path in charge. */
+static int openai_live_unique_slot_locked(server *s, const stop_list *ids,
+                                          const char *prefix_text) {
+    if (!s || !ids || ids->len == 0 || !prefix_text) return -1;
+    const size_t prefix_len = strlen(prefix_text);
+    int found = -1;
+    for (int i = 0; i < s->slot_count; i++) {
+        const live_tool_state *st = &s->slots[i].openai_live;
+        bool match = st->valid && st->call_ids.len == ids->len &&
+                     st->visible_text && st->visible_len == prefix_len &&
+                     prefix_len > 0 &&
+                     !memcmp(st->visible_text, prefix_text, prefix_len);
+        for (int j = 0; match && j < ids->len; j++) {
+            match = id_list_contains(&st->call_ids, ids->v[j]);
+        }
+        if (!match) continue;
+        if (found >= 0) return -1;
+        found = i;
+    }
+    return found;
 }
 
 static bool responses_live_matches_request(server *s, server_slot *slot,
@@ -10223,6 +10662,31 @@ static void build_prompt_from_exact_prefix_and_text_suffix(
         engine, exact_prefix, suffix_text, out);
 }
 
+/* A canonicalized tool-call checkpoint already ends in EOS, while a sampled
+ * checkpoint normally stops immediately before EOS. Live result renderers
+ * intentionally begin with EOS so both frontiers can be continued. Append it
+ * only when the exact live frontier does not already contain it. */
+static int live_tool_suffix_first_token(const ds4_tokens *exact_prefix,
+                                        const ds4_tokens *suffix,
+                                        int eos) {
+    return exact_prefix && suffix && exact_prefix->len > 0 && suffix->len > 0 &&
+           exact_prefix->v[exact_prefix->len - 1] == eos && suffix->v[0] == eos;
+}
+
+static void build_live_tool_prompt_from_exact_prefix_and_text_suffix(
+        ds4_engine *engine,
+        const ds4_tokens *exact_prefix,
+        const char *suffix_text,
+        ds4_tokens *out) {
+    ds4_tokens suffix = {0};
+    ds4_tokens_copy(out, exact_prefix);
+    ds4_tokenize_rendered_chat(engine, suffix_text ? suffix_text : "", &suffix);
+    const int eos = ds4_token_eos(engine);
+    const int first = live_tool_suffix_first_token(exact_prefix, &suffix, eos);
+    for (int i = first; i < suffix.len; i++) ds4_tokens_push(out, suffix.v[i]);
+    ds4_tokens_free(&suffix);
+}
+
 static int kv_cache_store_len(const kv_disk_cache *kc, int tokens) {
     return ds4_kvstore_store_len(kc, tokens);
 }
@@ -10628,6 +11092,11 @@ static int kv_cache_try_load_vision(server *s, server_slot *slot,
  * The tiers, and why they bind a request to a slot without an exact token
  * prefix match:
  *
+ * - cancelled-retry: the exact cancelled client request maps back to its
+ *   validated prompt frontier, including hidden tokens absent from replay.
+ * - openai-tool-output: the final tool_call_id set binds a full OpenAI chat
+ *   replay to the slot that sampled those calls. Only the new tool-result tail
+ *   is appended, so canonical JSON/DSML differences cannot lose the frontier.
  * - responses-visible: other clients send the full visible transcript on
  *   every turn even though the API semantics still make the request a
  *   continuation; hidden reasoning may be live in KV but absent from the
@@ -10663,6 +11132,8 @@ static bool kv_rewind_reuse_enabled(void);
 
 typedef enum {
     REUSE_NONE = 0,
+    REUSE_CANCELLED_RETRY,
+    REUSE_OPENAI_TOOL_OUTPUT,
     REUSE_RESPONSES_VISIBLE,
     REUSE_RESPONSES_TOOL_OUTPUT,
     REUSE_ANTHROPIC_TOOL_OUTPUT,
@@ -10708,6 +11179,30 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
     }
     const char *ptext = req->prompt_text;
     const size_t plen = ptext ? strlen(ptext) : 0;
+
+    if (cancelled_retry_owner_locked(s, req) == slot->id &&
+        cancelled_retry_slot_matches(slot, req)) {
+        pr.kind = REUSE_CANCELLED_RETRY;
+        pr.reuse_tokens = live_pos;
+        return pr;
+    }
+
+    if (req->api == API_OPENAI && req->openai_live_suffix_text &&
+        req->openai_live_call_ids.len > 0 &&
+        openai_live_assistant_matches(&slot->openai_live, req) &&
+        openai_live_unique_slot_locked(s, &req->openai_live_call_ids,
+                                       req->openai_live_prefix_text) ==
+            slot->id &&
+        openai_live_matches_request_locked(slot,
+                                           &req->openai_live_call_ids,
+                                           req->openai_live_prefix_text,
+                                           live))
+    {
+        pr.kind = REUSE_OPENAI_TOOL_OUTPUT;
+        pr.reuse_tokens = live_pos;
+        pr.matched_ids = req->openai_live_call_ids.len;
+        return pr;
+    }
 
     if (req->api == API_RESPONSES && ptext &&
         slot->responses_live.valid &&
@@ -11274,77 +11769,158 @@ static bool speculative_tail_rewind_supported(bool glm_dsa,
     return glm_dsa && block_tokens == 2 && consumed_tokens == 1;
 }
 
+static bool cancel_prompt_frontier_can_be_preserved(
+        int live_pos, int prompt_frontier,
+        bool prompt_frontier_preservable, bool checkpoint_state_matches) {
+    return prompt_frontier_preservable && checkpoint_state_matches &&
+           live_pos == prompt_frontier;
+}
+
+typedef struct {
+    int (*session_pos)(ds4_session *session);
+    int (*checkpoint_pos)(const ds4_cancel_checkpoint *checkpoint);
+    int (*checkpoint_restore)(ds4_session *session,
+                              const ds4_cancel_checkpoint *checkpoint,
+                              char *err, size_t errlen);
+    bool (*state_matches)(ds4_session *session,
+                          const ds4_vision_span *images,
+                          size_t image_count);
+    void (*session_invalidate)(ds4_session *session);
+} cancel_restore_ops;
+
+typedef struct {
+    int live_before;
+    bool restored;
+    bool preserved;
+    char err[160];
+} cancel_restore_result;
+
+static bool cancel_restore_production_state_matches(
+        ds4_session *session, const ds4_vision_span *images,
+        size_t image_count) {
+    return ds4_session_vision_state_matches(session, images, image_count);
+}
+
+static const cancel_restore_ops cancel_restore_production_ops = {
+    .session_pos = ds4_session_pos,
+    .checkpoint_pos = ds4_session_cancel_checkpoint_pos,
+    .checkpoint_restore = ds4_session_cancel_checkpoint_restore,
+    .state_matches = cancel_restore_production_state_matches,
+    .session_invalidate = ds4_session_invalidate,
+};
+
+/* Run while inference_mu is held. Keeping the state transitions behind this
+ * small operations table lets server tests exercise the production decision
+ * path without manufacturing an engine-private GPU session. */
+static void restore_cancelled_prompt_locked(
+        server_slot *slot,
+        const ds4_cancel_checkpoint *checkpoint,
+        const char *checkpoint_err,
+        int prompt_frontier,
+        bool prompt_frontier_preservable,
+        const ds4_vision_span *request_images,
+        size_t request_image_count,
+        const cancel_restore_ops *ops,
+        cancel_restore_result *result) {
+    ds4_session *session = slot->session;
+    memset(result, 0, sizeof(*result));
+    result->live_before = ops->session_pos(session);
+    const int checkpoint_pos = ops->checkpoint_pos(checkpoint);
+    if (checkpoint && checkpoint_pos != prompt_frontier) {
+        snprintf(result->err, sizeof(result->err),
+                 "request checkpoint frontier changed from %d to %d",
+                 prompt_frontier, checkpoint_pos);
+    } else if (checkpoint &&
+        ops->checkpoint_restore(session, checkpoint, result->err,
+                                sizeof(result->err)) == 0) {
+        result->restored = ops->session_pos(session) == checkpoint_pos &&
+                           ops->state_matches(session, request_images,
+                                              request_image_count);
+        if (!result->restored && !result->err[0]) {
+            snprintf(result->err, sizeof(result->err),
+                     "restored frontier failed validation");
+        }
+    } else if (!checkpoint && cancel_prompt_frontier_can_be_preserved(
+                   result->live_before, prompt_frontier,
+                   prompt_frontier_preservable,
+                   ops->state_matches(session, request_images,
+                                      request_image_count))) {
+        /* No decode or destructive post-processing touched the synchronized
+         * prompt frontier. There is nothing to roll back, so retain the valid
+         * checkpoint instead of manufacturing a cache miss. */
+        result->preserved = true;
+    } else if (!checkpoint) {
+        snprintf(result->err, sizeof(result->err), "%s",
+                 checkpoint_err && checkpoint_err[0] ? checkpoint_err :
+                 "request checkpoint unavailable");
+    }
+    if (!result->restored && !result->preserved) {
+        ops->session_invalidate(session);
+    } else if (slot->continued_last_store_tokens > prompt_frontier) {
+        /* Later checkpoints belong to the cancelled tail. They must not
+         * suppress continued saves for a different retry tail. */
+        slot->continued_last_store_tokens = prompt_frontier;
+    }
+}
+
 static bool restore_cancelled_request_checkpoint(
         server *s, server_slot *slot, job *j,
         const ds4_cancel_checkpoint *checkpoint,
         const char *checkpoint_err,
-        const char *stage, int completion,
-        int block_start, int block_tokens, int block_consumed,
-        uint64_t trace_id) {
-    char restore_err[160] = {0};
-    const int restore_to = ds4_session_cancel_checkpoint_pos(checkpoint);
-    const bool multimodal = j && j->req.image_count != 0;
-    bool restored = false;
+        int prompt_frontier,
+        bool prompt_frontier_preservable,
+        const char *stage, int completion, uint64_t trace_id) {
+    const ds4_vision_span *request_images = j ? j->req.images : NULL;
+    const size_t request_image_count = j ? j->req.image_count : 0;
+    const bool multimodal = request_image_count != 0;
+    cancel_restore_result result;
 
     pthread_mutex_lock(&s->inference_mu);
-    const int before = ds4_session_pos(slot->session);
-    if (checkpoint &&
-        ds4_session_cancel_checkpoint_restore(slot->session, checkpoint,
-                                              restore_err,
-                                              sizeof(restore_err)) == 0) {
-        restored = ds4_session_checkpoint_valid(slot->session) &&
-                   ds4_session_pos(slot->session) == restore_to &&
-                   (!multimodal ||
-                    ds4_session_vision_state_matches(
-                        slot->session, j->req.images, j->req.image_count));
-        if (!restored && !restore_err[0]) {
-            snprintf(restore_err, sizeof(restore_err),
-                     "restored frontier failed validation");
-        }
-    } else if (!checkpoint) {
-        snprintf(restore_err, sizeof(restore_err),
-                 "%s", checkpoint_err && checkpoint_err[0] ? checkpoint_err :
-                       "request checkpoint unavailable");
-    }
-    if (!restored) ds4_session_invalidate(slot->session);
+    restore_cancelled_prompt_locked(
+        slot, checkpoint, checkpoint_err, prompt_frontier,
+        prompt_frontier_preservable, request_images, request_image_count,
+        &cancel_restore_production_ops, &result);
     pthread_mutex_unlock(&s->inference_mu);
 
-    server_log(restored ? DS4_LOG_KVCACHE : DS4_LOG_WARNING,
+    request_live_state_clear(s, slot);
+    if (result.restored || result.preserved) {
+        pthread_mutex_lock(&s->tool_mu);
+        cancelled_retry_remember_locked(&slot->thinking_live, &j->req,
+                                         ds4_session_tokens(slot->session));
+        pthread_mutex_unlock(&s->tool_mu);
+    }
+
+    const char *action = result.restored ? "restore-prompt" :
+                         result.preserved ? "preserve-prompt" : "invalidate";
+    server_log((result.restored || result.preserved) ?
+               DS4_LOG_KVCACHE : DS4_LOG_WARNING,
                "ds4-server: slot %d request cancellation stage=%s generated=%d "
-               "block_start=%d block_tokens=%d block_consumed=%d "
                "prompt_frontier=%d live_before=%d multimodal=%d images=%zu "
-               "direct_speculation=%d disk_fallback=%s action=%s",
+               "disk_fallback=%s action=%s",
                slot->id,
                stage ? stage : "unknown",
                completion,
-               block_start,
-               block_tokens,
-               block_consumed,
-               restore_to,
-               before,
+               prompt_frontier,
+               result.live_before,
                multimodal ? 1 : 0,
                j ? j->req.image_count : 0,
-               server_direct_speculation_allowed(s) &&
-                   ds4_engine_mtp_draft_tokens(s->engine) > 1,
                (multimodal || !s->kv.enabled) ? "unavailable" : "available",
-               restored ? "restore-prompt" : "invalidate");
-    if (restore_err[0]) {
+               action);
+    if (result.err[0]) {
         server_log(DS4_LOG_WARNING,
                    "ds4-server: slot %d cancellation rollback detail=\"%s\"",
-                   slot->id, restore_err);
+                   slot->id, result.err);
     }
     trace_event(s, trace_id,
-                "cancelled stage=%s generated=%d block=%d/%d start=%d "
-                "prompt_frontier=%d action=%s%s%s",
+                "cancelled stage=%s generated=%d prompt_frontier=%d "
+                "action=%s%s%s",
                 stage ? stage : "unknown", completion,
-                block_consumed, block_tokens, block_start,
-                restore_to,
-                restored ? "restore-prompt" : "invalidate",
-                restore_err[0] ? " error=" : "",
-                restore_err[0] ? restore_err : "");
-    return restored;
+                prompt_frontier,
+                action,
+                result.err[0] ? " error=" : "",
+                result.err[0] ? result.err : "");
+    return result.restored || result.preserved;
 }
-
 typedef struct {
     bool inside;
     char tail[8]; /* Long enough for "</think>". */
@@ -11569,6 +12145,44 @@ static int server_prefill_quantum(server *s) {
     return server_prefill_quantum_for(s, generation_active);
 }
 
+/* A vision block may extend a scheduling slice past the backend's absolute
+ * prefill boundary. On the following slice, stop at the next boundary instead
+ * of carrying that offset forever. This avoids turning every later 4096-token
+ * backend pass into a large chunk plus a tiny fixed-overhead tail. Mixed
+ * prefill keeps its smaller fairness quantum unchanged. */
+static int server_prefill_slice_target(int done, int prompt_len,
+                                       int quantum, int alignment) {
+    if (prompt_len <= 0 || done >= prompt_len) return prompt_len;
+    if (quantum <= 0) return prompt_len;
+
+    int64_t next = (int64_t)done + quantum;
+    int target = next > prompt_len || next > INT_MAX ? prompt_len : (int)next;
+    if (alignment > 0 && quantum >= alignment && done > 0) {
+        const int rem = done % alignment;
+        if (rem != 0) {
+            const int64_t boundary = (int64_t)done + alignment - rem;
+            if (boundary < target) target = (int)boundary;
+        }
+    }
+    return target;
+}
+
+static int server_multimodal_prefill_slice_target(
+        int done, int prompt_len, int quantum, int alignment,
+        const ds4_vision_span *images, size_t image_count) {
+    int target = server_prefill_slice_target(
+        done, prompt_len, quantum, alignment);
+    for (size_t i = 0; i < image_count; i++) {
+        const uint64_t end = (uint64_t)images[i].token_start +
+                             images[i].embedding.token_count;
+        if ((uint64_t)target > images[i].token_start &&
+            (uint64_t)target < end) {
+            target = end > (uint64_t)prompt_len ? prompt_len : (int)end;
+        }
+    }
+    return target;
+}
+
 /* Synchronize one resident slot without monopolizing the model executor.  A
  * non-matching prompt is first rebuilt to one quantum; a matching checkpoint
  * advances from its current frontier. Absolute positions remain session-local,
@@ -11602,9 +12216,10 @@ static int server_session_sync(server *s, server_slot *slot,
             initialized = true;
         }
         int quantum = server_prefill_quantum(s);
-        int target = done + quantum;
-        if (target > prompt->len || target < done) target = prompt->len;
-        if (target <= 0) target = prompt->len;
+        int alignment = s->engine ?
+            (int)ds4_engine_prefill_quantum(s->engine) : 0;
+        int target = server_prefill_slice_target(
+            done, prompt->len, quantum, alignment);
 
         ds4_tokens prefix = *prompt;
         prefix.len = target;
@@ -11673,17 +12288,10 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
             initialized = true;
         }
         int quantum = server_prefill_quantum(s);
-        int target = done + quantum;
-        if (target > prompt->len || target < done) target = prompt->len;
-        if (target <= 0) target = prompt->len;
-        for (size_t i = 0; i < image_count; i++) {
-            uint64_t end = (uint64_t)images[i].token_start +
-                           images[i].embedding.token_count;
-            if ((uint64_t)target > images[i].token_start &&
-                (uint64_t)target < end) {
-                target = end > (uint64_t)prompt->len ? prompt->len : (int)end;
-            }
-        }
+        int alignment = s->engine ?
+            (int)ds4_engine_prefill_quantum(s->engine) : 0;
+        int target = server_multimodal_prefill_slice_target(
+            done, prompt->len, quantum, alignment, images, image_count);
         size_t prefix_images = 0;
         while (prefix_images < image_count) {
             uint64_t end = (uint64_t)images[prefix_images].token_start +
@@ -12027,10 +12635,32 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
  * tool id.  If a client sends a tool call without an id we know, the fallback
  * renderer still builds valid DSML from JSON, and this function either rewrites
  * the short suffix in place or reloads an older disk checkpoint before replay. */
+static bool begin_destructive_tool_checkpoint_rebuild(
+        ds4_session_rewrite_result rewrite_result,
+        ds4_cancel_checkpoint **checkpoint, char *checkpoint_err,
+        size_t checkpoint_errlen, bool *prompt_frontier_preservable) {
+    if (rewrite_result != DS4_SESSION_REWRITE_REBUILD_NEEDED) return false;
+    if (checkpoint) {
+        ds4_session_cancel_checkpoint_free(*checkpoint);
+        *checkpoint = NULL;
+    }
+    if (checkpoint_err && checkpoint_errlen) {
+        snprintf(checkpoint_err, checkpoint_errlen,
+                 "rollback retired before destructive tool checkpoint rebuild");
+    }
+    if (prompt_frontier_preservable) *prompt_frontier_preservable = false;
+    return true;
+}
+
 static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
                                          job *j, const char *ctx,
                                          uint64_t trace_id, const char *content,
-                                         const char *reasoning, const tool_calls *calls) {
+                                         const char *reasoning,
+                                         const tool_calls *calls,
+                                         ds4_cancel_checkpoint **cancel_checkpoint,
+                                         char *cancel_checkpoint_err,
+                                         size_t cancel_checkpoint_errlen,
+                                         bool *prompt_frontier_preservable) {
     if (!calls || calls->len == 0 || !j->req.prompt_text) return;
 
     char *suffix_text = build_tool_checkpoint_suffix(&j->req, content, reasoning, calls);
@@ -12086,6 +12716,9 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         ds4_session_rewrite_from_common(slot->session, &canonical, common,
                                         err, sizeof(err));
     pthread_mutex_unlock(&s->inference_mu);
+    const bool rebuild_needed = begin_destructive_tool_checkpoint_rebuild(
+        rr, cancel_checkpoint, cancel_checkpoint_err,
+        cancel_checkpoint_errlen, prompt_frontier_preservable);
     if (rr == DS4_SESSION_REWRITE_OK) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: tool checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d",
@@ -12093,11 +12726,14 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         trace_event(s, trace_id,
                     "tool checkpoint canonicalized: common=%d live=%d canonical=%d",
                     common, live_len, canonical.len);
-    } else if (rr == DS4_SESSION_REWRITE_REBUILD_NEEDED) {
+    } else if (rebuild_needed) {
         /* The generated DSML suffix and the canonical prompt share a prefix,
          * but the generated tail is too large to overwrite safely inside the
          * live raw-window ring.  Prefer an older disk checkpoint over replaying
-         * a very long conversation from token zero. */
+         * a very long conversation from token zero.  The request-local
+         * cancellation checkpoint omits compressed rows because ordinary
+         * decode only appends them.  This path replaces those rows, so retire
+         * rollback before the first disk load, invalidation, or replay. */
         char *path = NULL;
         ds4_tokens effective = {0};
         int loaded = kv_cache_try_load_tokenized_text(
@@ -12439,13 +13075,17 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     ds4_tokens effective_prompt = {0};
     const ds4_tokens *prompt_for_sync = &j->req.prompt;
     const bool responses_protocol = j->req.api == API_RESPONSES;
+    bool openai_live_continuation = false;
     bool responses_live_continuation = false;
     bool anthropic_live_continuation = false;
     bool thinking_live_continuation = false;
     const char *responses_live_match = NULL;
+    int openai_live_match_ids = 0;
     int responses_live_match_ids = 0;
     int anthropic_live_match_ids = 0;
-    /* Responses gets the first chance to continue from live state.  This is
+    /* An exact cancelled retry precedes protocol continuation: its restored
+     * frontier already contains the tool results. Responses otherwise gets
+     * the first chance to continue from live state. This is
      * the whole point of the API shape: a request that is bound to prior live
      * output by visible transcript or tool call ids does not need to prove an
      * exact token-prefix match.  Exact token/text/disk matching remains the
@@ -12485,6 +13125,23 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     int cached = reuse.reuse_tokens;
     const char *cache_source = "none";
     switch (reuse.kind) {
+    case REUSE_CANCELLED_RETRY:
+        pthread_mutex_lock(&s->tool_mu);
+        ds4_tokens_copy(&effective_prompt,
+                        &slot->thinking_live.retry_frontier);
+        pthread_mutex_unlock(&s->tool_mu);
+        prompt_for_sync = &effective_prompt;
+        cache_source = "cancelled-retry";
+        break;
+    case REUSE_OPENAI_TOOL_OUTPUT:
+        build_live_tool_prompt_from_exact_prefix_and_text_suffix(
+            s->engine, ds4_session_tokens(slot->session),
+            j->req.openai_live_suffix_text, &effective_prompt);
+        cache_source = "openai-tool-output";
+        openai_live_continuation = true;
+        openai_live_match_ids = reuse.matched_ids;
+        prompt_for_sync = &effective_prompt;
+        break;
     case REUSE_RESPONSES_VISIBLE:
         build_prompt_from_exact_prefix_and_text_suffix(
             s->engine, ds4_session_tokens(slot->session),
@@ -12501,7 +13158,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         prompt_for_sync = &effective_prompt;
         break;
     case REUSE_RESPONSES_TOOL_OUTPUT:
-        build_prompt_from_exact_prefix_and_text_suffix(
+        build_live_tool_prompt_from_exact_prefix_and_text_suffix(
             s->engine, ds4_session_tokens(slot->session),
             j->req.responses_live_suffix_text, &effective_prompt);
         cache_source = "responses-tool-output";
@@ -12511,7 +13168,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         prompt_for_sync = &effective_prompt;
         break;
     case REUSE_ANTHROPIC_TOOL_OUTPUT:
-        build_prompt_from_exact_prefix_and_text_suffix(
+        build_live_tool_prompt_from_exact_prefix_and_text_suffix(
             s->engine, ds4_session_tokens(slot->session),
             j->req.anthropic_live_suffix_text, &effective_prompt);
         cache_source = "anthropic-tool-output";
@@ -12565,6 +13222,27 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     default:
         cached = 0;
         break;
+    }
+    /* A normal replay is about to mutate or replace this slot. Retire the old
+     * OpenAI binding before any disk load or sync, so an error cannot leave a
+     * stale capability pointing at the slot's new checkpoint. */
+    if (!openai_live_continuation) openai_live_clear(s, slot);
+    if (j->req.api == API_OPENAI &&
+        j->req.openai_live_call_ids.len > 0 &&
+        !openai_live_continuation && reuse.kind != REUSE_CANCELLED_RETRY)
+    {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: openai tool continuation has no unique live binding ids=%d selected_live=%d prompt=%d common=%d vision=%s tool_memory=mem:%d,disk:%d,canonical:%d,missing:%d; using replay cache ladder",
+                   j->req.openai_live_call_ids.len,
+                   old_pos,
+                   j->req.prompt.len,
+                   common,
+                   live_vision_exact_match ? "exact-match" :
+                   live_vision_prefix_match ? "prefix-match" : "mismatch",
+                   j->req.tool_replay.mem,
+                   j->req.tool_replay.disk,
+                   j->req.tool_replay.canonical,
+                   j->req.tool_replay.missing_ids);
     }
     int disk_cached = 0;
     char *disk_cache_path = NULL;
@@ -12646,7 +13324,13 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     char req_flags[64];
     log_flags(req_flags, sizeof(req_flags), responses_protocol,
               j->req.has_tools, false, false, false);
-    if (responses_live_continuation) {
+    if (openai_live_continuation) {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: openai live continuation match=tool-call-ids ids=%d cached=%d prompt=%d",
+                   openai_live_match_ids,
+                   cached,
+                   prompt_tokens);
+    } else if (responses_live_continuation) {
         server_log(DS4_LOG_PREFILL,
                    "ds4-server: responses live continuation RESPPROTO match=%s ids=%d cached=%d prompt=%d",
                    responses_live_match ? responses_live_match : "unknown",
@@ -12736,6 +13420,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                 trace_event(s, trace_id, "cancelled during prefill");
                 return;
             }
+            request_live_state_clear(s, slot);
             trace_event(s, trace_id, "prefill failed: %s", err);
             send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
             return;
@@ -12774,6 +13459,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             trace_event(s, trace_id, "cancelled during prefill");
             return;
         }
+        request_live_state_clear(s, slot);
         trace_event(s, trace_id, "prefill failed: %s", err);
         send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
         return;
@@ -12782,7 +13468,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (job_cancelled(j)) {
         ds4_session_set_progress(slot->session, NULL, NULL);
         ds4_session_set_display_progress(slot->session, NULL, NULL);
-        request_live_state_clear(s, slot);
+        restore_cancelled_request_checkpoint(s, slot, j, NULL, NULL,
+            prompt_for_sync->len, true, "prefill-done", 0, trace_id);
         trace_event(s, trace_id, "cancelled after prefill");
         ds4_tokens_free(&effective_prompt);
         return;
@@ -12821,6 +13508,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     openai_stream openai_live = {0};
     responses_stream responses_live = {0};
     ds4_cancel_checkpoint *cancel_checkpoint = NULL;
+    const int cancel_prompt_frontier = ds4_session_pos(slot->session);
+    bool cancel_prompt_frontier_preservable = true;
     const bool openai_live_chat = request_uses_openai_live_stream(&j->req);
     const bool responses_live_chat = request_uses_responses_live_stream(&j->req);
     long responses_created_at = (long)time(NULL);
@@ -12832,7 +13521,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                        ctx_span,
                        req_flags[0] ? " " : "",
                        req_flags);
-            request_live_state_clear(s, slot);
+            restore_cancelled_request_checkpoint(s, slot, j, NULL, NULL,
+                cancel_prompt_frontier, true, "prefill-stream", 0, trace_id);
             ds4_tokens_free(&effective_prompt);
             return;
         }
@@ -12847,7 +13537,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                        ctx_span,
                        req_flags[0] ? " " : "",
                        req_flags);
-            request_live_state_clear(s, slot);
+            restore_cancelled_request_checkpoint(s, slot, j, NULL, NULL,
+                cancel_prompt_frontier, true, "sse-headers", 0, trace_id);
             ds4_tokens_free(&effective_prompt);
             return;
         }
@@ -12857,7 +13548,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                       prompt_tokens, &anthropic_live)) {
             job_mark_cancelled(j);
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", ctx_span);
-            request_live_state_clear(s, slot);
+            restore_cancelled_request_checkpoint(s, slot, j, NULL, NULL,
+                cancel_prompt_frontier, true, "anthropic-start", 0, trace_id);
             ds4_tokens_free(&effective_prompt);
             return;
         }
@@ -12865,7 +13557,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             !sse_chunk(j->fd, &j->req, id, NULL, NULL)) {
             job_mark_cancelled(j);
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s openai role chunk failed", ctx_span);
-            request_live_state_clear(s, slot);
+            restore_cancelled_request_checkpoint(s, slot, j, NULL, NULL,
+                cancel_prompt_frontier, true, "openai-role", 0, trace_id);
             ds4_tokens_free(&effective_prompt);
             return;
         }
@@ -12881,7 +13574,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                            req_flags[0] ? " " : "",
                            req_flags);
                 responses_stream_free(&responses_live);
-                request_live_state_clear(s, slot);
+                restore_cancelled_request_checkpoint(s, slot, j, NULL, NULL,
+                    cancel_prompt_frontier, true, "responses-created", 0, trace_id);
                 ds4_tokens_free(&effective_prompt);
                 return;
             }
@@ -12889,12 +13583,6 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     }
 
     char cancel_checkpoint_err[160] = {0};
-    pthread_mutex_lock(&s->inference_mu);
-    (void)ds4_session_cancel_checkpoint_capture(slot->session,
-                                                &cancel_checkpoint,
-                                                cancel_checkpoint_err,
-                                                sizeof(cancel_checkpoint_err));
-    pthread_mutex_unlock(&s->inference_mu);
 
     bool dsml_recovery_attempted = false;
     uint64_t rng = j->req.seed;
@@ -12902,14 +13590,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         rng = ((uint64_t)time(NULL) << 32) ^ (uint64_t)(uintptr_t)j;
     }
     if (!rng) rng = UINT64_C(0x9e3779b97f4a7c15);
-    int cancel_block_start = -1;
-    int cancel_block_tokens = 0;
-    int cancel_block_consumed = 0;
 decode_again:
     ;
-    cancel_block_start = -1;
-    cancel_block_tokens = 0;
-    cancel_block_consumed = 0;
     buf text = {0};
     size_t plain_stream_pos = 0;
     size_t stop_scan_from = 0;
@@ -12919,12 +13601,29 @@ decode_again:
     int room = ds4_session_ctx(slot->session) - ds4_session_pos(slot->session);
     bool saw_tool_start = false;
     bool saw_tool_end = false;
+    bool tool_text_repaired = false;
     bool saw_orphan_tool_end = false;
     size_t tool_scan_from = 0;
     int next_tool_progress = 128;
     int next_decode_log = 50;
     if (max_tokens < 0) max_tokens = 0;
     if (max_tokens > room) max_tokens = room;
+    /* Capture only when this pass can mutate the decode frontier.  Empty or
+     * context-full requests have nothing to roll back and should not pay for
+     * the Metal snapshot.  A recovery pass keeps the original checkpoint. */
+    if (!cancel_checkpoint && !cancel_checkpoint_err[0] && max_tokens > 0 &&
+        !g_stop_requested && !job_cancelled(j)) {
+        const double capture_t0 = now_sec();
+        pthread_mutex_lock(&s->inference_mu);
+        const int capture_rc = ds4_session_cancel_checkpoint_capture(
+            slot->session, &cancel_checkpoint, cancel_checkpoint_err,
+            sizeof(cancel_checkpoint_err));
+        pthread_mutex_unlock(&s->inference_mu);
+        trace_event(s, trace_id,
+                    "cancellation checkpoint capture status=%s %.3fms",
+                    capture_rc == 0 ? "ready" : "unavailable",
+                    (now_sec() - capture_t0) * 1000.0);
+    }
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
     const double decode_t0 = now_sec();
     double last_decode_log_t = decode_t0;
@@ -13013,9 +13712,6 @@ decode_again:
             toks[0] = token;
             ntok = 1;
         }
-        cancel_block_start = block_start;
-        cancel_block_tokens = ntok;
-
         bool stop_decode = false;
         bool block_checkpoint_preserved = true;
         int block_consumed = 0;
@@ -13208,7 +13904,6 @@ decode_again:
                 break;
             }
         }
-        cancel_block_consumed = block_consumed;
         const int tail_rewind_to = speculative_tail_rewind_target(
             block_start, ntok, block_consumed, block_checkpoint_preserved);
         if (tail_rewind_to >= 0 && !job_cancelled(j)) {
@@ -13250,12 +13945,11 @@ decode_again:
         restore_cancelled_request_checkpoint(
             s, slot, j, cancel_checkpoint,
             cancel_checkpoint_err,
-            "generation", completion,
-            cancel_block_start, cancel_block_tokens, cancel_block_consumed,
-            trace_id);
+            cancel_prompt_frontier,
+            cancel_prompt_frontier_preservable,
+            "generation", completion, trace_id);
         ds4_session_cancel_checkpoint_free(cancel_checkpoint);
         cancel_checkpoint = NULL;
-        request_live_state_clear(s, slot);
         trace_event(s, trace_id, "cancelled during generation after %d tokens", completion);
         anthropic_stream_free(&anthropic_live);
         openai_stream_free(&openai_live);
@@ -13296,6 +13990,7 @@ decode_again:
                 text.len = strlen(text.ptr);
                 saw_tool_end = true;
                 completed_truncation = true;
+                tool_text_repaired = true;
                 server_log(DS4_LOG_WARNING,
                            "ds4-server: chat ctx=%s%s%s repaired unterminated tool call (%d calls recovered)",
                            ctx_span,
@@ -13372,12 +14067,11 @@ decode_again:
         restore_cancelled_request_checkpoint(
             s, slot, j, cancel_checkpoint,
             cancel_checkpoint_err,
-            "flush", completion,
-            cancel_block_start, cancel_block_tokens, cancel_block_consumed,
-            trace_id);
+            cancel_prompt_frontier,
+            cancel_prompt_frontier_preservable,
+            "flush", completion, trace_id);
         ds4_session_cancel_checkpoint_free(cancel_checkpoint);
         cancel_checkpoint = NULL;
-        request_live_state_clear(s, slot);
         trace_event(s, trace_id, "cancelled while flushing generation");
         anthropic_stream_free(&anthropic_live);
         openai_stream_free(&openai_live);
@@ -13495,12 +14189,11 @@ decode_again:
             restore_cancelled_request_checkpoint(
                 s, slot, j, cancel_checkpoint,
                 cancel_checkpoint_err,
-                "response-parse", completion,
-                cancel_block_start, cancel_block_tokens, cancel_block_consumed,
-                trace_id);
+                cancel_prompt_frontier,
+                cancel_prompt_frontier_preservable,
+                "response-parse", completion, trace_id);
             ds4_session_cancel_checkpoint_free(cancel_checkpoint);
             cancel_checkpoint = NULL;
-            request_live_state_clear(s, slot);
             trace_event(s, trace_id, "cancelled during response parsing");
             free(parsed_content);
             free(parsed_reasoning);
@@ -13517,6 +14210,11 @@ decode_again:
             if (j->req.api == API_ANTHROPIC && j->req.stream)
                 apply_anthropic_stream_tool_ids(&parsed_calls, &anthropic_live);
             assign_tool_call_ids(s, &parsed_calls, j->req.api);
+            /* Publish before the terminal response: streaming clients may
+             * already know these IDs, and a successful non-streaming client
+             * can submit its follow-up as soon as the write reaches it.  If a
+             * later write fails, the bounded entry is either inert or useful
+             * to a streaming client that already received the ID. */
             tool_memory_remember(s, &parsed_calls);
             final_finish = "tool_calls";
         } else if (j->req.api == API_RESPONSES) {
@@ -13527,12 +14225,11 @@ decode_again:
         restore_cancelled_request_checkpoint(
             s, slot, j, cancel_checkpoint,
             cancel_checkpoint_err,
-            "response-publish", completion,
-            cancel_block_start, cancel_block_tokens, cancel_block_consumed,
-            trace_id);
+            cancel_prompt_frontier,
+            cancel_prompt_frontier_preservable,
+            "response-publish", completion, trace_id);
         ds4_session_cancel_checkpoint_free(cancel_checkpoint);
         cancel_checkpoint = NULL;
-        request_live_state_clear(s, slot);
         trace_event(s, trace_id, "cancelled before publishing response state");
         free(parsed_content);
         free(parsed_reasoning);
@@ -13584,17 +14281,26 @@ decode_again:
         }
     }
 
+    const bool openai_frontier_exact = openai_live_can_publish(
+        prompt_tokens, completion, ds4_session_pos(slot->session),
+        tool_text_repaired || dsml_recovery_attempted);
+
     if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
         should_canonicalize_tool_checkpoint(s, &parsed_calls))
     {
-        /* Chat/completions has no protocol object that binds the next request
-         * to this live KV state.  Canonicalize only the fallback tool-call
-         * path where exact sampled replay is unavailable.  Responses skips
-         * this path because previous_response_id binds the next turn. */
+        /* OpenAI chat now binds an immediate tool result by tool_call_id, but
+         * full replay remains the fallback after restart or slot eviction.
+         * Canonicalize only when exact sampled replay is unavailable.
+         * Responses skips this path because its live continuation contract is
+         * handled separately. */
         canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "",
-                                     parsed_reasoning, &parsed_calls);
+                                     parsed_reasoning, &parsed_calls,
+                                     &cancel_checkpoint,
+                                     cancel_checkpoint_err,
+                                     sizeof(cancel_checkpoint_err),
+                                     &cancel_prompt_frontier_preservable);
         thinking_live_clear(s, slot);
     } else if (parsed_calls.len) {
         thinking_live_clear(s, slot);
@@ -13606,7 +14312,21 @@ decode_again:
         thinking_live_clear(s, slot);
     }
 
-    bool response_ok = !job_cancelled(j);
+    /* Canonicalization can rewrite the short generated tail. Record the
+     * binding afterwards so its frontier always names the final live state. */
+    if (j->req.api == API_OPENAI) {
+        if (openai_frontier_exact && parsed_calls.len && strcmp(final_finish, "error") &&
+            strcmp(final_finish, "length"))
+        {
+            openai_live_remember(s, slot, j->req.openai_live_identity_text,
+                                 &parsed_calls, parsed_content, parsed_reasoning);
+        } else {
+            openai_live_clear(s, slot);
+        }
+    }
+
+    const bool response_write_started = job_begin_response_write(j);
+    bool response_ok = response_write_started;
     if (response_ok && j->req.stream) {
         if (j->req.api == API_ANTHROPIC) {
             response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, id, &anthropic_live,
@@ -13659,7 +14379,9 @@ decode_again:
                                      &parsed_calls, final_finish,
                                      prompt_tokens, completion);
     }
-    if (job_cancelled(j)) response_ok = false;
+    if (response_write_started) {
+        job_finish_response_write(j, response_ok);
+    }
     if (!response_ok) {
         job_mark_cancelled(j);
         final_finish = "error";
@@ -13667,12 +14389,11 @@ decode_again:
         restore_cancelled_request_checkpoint(
             s, slot, j, cancel_checkpoint,
             cancel_checkpoint_err,
-            "response-write", completion,
-            cancel_block_start, cancel_block_tokens, cancel_block_consumed,
-            trace_id);
+            cancel_prompt_frontier,
+            cancel_prompt_frontier_preservable,
+            "response-write", completion, trace_id);
         ds4_session_cancel_checkpoint_free(cancel_checkpoint);
         cancel_checkpoint = NULL;
-        request_live_state_clear(s, slot);
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: %s ctx=%s%s%s client disconnected",
                    j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -13777,12 +14498,60 @@ static bool live_state_contains_all(const live_tool_state *state,
     return true;
 }
 
-/* Return the only slot eligible for an explicit live continuation, or -1 when
- * the request has no resident binding. A missing binding is intentionally not
- * treated as ineligible: generate_job() then emits the existing 409 response. */
+#define JOB_SLOT_WAIT (-2)
+
+/* Return the only slot eligible for an explicit live continuation, -1 when
+ * the request may use normal routing, or JOB_SLOT_WAIT while a producing slot
+ * may still publish its binding. Called with s->mu and tool_mu held. */
 static int job_required_slot_locked(server *s, const job *j) {
     if (!s || !j) return -1;
     const request *r = &j->req;
+    /* Rollback publishes before the worker releases its busy flag. Resolve
+     * the resident retry here so that short handoff cannot send it to an
+     * unrelated idle slot. Never inspect a busy session's mutable tokens. */
+    const int retry_owner = cancelled_retry_owner_locked(s, r);
+    if (retry_owner >= 0) {
+        server_slot *slot = &s->slots[retry_owner];
+        if (slot->busy || slot->assigned ||
+            cancelled_retry_slot_matches(slot, r)) return retry_owner;
+    }
+    if (r->api == API_OPENAI && r->openai_live_suffix_text &&
+        r->openai_live_call_ids.len > 0)
+    {
+        int slot = openai_live_unique_slot_locked(
+            s, &r->openai_live_call_ids, r->openai_live_prefix_text);
+        if (slot >= 0) {
+            /* Never inspect or route away from a slot that is still finishing
+             * the producer/previous continuation. Its final frontier and
+             * binding are published before busy is cleared. */
+            if (s->slots[slot].busy || s->slots[slot].assigned) return slot;
+            slot_reuse pr = slot_probe_reuse_locked(s, &s->slots[slot], r);
+            if (pr.kind == REUSE_OPENAI_TOOL_OUTPUT) return slot;
+            /* IDs and visible identity survived, but the exact token/image
+             * frontier did not: the binding is stale, so normal replay must
+             * choose a slot without being pinned to this former owner. */
+            return -1;
+        }
+        /* The client can receive the final tool-call SSE bytes just before the
+         * worker publishes its live binding. Wait only for the in-flight
+         * request whose stable identity is this continuation's pre-call
+         * prefix. Unrelated traffic must never hold the request indefinitely. */
+        int producer = -1;
+        for (int i = 0; i < s->slot_count; i++) {
+            const server_slot *slot = &s->slots[i];
+            if (!(slot->busy || slot->assigned) ||
+                !slot->openai_producer_identity ||
+                !r->openai_live_prefix_text ||
+                strcmp(slot->openai_producer_identity,
+                       r->openai_live_prefix_text))
+            {
+                continue;
+            }
+            if (producer >= 0) return JOB_SLOT_WAIT;
+            producer = i;
+        }
+        if (producer >= 0) return producer;
+    }
     for (int i = 0; i < s->slot_count; i++) {
         server_slot *slot = &s->slots[i];
         if (r->responses_requires_live_tool_state &&
@@ -13887,6 +14656,7 @@ static void dispatch_jobs_locked(server *s) {
         job *prev = NULL;
         for (job *j = s->head; j; prev = j, j = j->next) {
             int required = job_required_slot_locked(s, j);
+            if (required == JOB_SLOT_WAIT) continue;
             server_slot *best = NULL;
             int best_score = INT_MIN;
             for (int i = 0; i < s->slot_count; i++) {
@@ -13922,6 +14692,11 @@ static void dispatch_jobs_locked(server *s) {
         chosen->next = NULL;
         chosen_slot->assigned = chosen;
         chosen_slot->busy = true;
+        free(chosen_slot->openai_producer_identity);
+        chosen_slot->openai_producer_identity =
+            chosen->req.api == API_OPENAI &&
+            chosen->req.openai_live_identity_text
+                ? xstrdup(chosen->req.openai_live_identity_text) : NULL;
         active++;
         if (chosen_evict_live > 0) {
             server_log(DS4_LOG_KVCACHE,
@@ -14007,6 +14782,8 @@ static void *slot_worker_main(void *arg) {
         slot->last_used = time(NULL);
 
         pthread_mutex_lock(&s->mu);
+        free(slot->openai_producer_identity);
+        slot->openai_producer_identity = NULL;
         slot->busy = false;
         dispatch_jobs_locked(s);
         pthread_mutex_unlock(&s->mu);
@@ -14243,6 +15020,8 @@ static void server_cancel_job(server *s, job *j) {
             server_slot *slot = &s->slots[i];
             if (slot->assigned != j) continue;
             slot->assigned = NULL;
+            free(slot->openai_producer_identity);
+            slot->openai_producer_identity = NULL;
             slot->busy = false;
             detached = true;
             dispatch_jobs_locked(s);
@@ -14517,9 +15296,11 @@ static void server_close_resources(server *s) {
     tool_memory_free(&s->tool_mem);
     for (int i = 0; i < s->slot_count; i++) {
         server_slot *slot = &s->slots[i];
+        live_tool_state_free(&slot->openai_live);
         live_tool_state_free(&slot->responses_live);
         live_tool_state_free(&slot->anthropic_live);
         visible_live_free(&slot->thinking_live);
+        free(slot->openai_producer_identity);
         free(slot->live_text);
         if (slot->session) ds4_session_free(slot->session);
     }
@@ -15208,6 +15989,127 @@ static void test_mixed_prefill_quantum_option(void) {
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 128);
 }
 
+static void test_prefill_slice_realigns_after_vision_block(void) {
+    /* The production incident ended an image block 145 tokens beyond the
+     * 40960 boundary. The next idle slice must stop at 45056, not 45201. */
+    TEST_ASSERT(server_prefill_slice_target(41105, 220831, 4096, 4096) ==
+                45056);
+    TEST_ASSERT(server_prefill_slice_target(45056, 220831, 4096, 4096) ==
+                49152);
+
+    ds4_vision_span image = {0};
+    image.token_start = 40748;
+    image.embedding.token_count = 357;
+    TEST_ASSERT(server_multimodal_prefill_slice_target(
+                    36864, 220831, 4096, 4096, &image, 1) == 41105);
+    TEST_ASSERT(server_multimodal_prefill_slice_target(
+                    41105, 220831, 4096, 4096, &image, 1) == 45056);
+    TEST_ASSERT(server_multimodal_prefill_slice_target(
+                    45056, 220831, 4096, 4096, &image, 1) == 49152);
+
+    /* Do not inflate the small quantum used to interleave prefill and decode. */
+    TEST_ASSERT(server_prefill_slice_target(41105, 220831, 64, 4096) ==
+                41169);
+
+    /* The final partial slice still ends exactly at the prompt frontier. */
+    TEST_ASSERT(server_prefill_slice_target(219000, 220831, 4096, 4096) ==
+                220831);
+    TEST_ASSERT(server_prefill_slice_target(4096, 8192, 4096, 4096) == 8192);
+    TEST_ASSERT(server_prefill_slice_target(10000, 10500, 4096, 4096) ==
+                10500);
+    TEST_ASSERT(server_prefill_slice_target(INT_MAX - 100, INT_MAX,
+                                            4096, 4096) == INT_MAX);
+}
+
+static void test_openai_live_assistant_identity(void) {
+    tool_call entries[] = {
+        {"call-a", "bash", "{ \"command\" : \"pwd\" }"},
+        {"call-b", "bash", "{\"command\":\"true\"}"}
+    };
+    tool_calls calls = {.v = entries, .len = 2};
+    live_tool_state state = {0};
+    state.assistant_text = openai_live_assistant_identity("checking", &calls);
+    state.assistant_reasoning = xstrdup("private reasoning");
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    entries[0].arguments = "{\"command\":\"pwd\"}";
+    r.openai_live_assistant_text =
+        openai_live_assistant_identity("checking", &calls);
+    TEST_ASSERT(openai_live_assistant_matches(&state, &r));
+    r.openai_live_reasoning = xstrdup("private reasoning");
+    TEST_ASSERT(openai_live_assistant_matches(&state, &r));
+    free(r.openai_live_reasoning);
+    r.openai_live_reasoning = xstrdup("edited reasoning");
+    TEST_ASSERT(!openai_live_assistant_matches(&state, &r));
+    free(r.openai_live_reasoning);
+    r.openai_live_reasoning = NULL; /* omitted hidden reasoning is allowed */
+
+    free(r.openai_live_assistant_text);
+    r.openai_live_assistant_text =
+        openai_live_assistant_identity("edited content", &calls);
+    TEST_ASSERT(!openai_live_assistant_matches(&state, &r));
+    entries[0].name = "edited-tool";
+    free(r.openai_live_assistant_text);
+    r.openai_live_assistant_text =
+        openai_live_assistant_identity("checking", &calls);
+    TEST_ASSERT(!openai_live_assistant_matches(&state, &r));
+    entries[0].name = "bash";
+    entries[0].arguments = "{\"command\":\"edited-command\"}";
+    free(r.openai_live_assistant_text);
+    r.openai_live_assistant_text =
+        openai_live_assistant_identity("checking", &calls);
+    TEST_ASSERT(!openai_live_assistant_matches(&state, &r));
+    entries[0].arguments = "{\"command\":\"pwd\"}";
+    tool_call swap = entries[0];
+    entries[0] = entries[1];
+    entries[1] = swap;
+    free(r.openai_live_assistant_text);
+    r.openai_live_assistant_text =
+        openai_live_assistant_identity("checking", &calls);
+    TEST_ASSERT(!openai_live_assistant_matches(&state, &r));
+    entries[1] = entries[0];
+    entries[0] = swap;
+    calls.raw_tool_text = "unrelated sampled spelling";
+    free(r.openai_live_assistant_text);
+    r.openai_live_assistant_text =
+        openai_live_assistant_identity("checking", &calls);
+    TEST_ASSERT(openai_live_assistant_matches(&state, &r));
+    request_free(&r);
+    live_tool_state_free(&state);
+}
+
+static void test_openai_live_publication_boundary(void) {
+    TEST_ASSERT(openai_live_can_publish(100, 7, 107, false));
+    /* An accepted speculative block may contain un-emitted tokens. */
+    TEST_ASSERT(!openai_live_can_publish(100, 7, 108, false));
+    TEST_ASSERT(!openai_live_can_publish(100, 7, 106, false));
+    /* Text-only repair or internal recovery must use ordinary replay. */
+    TEST_ASSERT(!openai_live_can_publish(100, 7, 107, true));
+    TEST_ASSERT(openai_live_can_publish(INT_MAX - 7, 7, INT_MAX, false));
+    TEST_ASSERT(!openai_live_can_publish(INT_MAX, 7, INT_MAX, false));
+}
+
+static void test_live_tool_suffix_deduplicates_canonical_eos(void) {
+    ds4_tokens sampled = {0};
+    ds4_tokens canonical = {0};
+    ds4_tokens suffix = {0};
+    ds4_tokens_push(&sampled, 10);
+    ds4_tokens_push(&sampled, 11);
+    ds4_tokens_push(&canonical, 10);
+    ds4_tokens_push(&canonical, 99);
+    ds4_tokens_push(&suffix, 99);
+    ds4_tokens_push(&suffix, 12);
+
+    TEST_ASSERT(live_tool_suffix_first_token(&sampled, &suffix, 99) == 0);
+    TEST_ASSERT(live_tool_suffix_first_token(&canonical, &suffix, 99) == 1);
+    TEST_ASSERT(live_tool_suffix_first_token(&canonical, &suffix, 98) == 0);
+    TEST_ASSERT(live_tool_suffix_first_token(NULL, &suffix, 99) == 0);
+
+    ds4_tokens_free(&sampled);
+    ds4_tokens_free(&canonical);
+    ds4_tokens_free(&suffix);
+}
+
 static void test_max_active_requests_option(void) {
     char *default_argv[] = {"ds4-server"};
     server_config defaults = parse_options(1, default_argv);
@@ -15557,6 +16459,60 @@ static void test_slot_probe_live_state_tiers(void) {
     int ckpt_tok[10];
     for (int i = 0; i < 10; i++) ckpt_tok[i] = i + 1;
 
+    /* 0. openai-tool-output: tool_call_id binds a full chat replay to the
+     *    sampled frontier even when its reconstructed token prefix differs. */
+    {
+        server_slot slot = {0};
+        slot.id = 0;
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        slot.openai_live.valid = true;
+        slot.openai_live.live_tokens = 10;
+        ds4_tokens_copy(&slot.openai_live.frontier,
+                        ds4_session_tokens(slot.session));
+        slot.openai_live.visible_text = xstrdup("same prior prompt");
+        slot.openai_live.assistant_text = xstrdup("same assistant");
+        slot.openai_live.visible_len = strlen(slot.openai_live.visible_text);
+        id_list_push_unique(&slot.openai_live.call_ids, "call-openai");
+        s.slots = &slot;
+        s.slot_count = 1;
+        job j = {0};
+        j.req.api = API_OPENAI;
+        j.req.openai_live_prefix_text = xstrdup("same prior prompt");
+        j.req.openai_live_assistant_text = xstrdup("same assistant");
+        j.req.openai_live_suffix_text = xstrdup(" tool-out");
+        id_list_push_unique(&j.req.openai_live_call_ids, "call-openai");
+        ds4_tokens_push(&j.req.prompt, 999);  /* replay prefix diverges */
+        slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &j.req);
+        TEST_ASSERT(pr.kind == REUSE_OPENAI_TOOL_OUTPUT);
+        TEST_ASSERT(pr.reuse_tokens == 10);
+        TEST_ASSERT(pr.matched_ids == 1);
+        /* Same length is not enough: replacing the checkpoint with different
+         * tokens must invalidate the live capability. */
+        int changed_tok[10];
+        memcpy(changed_tok, ckpt_tok, sizeof(changed_tok));
+        changed_tok[9] = 9999;
+        ds4_session_free_test_checkpoint(slot.session);
+        slot.session = ds4_session_new_test_checkpoint(changed_tok, 10);
+        TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind ==
+                    REUSE_NONE);
+        ds4_session_free_test_checkpoint(slot.session);
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        free(j.req.openai_live_prefix_text);
+        j.req.openai_live_prefix_text = xstrdup("edited prior prompt");
+        TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind ==
+                    REUSE_NONE);
+        free(j.req.openai_live_prefix_text);
+        j.req.openai_live_prefix_text = xstrdup("same prior prompt");
+        slot.openai_live.live_tokens = 9;
+        TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind ==
+                    REUSE_NONE);
+        live_tool_state_free(&slot.openai_live);
+        ds4_session_free_test_checkpoint(slot.session);
+        request_free(&j.req);
+        s.slots = NULL;
+        s.slot_count = 0;
+    }
+
     /* 1. responses-visible: the visible transcript remembered at the live
      *    frontier is a byte prefix of the replayed request text. */
     {
@@ -15746,6 +16702,135 @@ static void test_dispatch_routes_alien_request_to_empty_slot(void) {
     pthread_cond_destroy(&s.cv);
 }
 
+static void test_dispatch_routes_openai_tool_continuation_to_owner(void) {
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    pthread_cond_init(&s.cv, NULL);
+    s.batched_mode = true;
+    s.max_active_requests = 1;
+    server_slot slots[3] = {0};
+    s.slots = slots;
+    s.slot_count = 3;
+    for (int i = 0; i < 3; i++) slots[i].id = i;
+
+    int a[] = {1, 2, 3, 4};
+    int b[] = {1, 2, 8, 9};
+    slots[0].session = ds4_session_new_test_checkpoint(a, 4);
+    slots[1].session = ds4_session_new_test_checkpoint(b, 4);
+    slots[2].session = ds4_session_new_test_checkpoint(NULL, 0);
+    slots[0].openai_live.valid = true;
+    slots[0].openai_live.live_tokens = 4;
+    ds4_tokens_copy(&slots[0].openai_live.frontier,
+                    ds4_session_tokens(slots[0].session));
+    slots[0].openai_live.visible_text = xstrdup("thread A prompt");
+    slots[0].openai_live.visible_len = strlen(slots[0].openai_live.visible_text);
+    id_list_push_unique(&slots[0].openai_live.call_ids, "call-other-thread");
+    slots[1].openai_live.valid = true;
+    slots[1].openai_live.live_tokens = 4;
+    ds4_tokens_copy(&slots[1].openai_live.frontier,
+                    ds4_session_tokens(slots[1].session));
+    slots[1].openai_live.visible_text = xstrdup("thread B prompt");
+    slots[1].openai_live.assistant_text = xstrdup("thread B assistant");
+    slots[1].openai_live.visible_len = strlen(slots[1].openai_live.visible_text);
+    id_list_push_unique(&slots[1].openai_live.call_ids, "call-owning-thread");
+
+    /* Model the incident: parsing captured the continuation id, reconstructed
+     * tokens do not match either live checkpoint, and an empty slot exists. */
+    job j = {0};
+    j.req.api = API_OPENAI;
+    j.req.openai_live_prefix_text = xstrdup("thread B prompt");
+    j.req.openai_live_assistant_text = xstrdup("thread B assistant");
+    j.req.openai_live_suffix_text = xstrdup(" tool-result");
+    id_list_push_unique(&j.req.openai_live_call_ids, "call-owning-thread");
+    ds4_tokens_push(&j.req.prompt, 777);
+    s.head = &j;
+    s.tail = &j;
+
+    dispatch_jobs_locked(&s);
+    TEST_ASSERT(slots[1].assigned == &j);
+    TEST_ASSERT(slots[1].busy);
+    TEST_ASSERT(slots[0].assigned == NULL);
+    TEST_ASSERT(slots[2].assigned == NULL);
+    TEST_ASSERT(s.head == NULL);
+
+    request_free(&j.req);
+    for (int i = 0; i < 3; i++) {
+        live_tool_state_free(&slots[i].openai_live);
+        ds4_session_free_test_checkpoint(slots[i].session);
+    }
+    pthread_mutex_destroy(&s.tool_mu);
+    pthread_cond_destroy(&s.cv);
+}
+
+static void test_openai_continuation_waits_for_binding_publication(void) {
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    pthread_cond_init(&s.cv, NULL);
+    s.batched_mode = true;
+    s.max_active_requests = 2;
+    server_slot slots[2] = {0};
+    s.slots = slots;
+    s.slot_count = 2;
+    int a[] = {1, 2, 3, 4};
+    int b[] = {7, 8};
+    for (int i = 0; i < 2; i++) slots[i].id = i;
+    slots[0].session = ds4_session_new_test_checkpoint(a, 4);
+    slots[1].session = ds4_session_new_test_checkpoint(b, 2);
+
+    job j = {0};
+    j.req.api = API_OPENAI;
+    j.req.openai_live_prefix_text = xstrdup("producer prompt");
+    j.req.openai_live_suffix_text = xstrdup(" tool-result");
+    id_list_push_unique(&j.req.openai_live_call_ids, "call-racing");
+
+    /* Unrelated in-flight work is not a reason to wait. */
+    slots[1].busy = true;
+    slots[1].openai_producer_identity = xstrdup("unrelated prompt");
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == -1);
+    slots[1].busy = false;
+    free(slots[1].openai_producer_identity);
+    slots[1].openai_producer_identity = NULL;
+
+    /* The response is visible to the client, but the producer has not yet
+     * published its binding. Do not send the result to the other idle slot. */
+    slots[0].busy = true;
+    slots[0].openai_producer_identity = xstrdup("producer prompt");
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == 0);
+    s.head = s.tail = &j;
+    dispatch_jobs_locked(&s);
+    TEST_ASSERT(s.head == &j);
+    TEST_ASSERT(slots[0].assigned == NULL);
+    TEST_ASSERT(slots[1].assigned == NULL);
+
+    /* Publication precedes clearing busy. The same queued job now binds to
+     * the exact producer frontier and is dispatched there. */
+    slots[0].openai_live.valid = true;
+    slots[0].openai_live.live_tokens = 4;
+    ds4_tokens_copy(&slots[0].openai_live.frontier,
+                    ds4_session_tokens(slots[0].session));
+    slots[0].openai_live.visible_text = xstrdup("producer prompt");
+    slots[0].openai_live.assistant_text = xstrdup("producer assistant");
+    j.req.openai_live_assistant_text = xstrdup("producer assistant");
+    slots[0].openai_live.visible_len = strlen("producer prompt");
+    id_list_push_unique(&slots[0].openai_live.call_ids, "call-racing");
+    slots[0].busy = false;
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == 0);
+    dispatch_jobs_locked(&s);
+    TEST_ASSERT(s.head == NULL);
+    TEST_ASSERT(slots[0].assigned == &j);
+    TEST_ASSERT(slots[0].busy);
+    TEST_ASSERT(slots[1].assigned == NULL);
+
+    request_free(&j.req);
+    live_tool_state_free(&slots[0].openai_live);
+    for (int i = 0; i < 2; i++) {
+        free(slots[i].openai_producer_identity);
+        ds4_session_free_test_checkpoint(slots[i].session);
+    }
+    pthread_mutex_destroy(&s.tool_mu);
+    pthread_cond_destroy(&s.cv);
+}
+
 static void test_dispatch_respects_active_request_limit(void) {
     server s = {0};
     pthread_mutex_init(&s.tool_mu, NULL);
@@ -15896,8 +16981,59 @@ static void test_batched_live_continuation_slot_binding(void) {
     server_slot slots[3] = {0};
     s.slots = slots;
     s.slot_count = 3;
+    int tokens[3][4] = {{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}};
+    for (int i = 0; i < 3; i++) {
+        slots[i].id = i;
+        slots[i].session = ds4_session_new_test_checkpoint(tokens[i], 4);
+    }
 
     job j = {0};
+    j.req.api = API_OPENAI;
+    j.req.openai_live_prefix_text = xstrdup("same prior prompt");
+    j.req.openai_live_assistant_text = xstrdup("same assistant");
+    j.req.openai_live_suffix_text = xstrdup(" tool-result");
+    id_list_push_unique(&j.req.openai_live_call_ids, "call-openai-slot-0");
+    slots[0].openai_live.valid = true;
+    slots[0].openai_live.live_tokens = 4;
+    ds4_tokens_copy(&slots[0].openai_live.frontier,
+                    ds4_session_tokens(slots[0].session));
+    slots[0].openai_live.visible_text = xstrdup("same prior prompt");
+    slots[0].openai_live.assistant_text = xstrdup("same assistant");
+    slots[0].openai_live.visible_len = strlen(slots[0].openai_live.visible_text);
+    id_list_push_unique(&slots[0].openai_live.call_ids,
+                        "call-openai-slot-0");
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == 0);
+
+    /* An idle slot whose IDs/text survived but whose exact token frontier was
+     * replaced is no longer the required owner. */
+    int changed[] = {1, 2, 3, 99};
+    ds4_session_free_test_checkpoint(slots[0].session);
+    slots[0].session = ds4_session_new_test_checkpoint(changed, 4);
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == -1);
+    ds4_session_free_test_checkpoint(slots[0].session);
+    slots[0].session = ds4_session_new_test_checkpoint(tokens[0], 4);
+
+    /* An impossible duplicate id is ambiguous, never permission to borrow
+     * either conversation's live KV. */
+    slots[1].openai_live.valid = true;
+    slots[1].openai_live.live_tokens = 4;
+    ds4_tokens_copy(&slots[1].openai_live.frontier,
+                    ds4_session_tokens(slots[1].session));
+    slots[1].openai_live.visible_text = xstrdup("same prior prompt");
+    slots[1].openai_live.visible_len = strlen(slots[1].openai_live.visible_text);
+    id_list_push_unique(&slots[1].openai_live.call_ids,
+                        "call-openai-slot-0");
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == -1);
+    live_tool_state_clear_locked(&slots[1].openai_live);
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == 0);
+
+    free(j.req.openai_live_suffix_text);
+    j.req.openai_live_suffix_text = NULL;
+    free(j.req.openai_live_prefix_text);
+    j.req.openai_live_prefix_text = NULL;
+    stop_list_clear(&j.req.openai_live_call_ids);
+    live_tool_state_clear_locked(&slots[0].openai_live);
+
     j.req.responses_requires_live_tool_state = true;
     id_list_push_unique(&j.req.responses_live_call_ids, "call-slot-1");
     slots[1].responses_live.valid = true;
@@ -15914,8 +17050,12 @@ static void test_batched_live_continuation_slot_binding(void) {
     slots[2].anthropic_live.valid = false;
     TEST_ASSERT(job_required_slot_locked(&s, &j) == -1);
     request_free(&j.req);
+    live_tool_state_free(&slots[0].openai_live);
+    live_tool_state_free(&slots[1].openai_live);
     live_tool_state_free(&slots[1].responses_live);
     live_tool_state_free(&slots[2].anthropic_live);
+    for (int i = 0; i < 3; i++)
+        ds4_session_free_test_checkpoint(slots[i].session);
 }
 
 static void test_tool_schema_order_from_anthropic_schema(void) {
@@ -18472,6 +19612,167 @@ static void test_anthropic_tool_memory_replays_sampled_dsml(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+static void test_openai_live_tail_renders_tool_results_only(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.think_mode = DS4_THINK_HIGH;
+
+    chat_msgs msgs = {0};
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    tool_call a = {0};
+    a.id = xstrdup("call_live_a");
+    a.name = xstrdup("bash");
+    a.arguments = xstrdup("{\"command\":\"printf 'λ\\n'\"}");
+    tool_calls_push(&assistant.calls, a);
+    tool_call b = {0};
+    b.id = xstrdup("call_live_b");
+    b.name = xstrdup("bash");
+    b.arguments = xstrdup("{\"command\":\"pwd\"}");
+    tool_calls_push(&assistant.calls, b);
+    chat_msgs_push(&msgs, assistant);
+
+    chat_msg first = {0};
+    first.role = xstrdup("tool");
+    first.tool_call_id = xstrdup("call_live_a");
+    first.content = xstrdup("quote=\" slash=\\\\ newline=\\n λ");
+    chat_msgs_push(&msgs, first);
+
+    chat_msg second = {0};
+    second.role = xstrdup("tool");
+    second.tool_call_id = xstrdup("call_live_b");
+    second.content = xstrdup("/tmp");
+    chat_msgs_push(&msgs, second);
+
+    openai_prepare_live_continuation(&r, &msgs, NULL);
+    TEST_ASSERT(r.openai_live_call_ids.len == 2);
+    TEST_ASSERT(id_list_contains(&r.openai_live_call_ids, "call_live_a"));
+    TEST_ASSERT(id_list_contains(&r.openai_live_call_ids, "call_live_b"));
+    TEST_ASSERT(r.openai_live_prefix_text != NULL);
+    TEST_ASSERT(r.openai_live_suffix_text != NULL);
+    TEST_ASSERT(!strncmp(r.openai_live_suffix_text,
+                         "<｜end▁of▁sentence｜><｜User｜><tool_result>",
+                         strlen("<｜end▁of▁sentence｜><｜User｜><tool_result>")));
+    TEST_ASSERT(strstr(r.openai_live_suffix_text, "/tmp</tool_result>") != NULL);
+    TEST_ASSERT(strstr(r.openai_live_suffix_text,
+                       "<｜Assistant｜><think>") != NULL);
+    TEST_ASSERT(strstr(r.openai_live_suffix_text, "bash") == NULL);
+
+    /* Do not bind a partial result set for a multi-call assistant turn. */
+    request partial;
+    request_init(&partial, REQ_CHAT, 128);
+    partial.api = API_OPENAI;
+    const int full_len = msgs.len;
+    msgs.len = 2;
+    openai_prepare_live_continuation(&partial, &msgs, NULL);
+    TEST_ASSERT(partial.openai_live_call_ids.len == 0);
+    TEST_ASSERT(partial.openai_live_suffix_text == NULL);
+    msgs.len = full_len;
+
+    request_free(&partial);
+    chat_msgs_free(&msgs);
+    request_free(&r);
+}
+
+static void test_openai_live_state_remember_and_clear(void) {
+    server s = {0};
+    server_slot slot = {0};
+    int toks[] = {1, 2, 3, 4};
+    slot.session = ds4_session_new_test_checkpoint(toks, 4);
+    pthread_mutex_init(&s.tool_mu, NULL);
+
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.id = xstrdup("call_clear");
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{}");
+    tool_calls_push(&calls, tc);
+
+    openai_live_remember(&s, &slot, "same prior prompt", &calls, "", "");
+    TEST_ASSERT(slot.openai_live.valid);
+    TEST_ASSERT(slot.openai_live.live_tokens == 4);
+    TEST_ASSERT(slot.openai_live.frontier.len == 4);
+    TEST_ASSERT(ds4_tokens_starts_with(&slot.openai_live.frontier,
+                                       ds4_session_tokens(slot.session)));
+    TEST_ASSERT(slot.openai_live.call_ids.len == 1);
+    TEST_ASSERT(id_list_contains(&slot.openai_live.call_ids, "call_clear"));
+    TEST_ASSERT(slot.openai_live.visible_text &&
+                !strcmp(slot.openai_live.visible_text, "same prior prompt"));
+
+    request_live_state_clear(&s, &slot);
+    TEST_ASSERT(!slot.openai_live.valid);
+    TEST_ASSERT(slot.openai_live.live_tokens == 0);
+    TEST_ASSERT(slot.openai_live.frontier.len == 0);
+    TEST_ASSERT(slot.openai_live.call_ids.len == 0);
+
+    tool_calls_free(&calls);
+    live_tool_state_free(&slot.openai_live);
+    ds4_session_free_test_checkpoint(slot.session);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
+static void test_openai_live_identity_precedes_tool_memory_attachment(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.has_tools = true;
+    r.think_mode = DS4_THINK_HIGH;
+
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("first");
+    chat_msgs_push(&msgs, user);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    tool_call call = {0};
+    call.id = xstrdup("call-prior");
+    call.name = xstrdup("bash");
+    call.arguments = xstrdup("{\"command\":\"true\"}");
+    tool_calls_push(&assistant.calls, call);
+    chat_msgs_push(&msgs, assistant);
+    chat_msg result = {0};
+    result.role = xstrdup("tool");
+    result.tool_call_id = xstrdup("call-prior");
+    result.content = xstrdup("ok");
+    chat_msgs_push(&msgs, result);
+
+    char *before = render_chat_prompt_text_for_syntax(
+        r.model_syntax, &msgs, NULL, &r.tool_orders, r.think_mode);
+    openai_prepare_live_identity(&r, &msgs, NULL);
+    TEST_ASSERT(r.openai_live_identity_text != NULL);
+    TEST_ASSERT(!strcmp(r.openai_live_identity_text, before));
+
+    /* Model the exact sampled DSML arriving from RAM/disk after identity was
+     * captured. It can improve replay, but cannot retroactively change which
+     * client-visible request owns the future call id. */
+    msgs.v[1].calls.raw_tool_text = xstrdup(
+        "<｜DSML｜invoke name=\"bash\"><｜DSML｜parameter name=\"command\" "
+        "string=\"true\">true</｜DSML｜parameter></｜DSML｜invoke>");
+    char *after = render_chat_prompt_text_for_syntax(
+        r.model_syntax, &msgs, NULL, &r.tool_orders, r.think_mode);
+    TEST_ASSERT(strcmp(before, after) != 0);
+    TEST_ASSERT(!strcmp(r.openai_live_identity_text, before));
+
+    free(before);
+    free(after);
+    chat_msgs_free(&msgs);
+    request_free(&r);
+}
+
+static void test_openai_live_prefix_normalizes_image_markers(void) {
+    const char *a = "before\036DS4_IMAGE_000000000000000000000001\037after";
+    const char *b = "before\036DS4_IMAGE_abcdefabcdefabcdefabcdef\037after";
+    char *na = normalize_server_image_markers(a);
+    char *nb = normalize_server_image_markers(b);
+    TEST_ASSERT(na && nb && !strcmp(na, nb));
+    TEST_ASSERT(strstr(na, "DS4_IMAGE\037after") != NULL);
+    TEST_ASSERT(strstr(na, "000000000000000000000001") == NULL);
+    free(na);
+    free(nb);
+}
+
 static void test_anthropic_live_tail_renders_tool_results_only(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -19438,6 +20739,510 @@ static void test_client_disconnect_probe(void) {
     TEST_ASSERT(!client_recv_errno_disconnected(EINTR));
     TEST_ASSERT(!client_recv_errno_disconnected(EAGAIN));
     TEST_ASSERT(!client_recv_errno_disconnected(EWOULDBLOCK));
+}
+
+static void test_cancel_job_init(job *j);
+static void test_cancel_job_destroy(job *j);
+
+static void test_terminal_response_commit_owns_late_disconnect(void) {
+    job delivered;
+    test_cancel_job_init(&delivered);
+    TEST_ASSERT(job_begin_response_write(&delivered));
+    /* Simulate the watcher observing FIN after the terminal write has begun
+     * but before its successful return has been committed. */
+    job_mark_cancelled(&delivered);
+    TEST_ASSERT(!job_cancelled(&delivered));
+    job_finish_response_write(&delivered, true);
+    TEST_ASSERT(delivered.response_committed);
+    TEST_ASSERT(!job_cancelled(&delivered));
+    job_mark_cancelled(&delivered);
+    TEST_ASSERT(!job_cancelled(&delivered));
+    test_cancel_job_destroy(&delivered);
+
+    job failed;
+    test_cancel_job_init(&failed);
+    TEST_ASSERT(job_begin_response_write(&failed));
+    job_mark_cancelled(&failed);
+    job_finish_response_write(&failed, false);
+    TEST_ASSERT(!failed.response_committed);
+    TEST_ASSERT(job_cancelled(&failed));
+    test_cancel_job_destroy(&failed);
+
+    job already_cancelled;
+    test_cancel_job_init(&already_cancelled);
+    job_mark_cancelled(&already_cancelled);
+    TEST_ASSERT(!job_begin_response_write(&already_cancelled));
+    TEST_ASSERT(job_cancelled(&already_cancelled));
+    test_cancel_job_destroy(&already_cancelled);
+}
+
+static void test_destructive_tool_rebuild_retires_cancel_checkpoint(void) {
+    ds4_cancel_checkpoint *checkpoint = NULL;
+    char err[96] = {0};
+    bool prompt_frontier_preservable = true;
+    TEST_ASSERT(begin_destructive_tool_checkpoint_rebuild(
+        DS4_SESSION_REWRITE_REBUILD_NEEDED, &checkpoint, err, sizeof(err),
+        &prompt_frontier_preservable));
+    TEST_ASSERT(checkpoint == NULL);
+    TEST_ASSERT(strstr(err, "destructive tool checkpoint rebuild") != NULL);
+    TEST_ASSERT(!prompt_frontier_preservable);
+    TEST_ASSERT(!cancel_prompt_frontier_can_be_preserved(4096, 4096,
+                                                         prompt_frontier_preservable,
+                                                         true));
+
+    err[0] = '\0';
+    prompt_frontier_preservable = true;
+    TEST_ASSERT(!begin_destructive_tool_checkpoint_rebuild(
+        DS4_SESSION_REWRITE_OK, &checkpoint, err, sizeof(err),
+        &prompt_frontier_preservable));
+    TEST_ASSERT(prompt_frontier_preservable);
+    TEST_ASSERT(err[0] == '\0');
+}
+
+static void test_cancelled_untouched_prompt_is_preserved(void) {
+    TEST_ASSERT(cancel_prompt_frontier_can_be_preserved(4096, 4096,
+                                                        true, true));
+    TEST_ASSERT(!cancel_prompt_frontier_can_be_preserved(4097, 4096,
+                                                         true, true));
+    TEST_ASSERT(!cancel_prompt_frontier_can_be_preserved(4096, 4096,
+                                                         false, true));
+    TEST_ASSERT(!cancel_prompt_frontier_can_be_preserved(4096, 4096,
+                                                         true, false));
+}
+
+typedef struct {
+    int pos;
+    int restore_to;
+    int restore_rc;
+    bool state_matches;
+    int restore_calls;
+    int match_calls;
+    int invalidate_calls;
+} test_cancel_restore_session;
+
+typedef struct {
+    int pos;
+} test_cancel_restore_checkpoint;
+
+static int test_cancel_restore_pos(ds4_session *opaque) {
+    return ((test_cancel_restore_session *)opaque)->pos;
+}
+
+static int test_cancel_restore_checkpoint_pos(
+        const ds4_cancel_checkpoint *opaque) {
+    if (!opaque) return -1;
+    return ((const test_cancel_restore_checkpoint *)opaque)->pos;
+}
+
+static int test_cancel_restore_apply(
+        ds4_session *opaque, const ds4_cancel_checkpoint *checkpoint,
+        char *err, size_t errlen) {
+    (void)checkpoint;
+    test_cancel_restore_session *session =
+        (test_cancel_restore_session *)opaque;
+    session->restore_calls++;
+    if (session->restore_rc != 0) {
+        snprintf(err, errlen, "injected restore failure");
+        return session->restore_rc;
+    }
+    session->pos = session->restore_to;
+    return 0;
+}
+
+static bool test_cancel_restore_state_matches(
+        ds4_session *opaque, const ds4_vision_span *images,
+        size_t image_count) {
+    (void)images;
+    (void)image_count;
+    test_cancel_restore_session *session =
+        (test_cancel_restore_session *)opaque;
+    session->match_calls++;
+    return session->state_matches;
+}
+
+static void test_cancel_restore_invalidate(ds4_session *opaque) {
+    test_cancel_restore_session *session =
+        (test_cancel_restore_session *)opaque;
+    session->invalidate_calls++;
+}
+
+static const cancel_restore_ops test_cancel_restore_ops = {
+    .session_pos = test_cancel_restore_pos,
+    .checkpoint_pos = test_cancel_restore_checkpoint_pos,
+    .checkpoint_restore = test_cancel_restore_apply,
+    .state_matches = test_cancel_restore_state_matches,
+    .session_invalidate = test_cancel_restore_invalidate,
+};
+
+static cancel_restore_result test_cancel_restore_run(
+        test_cancel_restore_session *session,
+        const test_cancel_restore_checkpoint *checkpoint,
+        int prompt_frontier, bool prompt_frontier_preservable,
+        const char *checkpoint_err) {
+    server_slot slot = {.session = (ds4_session *)session};
+    cancel_restore_result result;
+    restore_cancelled_prompt_locked(
+        &slot,
+        (const ds4_cancel_checkpoint *)checkpoint,
+        checkpoint_err, prompt_frontier, prompt_frontier_preservable,
+        NULL, 0, &test_cancel_restore_ops, &result);
+    return result;
+}
+
+static void test_cancelled_request_restore_orchestration(void) {
+    test_cancel_restore_checkpoint checkpoint = {.pos = 4096};
+    test_cancel_restore_session session = {
+        .pos = 4128,
+        .restore_to = 4096,
+        .state_matches = true,
+    };
+    cancel_restore_result result = test_cancel_restore_run(
+        &session, &checkpoint, 4096, true, NULL);
+    TEST_ASSERT(result.restored && !result.preserved);
+    TEST_ASSERT(session.restore_calls == 1);
+    TEST_ASSERT(session.match_calls == 1);
+    TEST_ASSERT(session.invalidate_calls == 0);
+    TEST_ASSERT(result.live_before == 4128);
+
+    session = (test_cancel_restore_session){
+        .pos = 4128,
+        .restore_to = 4096,
+        .state_matches = false,
+    };
+    result = test_cancel_restore_run(&session, &checkpoint, 4096, true, NULL);
+    TEST_ASSERT(!result.restored && !result.preserved);
+    TEST_ASSERT(session.restore_calls == 1);
+    TEST_ASSERT(session.match_calls == 1);
+    TEST_ASSERT(session.invalidate_calls == 1);
+    TEST_ASSERT(strstr(result.err, "failed validation") != NULL);
+
+    session = (test_cancel_restore_session){
+        .pos = 4128,
+        .restore_to = 4096,
+        .restore_rc = 1,
+        .state_matches = true,
+    };
+    result = test_cancel_restore_run(&session, &checkpoint, 4096, true, NULL);
+    TEST_ASSERT(!result.restored && !result.preserved);
+    TEST_ASSERT(session.restore_calls == 1);
+    TEST_ASSERT(session.match_calls == 0);
+    TEST_ASSERT(session.invalidate_calls == 1);
+    TEST_ASSERT(strstr(result.err, "injected restore failure") != NULL);
+
+    checkpoint.pos = 4095;
+    session = (test_cancel_restore_session){
+        .pos = 4128,
+        .restore_to = 4096,
+        .state_matches = true,
+    };
+    result = test_cancel_restore_run(&session, &checkpoint, 4096, true, NULL);
+    TEST_ASSERT(!result.restored && !result.preserved);
+    TEST_ASSERT(session.restore_calls == 0);
+    TEST_ASSERT(session.match_calls == 0);
+    TEST_ASSERT(session.invalidate_calls == 1);
+    TEST_ASSERT(strstr(result.err, "frontier changed") != NULL);
+
+    session = (test_cancel_restore_session){
+        .pos = 4096,
+        .state_matches = true,
+    };
+    result = test_cancel_restore_run(&session, NULL, 4096, true, NULL);
+    TEST_ASSERT(!result.restored && result.preserved);
+    TEST_ASSERT(session.restore_calls == 0);
+    TEST_ASSERT(session.match_calls == 1);
+    TEST_ASSERT(session.invalidate_calls == 0);
+
+    /* Destructive canonical rebuild retires both the snapshot and permission
+     * to preserve by position. A later cancellation must invalidate. */
+    ds4_cancel_checkpoint *retired = NULL;
+    char checkpoint_err[96] = {0};
+    bool preservable = true;
+    TEST_ASSERT(begin_destructive_tool_checkpoint_rebuild(
+        DS4_SESSION_REWRITE_REBUILD_NEEDED, &retired,
+        checkpoint_err, sizeof(checkpoint_err), &preservable));
+    TEST_ASSERT(!preservable && retired == NULL);
+    session = (test_cancel_restore_session){
+        .pos = 4096,
+        .state_matches = true,
+    };
+    result = test_cancel_restore_run(
+        &session, NULL, 4096, preservable, checkpoint_err);
+    TEST_ASSERT(!result.restored && !result.preserved);
+    TEST_ASSERT(session.restore_calls == 0);
+    TEST_ASSERT(session.match_calls == 1);
+    TEST_ASSERT(session.invalidate_calls == 1);
+    TEST_ASSERT(strstr(result.err, "destructive tool checkpoint rebuild") != NULL);
+}
+
+static void test_cancelled_request_rebases_continued_frontier(void) {
+    server s = {0};
+    s.kv.enabled = true;
+    s.kv.opt = kv_cache_default_options();
+    s.kv.opt.min_tokens = 512;
+    s.kv.opt.continued_interval_tokens = 16384;
+    s.kv.opt.boundary_align_tokens = 2048;
+    test_cancel_restore_checkpoint checkpoint = {.pos = 16384};
+    test_cancel_restore_session session = {0};
+    server_slot slot = {.session = (ds4_session *)&session};
+    cancel_restore_result result;
+
+    /* The cancelled tail may already have stored one or several intervals.
+     * A lower watermark must not be raised: that would skip an unsaved prompt. */
+    const int saved[] = {0, 8192, 16384, 32768, 65536};
+    for (size_t i = 0; i < sizeof(saved) / sizeof(saved[0]); i++) {
+        session = (test_cancel_restore_session){
+            .pos = 65537, .restore_to = 16384, .state_matches = true,
+        };
+        slot.continued_last_store_tokens = saved[i];
+        restore_cancelled_prompt_locked(
+            &slot, (const ds4_cancel_checkpoint *)&checkpoint, NULL,
+            16384, true, NULL, 0, &test_cancel_restore_ops, &result);
+        TEST_ASSERT(result.restored && !result.preserved);
+        TEST_ASSERT(session.invalidate_calls == 0);
+        const int expected = saved[i] > 16384 ? 16384 : saved[i];
+        TEST_ASSERT(slot.continued_last_store_tokens == expected);
+        TEST_ASSERT(kv_cache_slot_continued_target(&s, &slot, 32768) == 32768);
+        if (saved[i] < 16384) {
+            TEST_ASSERT(kv_cache_slot_continued_target(&s, &slot, 16384) == 16384);
+        }
+
+        /* The retry saves a new tail and is cancelled again. Reuse the same
+         * slot and checkpoint rather than testing a newly initialized slot. */
+        session.pos = 32769;
+        kv_cache_slot_note_store(&slot, 32768);
+        restore_cancelled_prompt_locked(
+            &slot, (const ds4_cancel_checkpoint *)&checkpoint, NULL,
+            16384, true, NULL, 0, &test_cancel_restore_ops, &result);
+        TEST_ASSERT(result.restored && !result.preserved);
+        TEST_ASSERT(session.invalidate_calls == 0);
+        TEST_ASSERT(slot.continued_last_store_tokens == 16384);
+        TEST_ASSERT(kv_cache_slot_continued_target(&s, &slot, 32768) == 32768);
+    }
+
+    /* An untouched prompt is also valid without a backend snapshot. */
+    session = (test_cancel_restore_session){.pos = 16384, .state_matches = true};
+    slot.continued_last_store_tokens = 32768;
+    restore_cancelled_prompt_locked(
+        &slot, NULL, NULL, 16384, true, NULL, 0,
+        &test_cancel_restore_ops, &result);
+    TEST_ASSERT(!result.restored && result.preserved);
+    TEST_ASSERT(slot.continued_last_store_tokens == 16384);
+
+    /* Failed restoration or validation must still invalidate. It must not
+     * publish the success-only watermark change. The next cold request resets
+     * bookkeeping through the existing cached == 0 path. */
+    for (int failure = 0; failure < 3; failure++) {
+        session = (test_cancel_restore_session){
+            .pos = 32769,
+            .restore_to = failure == 2 ? 16385 : 16384,
+            .restore_rc = failure == 0 ? 1 : 0,
+            .state_matches = failure != 1,
+        };
+        slot.continued_last_store_tokens = 32768;
+        restore_cancelled_prompt_locked(
+            &slot, (const ds4_cancel_checkpoint *)&checkpoint, NULL,
+            16384, true, NULL, 0, &test_cancel_restore_ops, &result);
+        TEST_ASSERT(!result.restored && !result.preserved);
+        TEST_ASSERT(session.invalidate_calls == 1);
+        TEST_ASSERT(slot.continued_last_store_tokens == 32768);
+    }
+}
+
+static void test_cancelled_retry_identity(void) {
+    const char *wire = "[{\"role\":\"user\",\"content\":\"history\"},"
+        "{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":["
+        "{\"id\":\"call_a\",\"type\":\"function\",\"function\":{"
+        "\"name\":\"lookup\",\"arguments\":\"{\\\"x\\\":1}\"}}]},"
+        "{\"role\":\"tool\",\"tool_call_id\":\"call_a\",\"content\":\"result\"}]";
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_messages(&wire, &msgs));
+    char *key = chat_retry_identity(&msgs);
+    TEST_ASSERT(key != NULL);
+    char *again = chat_retry_identity(&msgs);
+    TEST_ASSERT(!strcmp(key, again));
+    free(again);
+
+    /* The renderer may replace arguments with remembered DSML. This identity
+     * is captured before that attachment and must reject every such edit. */
+    char **fields[] = {
+        &msgs.v[0].content, &msgs.v[1].content,
+        &msgs.v[1].calls.v[0].id, &msgs.v[1].calls.v[0].name,
+        &msgs.v[1].calls.v[0].arguments, &msgs.v[2].tool_call_id,
+        &msgs.v[2].content
+    };
+    for (size_t i = 0; i < sizeof(fields)/sizeof(fields[0]); i++) {
+        char *saved = *fields[i];
+        *fields[i] = "edited";
+        char *edited = chat_retry_identity(&msgs);
+        TEST_ASSERT(strcmp(key, edited));
+        free(edited);
+        *fields[i] = saved;
+    }
+    msgs.v[1].reasoning = xstrdup("explicitly different reasoning");
+    char *edited = chat_retry_identity(&msgs);
+    TEST_ASSERT(strcmp(key, edited));
+    free(edited);
+    free(key);
+    chat_msgs_free(&msgs);
+
+    /* Random image sentinels do not make retries differ. They are removed
+     * only at known image boundaries; arbitrary lookalike text is retained. */
+    server_image_input image = {0};
+    snprintf(image.marker, sizeof(image.marker), "\036DS4_IMAGE_a\037");
+    chat_msg msg = {.role = "user", .content = "before\036DS4_IMAGE_a\037after"};
+    msg.images.v = &image;
+    msg.images.len = 1;
+    msgs = (chat_msgs){.v = &msg, .len = 1};
+    key = chat_retry_identity(&msgs);
+    snprintf(image.marker, sizeof(image.marker), "\036DS4_IMAGE_b\037");
+    msg.content = "before\036DS4_IMAGE_b\037after";
+    again = chat_retry_identity(&msgs);
+    TEST_ASSERT(!strcmp(key, again));
+    free(again);
+    msg.images.len = 0;
+    edited = chat_retry_identity(&msgs);
+    TEST_ASSERT(strcmp(key, edited));
+    free(edited);
+    msg.images.len = 1;
+    msg.content = "beforeafter";
+    TEST_ASSERT(chat_retry_identity(&msgs) == NULL);
+    free(key);
+}
+
+static void test_cancelled_retry_exact_frontier(void) {
+    request req = {.kind = REQ_CHAT, .api = API_OPENAI,
+                   .retry_identity = "exact original messages"};
+    int rendered_ids[] = {1, 2, 3};
+    int live_ids[] = {1, 9, 2, 3}; /* Hidden state omitted in client replay. */
+    req.prompt = (ds4_tokens){.v = rendered_ids, .len = 3, .cap = 3};
+    ds4_tokens live = {.v = live_ids, .len = 4, .cap = 4};
+    visible_live_state st = {0};
+    cancelled_retry_remember_locked(&st, &req, &live);
+    TEST_ASSERT(st.visible_text == NULL); /* Never a visible/disk-prefix key. */
+    TEST_ASSERT(cancelled_retry_matches(&st, &req, &live));
+    req.stream = true;
+    req.max_tokens = 1024;
+    req.temperature = 1.0f;
+    TEST_ASSERT(cancelled_retry_matches(&st, &req, &live));
+    req.retry_identity = "edited tool result";
+    TEST_ASSERT(!cancelled_retry_matches(&st, &req, &live));
+    req.retry_identity = "exact original messages";
+    rendered_ids[1] = 7; /* Changed rendered tools/thinking/settings. */
+    TEST_ASSERT(!cancelled_retry_matches(&st, &req, &live));
+    rendered_ids[1] = 2;
+    live_ids[1] = 7; /* Different cache with the same length. */
+    TEST_ASSERT(!cancelled_retry_matches(&st, &req, &live));
+    live_ids[1] = 9;
+    live.len--;
+    TEST_ASSERT(!cancelled_retry_matches(&st, &req, &live));
+    live.len++;
+    req.api = API_ANTHROPIC;
+    TEST_ASSERT(!cancelled_retry_matches(&st, &req, &live));
+    req.api = API_OPENAI;
+    req.prompt.len--;
+    TEST_ASSERT(!cancelled_retry_matches(&st, &req, &live));
+    req.prompt.len++;
+    TEST_ASSERT(cancelled_retry_matches(&st, &req, &live));
+
+    /* A second cancellation replaces the first binding. Normal state cleanup
+     * after failure, completion or eviction retires all owned allocations. */
+    req.retry_identity = "second request";
+    cancelled_retry_remember_locked(&st, &req, &live);
+    TEST_ASSERT(cancelled_retry_matches(&st, &req, &live));
+    req.retry_identity = "exact original messages";
+    TEST_ASSERT(!cancelled_retry_matches(&st, &req, &live));
+    visible_live_clear_locked(&st);
+    TEST_ASSERT(!cancelled_retry_matches(&st, &req, &live));
+    TEST_ASSERT(!st.retry_identity && !st.retry_prompt.v &&
+                !st.retry_frontier.v);
+    cancelled_retry_remember_locked(&st, &req, NULL);
+    TEST_ASSERT(!st.valid);
+    visible_live_free(&st);
+}
+
+static void test_cancelled_retry_reuse_probe(void) {
+    server s = {0};
+    server_slot slots[2] = {0};
+    int rendered_ids[] = {1, 2, 3};
+    int live_ids[] = {1, 9, 2, 3};
+    job j = {0};
+    j.req.kind = REQ_CHAT;
+    j.req.api = API_OPENAI;
+    j.req.retry_identity = "same request";
+    j.req.prompt = (ds4_tokens){.v = rendered_ids, .len = 3, .cap = 3};
+    s.slots = slots;
+    s.slot_count = 2;
+    slots[1].id = 1;
+    slots[0].session = ds4_session_new_test_checkpoint(NULL, 0);
+    slots[1].session = ds4_session_new_test_checkpoint(live_ids, 4);
+    const ds4_tokens *live = ds4_session_tokens(slots[1].session);
+    cancelled_retry_remember_locked(&slots[1].thinking_live, &j.req, live);
+
+    /* Dispatch and execution use the same probe even though the client
+     * renders three tokens and the valid cached frontier contains four. */
+    slot_reuse pr = slot_probe_reuse_locked(&s, &slots[1], &j.req);
+    TEST_ASSERT(pr.kind == REUSE_CANCELLED_RETRY && pr.reuse_tokens == 4);
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == 1);
+    TEST_ASSERT(job_slot_score(&s, &slots[1], &j, 1, 1000000) == INT_MAX);
+    TEST_ASSERT(job_slot_score(&s, &slots[1], &j, -1, 1000000) == 4);
+    TEST_ASSERT(job_slot_score(&s, &slots[0], &j, 1, 1000000) == INT_MIN);
+    ds4_tokens effective = {0};
+    ds4_tokens_copy(&effective, &slots[1].thinking_live.retry_frontier);
+    TEST_ASSERT(ds4_session_common_prefix(slots[1].session, &effective) == 4);
+    ds4_tokens_free(&effective);
+
+    j.req.retry_identity = "edited result";
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slots[1], &j.req).kind == REUSE_NONE);
+    j.req.retry_identity = "same request";
+    cancelled_retry_remember_locked(&slots[0].thinking_live, &j.req, live);
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slots[1], &j.req).kind == REUSE_NONE);
+    visible_live_clear_locked(&slots[0].thinking_live);
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slots[1], &j.req).kind == REUSE_CANCELLED_RETRY);
+    ds4_session_invalidate(slots[1].session);
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slots[1], &j.req).kind == REUSE_NONE);
+    visible_live_free(&slots[0].thinking_live);
+    visible_live_free(&slots[1].thinking_live);
+    ds4_session_free(slots[0].session);
+    ds4_session_free(slots[1].session);
+}
+
+static void test_cancelled_retry_dispatch_handoff(void) {
+    server s = {0};
+    server_slot slots[3] = {0};
+    job j = {0};
+    int ids[] = {1, 2, 3};
+    ds4_tokens live = {.v = ids, .len = 3, .cap = 3};
+    s.slots = slots;
+    s.slot_count = 3;
+    j.req.kind = REQ_CHAT;
+    j.req.api = API_OPENAI;
+    j.req.prompt = live;
+    j.req.retry_identity = "same request";
+    slots[1].id = 1;
+    cancelled_retry_remember_locked(&slots[1].thinking_live, &j.req, &live);
+    slots[1].busy = true;
+    /* A published rollback must wait for its worker, not pick slot zero.
+     * The busy session is NULL deliberately: dispatch must not read it. */
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == 1);
+    TEST_ASSERT(job_slot_score(&s, &slots[0], &j, 1, 1000000) == INT_MIN);
+    TEST_ASSERT(job_slot_score(&s, &slots[1], &j, 1, 1000000) == INT_MIN);
+    slots[1].busy = false;
+    slots[1].assigned = &j;
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == 1);
+    slots[1].assigned = NULL;
+    /* Once idle, a stale/invalid session cannot claim ownership. */
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == -1);
+    slots[1].busy = true;
+    cancelled_retry_remember_locked(&slots[2].thinking_live, &j.req, &live);
+    TEST_ASSERT(cancelled_retry_owner_locked(&s, &j.req) == -1);
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == -1);
+    visible_live_free(&slots[2].thinking_live);
+    j.req.retry_identity = "another request";
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == -1);
+    j.req.retry_identity = "same request";
+    visible_live_clear_locked(&slots[1].thinking_live);
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == -1);
+    visible_live_free(&slots[1].thinking_live);
 }
 
 static void test_cancel_job_init(job *j) {
@@ -21226,6 +23031,10 @@ static void test_responses_inline_image_content(void) {
 static void ds4_server_unit_tests_run(void) {
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
+    test_prefill_slice_realigns_after_vision_block();
+    test_openai_live_assistant_identity();
+    test_openai_live_publication_boundary();
+    test_live_tool_suffix_deduplicates_canonical_eos();
     test_max_active_requests_option();
     test_multimodal_prefill_resume_frontier();
     test_batched_live_continuation_slot_binding();
@@ -21233,6 +23042,8 @@ static void ds4_server_unit_tests_run(void) {
     test_slot_probe_live_state_tiers();
     test_slot_routing_staleness_tiers();
     test_dispatch_routes_alien_request_to_empty_slot();
+    test_dispatch_routes_openai_tool_continuation_to_owner();
+    test_openai_continuation_waits_for_binding_publication();
     test_dispatch_respects_active_request_limit();
     test_ten_resident_continuations_keep_their_slots();
     test_batched_cache_capacity_does_not_enable_speculation();
@@ -21298,6 +23109,10 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_dsml();
     test_anthropic_tool_memory_replays_sampled_dsml();
+    test_openai_live_tail_renders_tool_results_only();
+    test_openai_live_state_remember_and_clear();
+    test_openai_live_identity_precedes_tool_memory_attachment();
+    test_openai_live_prefix_normalizes_image_markers();
     test_anthropic_live_tail_renders_tool_results_only();
     test_anthropic_tool_result_id_validation();
     test_anthropic_full_replay_allows_unknown_live_id();
@@ -21338,6 +23153,15 @@ static void ds4_server_unit_tests_run(void) {
     test_speculative_tail_rewind_target();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
+    test_terminal_response_commit_owns_late_disconnect();
+    test_destructive_tool_rebuild_retires_cancel_checkpoint();
+    test_cancelled_untouched_prompt_is_preserved();
+    test_cancelled_request_restore_orchestration();
+    test_cancelled_request_rebases_continued_frontier();
+    test_cancelled_retry_identity();
+    test_cancelled_retry_reuse_probe();
+    test_cancelled_retry_exact_frontier();
+    test_cancelled_retry_dispatch_handoff();
     test_cancelled_progress_callback_is_inert();
     test_prefill_progress_cache_coordinates();
     test_disk_cache_interruption_keeps_valid_entry();

@@ -74747,10 +74747,12 @@ int ds4_session_cancel_checkpoint_capture(
                                   "session has no valid prompt checkpoint");
         return 1;
     }
-    if (s->distributed || (s->engine && s->engine->tp.active)) {
+    if (!s->engine || s->engine->backend != DS4_BACKEND_METAL ||
+        s->engine->distributed.role != DS4_DISTRIBUTED_NONE ||
+        s->distributed || s->engine->tp.active) {
         cancel_checkpoint_set_err(
             err, errlen,
-            "request-local cancellation checkpoints do not support distributed sessions");
+            "request-local cancellation checkpoints require a local Metal session");
         return 1;
     }
     if (ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
@@ -74872,6 +74874,63 @@ int ds4_session_cancel_checkpoint_capture(
 #endif
 }
 
+#ifndef DS4_NO_GPU
+static bool cancel_checkpoint_restore_layout_matches(
+        const ds4_cancel_checkpoint *checkpoint, const ds4_session *s) {
+    if (!checkpoint || !s || !checkpoint->logits ||
+        (checkpoint->image_count != 0 && !checkpoint->images) ||
+        checkpoint->raw_cap == 0 || checkpoint->raw_live > checkpoint->raw_cap ||
+        checkpoint->raw_live > (uint32_t)checkpoint->pos) {
+        return false;
+    }
+    const ds4_gpu_graph *g = &s->graph;
+    const uint64_t row_bytes = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t saved_raw_bytes =
+        (uint64_t)checkpoint->raw_live * row_bytes;
+    const uint64_t live_raw_bytes =
+        (uint64_t)checkpoint->raw_cap * row_bytes;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor *raw = g->layer_raw_cache[il];
+        if (!raw) {
+            if (checkpoint->raw[il] || checkpoint->attn_state_kv[il] ||
+                checkpoint->attn_state_score[il] ||
+                checkpoint->index_state_kv[il] ||
+                checkpoint->index_state_score[il]) return false;
+            continue;
+        }
+        if (g->layer_raw_cache_tp[il] || !checkpoint->raw[il] ||
+            ds4_gpu_tensor_bytes(raw) < live_raw_bytes ||
+            ds4_gpu_tensor_bytes(checkpoint->raw[il]) != saved_raw_bytes) {
+            return false;
+        }
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        ds4_gpu_tensor *ak = g->layer_attn_state_kv[il];
+        ds4_gpu_tensor *as = g->layer_attn_state_score[il];
+        if (!ak || !as || !checkpoint->attn_state_kv[il] ||
+            !checkpoint->attn_state_score[il] ||
+            ds4_gpu_tensor_bytes(ak) !=
+                ds4_gpu_tensor_bytes(checkpoint->attn_state_kv[il]) ||
+            ds4_gpu_tensor_bytes(as) !=
+                ds4_gpu_tensor_bytes(checkpoint->attn_state_score[il])) {
+            return false;
+        }
+        if (ratio != 4) continue;
+        ds4_gpu_tensor *ik = g->layer_index_state_kv[il];
+        ds4_gpu_tensor *is = g->layer_index_state_score[il];
+        if (!ik || !is || !checkpoint->index_state_kv[il] ||
+            !checkpoint->index_state_score[il] ||
+            ds4_gpu_tensor_bytes(ik) !=
+                ds4_gpu_tensor_bytes(checkpoint->index_state_kv[il]) ||
+            ds4_gpu_tensor_bytes(is) !=
+                ds4_gpu_tensor_bytes(checkpoint->index_state_score[il])) {
+            return false;
+        }
+    }
+    return true;
+}
+#endif
+
 int ds4_session_cancel_checkpoint_restore(
         ds4_session *s, const ds4_cancel_checkpoint *checkpoint,
         char *err, size_t errlen) {
@@ -74886,11 +74945,19 @@ int ds4_session_cancel_checkpoint_restore(
                               "graph backend support is not compiled in");
     return 1;
 #else
-    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || s->distributed ||
-        (s->engine && s->engine->tp.active) ||
+    if (!s->engine || s->engine->backend != DS4_BACKEND_METAL ||
+        s->engine->distributed.role != DS4_DISTRIBUTED_NONE ||
+        ds4_session_is_cpu(s) || ds4_session_is_glm(s) || s->distributed ||
+        s->engine->tp.active ||
         s->graph.raw_cap != checkpoint->raw_cap) {
         cancel_checkpoint_set_err(err, errlen,
                                   "session no longer supports this cancellation checkpoint");
+        return 1;
+    }
+    if (!cancel_checkpoint_restore_layout_matches(checkpoint, s)) {
+        cancel_checkpoint_set_err(
+            err, errlen,
+            "cancellation checkpoint no longer matches the session layout");
         return 1;
     }
     ds4_gpu_graph *g = &s->graph;
@@ -74928,8 +74995,12 @@ int ds4_session_cancel_checkpoint_restore(
         }
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
-    else (void)ds4_gpu_synchronize();
     if (!ok) {
+        (void)ds4_gpu_synchronize();
+        /* Copies above mutate recurrent tensors layer by layer.  Once any
+         * backend operation fails, the live session must not remain publicly
+         * reusable with a mixture of restored and request-era state. */
+        ds4_session_invalidate(s);
         cancel_checkpoint_set_err(err, errlen,
                                   "failed to restore cancellation checkpoint tensors");
         return 1;
