@@ -146,7 +146,7 @@ test-mxfp4-metal: check-mxfp4-half-lut tests/test_mxfp4_metal
 tests/test_argsort_metal.o: tests/test_argsort_metal.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
-tests/test_argsort_metal: tests/test_argsort_metal.o ds4_metal.o
+tests/test_argsort_metal: tests/test_argsort_metal.o ds4_metal.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 test-argsort-metal: tests/test_argsort_metal
