@@ -1273,6 +1273,17 @@ request is never evicted. Choose `N` and `--ctx` so all resident KV allocations
 fit in GPU memory. Without this option, inference retains the original
 single-session behavior.
 
+`--max-active-requests N` separates resident KV capacity from compute
+concurrency. It requires `--batched-session`, may not exceed the resident
+session count, and defaults to that count so existing behavior is unchanged.
+For example, `--batched-session 10 --max-active-requests 1` allocates ten
+resident session slots while processing complete requests one at a time;
+additional requests wait in the server queue instead of occupying another
+active slot. This avoids mixed prefill/decode contention without reducing
+resident KV capacity. Request-to-slot selection is unchanged: this option
+controls admission concurrency, not which checkpoint the existing router
+chooses for a request.
+
 While generation is active, prefill yields every 128 tokens by default.
 `--mixed-prefill-quantum N` changes that interval for testing; larger values
 reduce scheduling handoffs but can make active decoders wait longer.
