@@ -942,3 +942,67 @@ The previous binary and every replaced source are retained with timestamp
 suffix `20260903T235728Z`; rollback requires explicit approval and no KV cache
 deletion or conversion. Test sources, commands and result TSVs are preserved in
 `local-performance/pr832-eval-20260903T225737Z/`.
+
+## 2026-09-04 PR #959 pruned argsort merges — tested and installed
+
+Upstream PR #959 at exact head
+`ea16db6f7f800b1311a199bf6debbc143878b1bb` is installed. The runtime change
+prunes intermediate Metal argsort merges to the requested `top_k` instead of
+carrying candidates that later rounds must discard. The comparator, final
+selection and sampling behavior are unchanged. Local commits `a541198` and
+`e4a6195` contain the upstream runtime change and focused Metal regression test;
+`5ab05e6` supplies the test's missing `ds4_image.o` link dependency. That last
+commit is test plumbing only and does not alter the server binary.
+
+No launcher, model, vision encoder, sampling, context/output ceiling,
+concurrency, prefill quantum, KV path/budget/format, cache policy or rewind
+setting changed. Production remains 262144 context/output, ten resident
+sessions, one active request, 4096/64 prefill quanta, the existing
+Vision-Exp-specific KV directory, continued saves every 16384 tokens, cold
+anchors enabled and rewind disabled.
+
+Correctness was checked at three levels. The focused Metal suites passed odd
+run counts, maximal pruning, non-power-of-two `top_k`, dense ties, the 31/32
+streaming gate, a 64K compressed frontier and non-512 fallback. Real-model
+frontier logits at 32768, 65536 and 131072 tokens were byte-identical between
+baseline and candidate. A separate 64-step teacher-forced trace after a 32768
+token real-model prefill compared all 8,273,920 float logits (33,095,680 bytes)
+and was byte-identical; both files have SHA256
+`fdef848d3bcb50ddb75d069842b0e9be42678543ac2e700b1e0fc4581441c871`.
+
+Whole-model ABBA timing varied by several percent between runs, so it was not
+used to claim a small net speedup. An evaluation-only same-process switch then
+alternated legacy and pruned merges on the same resident buffers and GPU state.
+Across 20 blocks per shape, median affected-kernel speedups were 0.1290% at
+8192 candidates (319.3220 to 318.9105 microseconds), 3.4121% at 32768
+candidates (355.2300 to 343.5090 microseconds), and 11.7051% at 65536
+candidates (388.5700 to 347.8533 microseconds). Every block produced the same
+selected-index checksum. The switch exists only in the disposable evaluation
+worktree; it is not present in production or proposed upstream.
+
+The production-shaped build passed `tests/test_argsort_metal`,
+`tests/test_topk_ab`, `./ds4_test --server`, launcher syntax and
+`git diff --check`. The clean staging head also passed the CPU portability
+build. The only compile diagnostics were the existing macOS 27
+`didModifyRange:` deprecation warnings from unrelated code.
+
+Installed `ds4-server` SHA256:
+`68c29f9e4f4a87605578988cac309e58d97aeef02972f2d6a55c717a514ee477`.
+The previous binary SHA256 was
+`265671a75997bf1d6fb3bd252e95f076d16fdae05f4eac9e68dccb4b1048bee6`.
+
+Post-install validation started launchd PID 49195 with the unchanged effective
+arguments and confirmed `/v1/models` still advertises 262144 context and output
+limits. A real 1879-token request was cold and wrote a checkpoint; its identical
+repeat reported 1879 cached tokens, zero cache-write tokens, loaded the disk
+checkpoint in 16.4 ms and performed zero prefill. Because the disk cache was
+already at its configured budget, storing that validation checkpoint evicted
+one zero-hit 147456-token checkpoint; no cache directory, format or policy was
+changed. DSG resumed only `m3-studio` and verified it healthy, undrained,
+unquarantined and able to accept work.
+
+Exact rollback copies, hashes, CSVs, full-logit traces, benchmark harnesses and
+commands are retained in
+`local-performance/pr959-production-20260904T121730Z/`. Rollback requires
+explicit approval and the server must be stopped before restoring the matching
+source and binary; the KV cache needs no deletion or conversion.
