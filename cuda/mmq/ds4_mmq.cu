@@ -119,6 +119,7 @@ private:
 static void *g_q81_scratch_ptr   = nullptr;
 static size_t g_q81_scratch_bytes = 0;
 static bool   g_q81_scratch_enabled = false;
+static int    g_q81_scratch_device = -1;
 static void  *g_aligned_q81_scratch_ptr = nullptr;
 static size_t g_aligned_q81_scratch_bytes = 0;
 static int    g_aligned_q81_scratch_device = -1;
@@ -139,6 +140,14 @@ struct mmq_pair_map_scratch {
 };
 
 static mmq_pair_map_scratch g_mmq_pair_maps[GGML_CUDA_MAX_DEVICES] = {};
+
+static bool q81_persistent_requested(int device,
+                                     const ggml_cuda_device_info &info) {
+    const char *env = getenv("DS4_CUDA_MMQ_Q81_PERSISTENT");
+    if (env && env[0] == '0') return false;
+    if (env && env[0] == '1') return true;
+    return info.devices[device].integrated && info.devices[device].cc >= 1200;
+}
 
 extern "C" void ds4_mmq_set_aligned_q81_scratch(void *ptr, size_t bytes) {
     g_aligned_q81_scratch_ptr = ptr;
@@ -349,11 +358,12 @@ extern "C" int ds4_mmq_init(int device) {
         maps.expert_bounds = base + 2u * MMQ_GFX1151_PAIR_MAP_ROWS;
     }
 
-    // Step 7 task #29: pre-allocate persistent Q8_1 scratch if enabled.
+    // Allocate before any layer-graph capture so every replay sees the same
+    // pointer and avoids stream-ordered allocation/free nodes.
     // Must happen here (before any layer-graph capture) so the cudaMalloc
     // is not forbidden by capture-mode restrictions, and so the kernel
     // pointer arg baked into the captured graph stays valid at replay.
-    if (getenv("DS4_CUDA_MMQ_Q81_PERSISTENT") && !g_q81_scratch_ptr) {
+    if (q81_persistent_requested(device, info) && !g_q81_scratch_ptr) {
         const size_t bytes = 256 * 1024;
         cudaError_t err = cudaMalloc(&g_q81_scratch_ptr, bytes);
         if (err != cudaSuccess) {
@@ -365,11 +375,31 @@ extern "C" int ds4_mmq_init(int device) {
         } else {
             g_q81_scratch_bytes = bytes;
             g_q81_scratch_enabled = true;
+            g_q81_scratch_device = device;
             fprintf(stderr, "ds4_mmq_init: persistent Q8_1 scratch enabled (%zu B at %p)\n",
                     bytes, g_q81_scratch_ptr);
         }
     }
     return 0;
+}
+
+extern "C" void ds4_mmq_cleanup(void) {
+    g_aligned_q81_scratch_ptr = nullptr;
+    g_aligned_q81_scratch_bytes = 0;
+    g_aligned_q81_scratch_device = -1;
+    if (g_q81_scratch_ptr) {
+        int previous = -1;
+        (void)cudaGetDevice(&previous);
+        if (g_q81_scratch_device >= 0) {
+            (void)cudaSetDevice(g_q81_scratch_device);
+        }
+        (void)cudaFree(g_q81_scratch_ptr);
+        if (previous >= 0) (void)cudaSetDevice(previous);
+        g_q81_scratch_ptr = nullptr;
+    }
+    g_q81_scratch_bytes = 0;
+    g_q81_scratch_enabled = false;
+    g_q81_scratch_device = -1;
 }
 
 // ----------------------------------------------------------------------------

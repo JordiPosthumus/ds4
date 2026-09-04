@@ -217,6 +217,38 @@ static cuda_moe_decode_graph_cache g_moe_decode_graph[DS4_MAX_GPUS];
 
 static int cuda_q4_mma_ok(void);
 
+static int cuda_f16_pair_vec2_ok(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        if (getenv("DS4_CUDA_NO_F16_PAIR_VEC2") != NULL) {
+            cached = 0;
+        } else if (getenv("DS4_CUDA_F16_PAIR_VEC2") != NULL) {
+            cached = 1;
+        } else {
+            int dev = 0, major = 0, integrated = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&major,
+                                   cudaDevAttrComputeCapabilityMajor, dev);
+            cudaDeviceGetAttribute(&integrated,
+                                   cudaDevAttrIntegrated, dev);
+            cached = integrated && major >= 12;
+        }
+    }
+    return cached;
+}
+
+static int cuda_q8_hc_expand_fused_ok(void) {
+    if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") != NULL) return 0;
+    if (getenv("DS4_CUDA_Q8_HC_EXPAND_FUSED") != NULL) return 1;
+    int dev = 0, major = 0, integrated = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&major,
+                           cudaDevAttrComputeCapabilityMajor, dev);
+    cudaDeviceGetAttribute(&integrated,
+                           cudaDevAttrIntegrated, dev);
+    return !(integrated && major >= 12);
+}
+
 
 
 
@@ -909,11 +941,29 @@ extern "C" int ds4_gpu_decode_graphs_supported(void) {
              strcmp(s, "off") == 0 || strcmp(s, "OFF") == 0 ||
              strcmp(s, "no") == 0 || strcmp(s, "NO") == 0 ||
              strcmp(s, "false") == 0 || strcmp(s, "FALSE") == 0);
+        const int force = s && *s &&
+            (s[0] == '1' ||
+             strcmp(s, "on") == 0 || strcmp(s, "ON") == 0 ||
+             strcmp(s, "yes") == 0 || strcmp(s, "YES") == 0 ||
+             strcmp(s, "true") == 0 || strcmp(s, "TRUE") == 0);
         if (off) {
             fprintf(stderr, "ds4: DS4_CUDA_DECODE_GRAPHS=%s - decode graph capture disabled\n", s);
             enabled = 0;
-        } else {
+        } else if (force) {
+            fprintf(stderr, "ds4: DS4_CUDA_DECODE_GRAPHS=%s - decode graph capture forced on\n", s);
             enabled = 1;
+        } else {
+            int dev = 0, major = 0, integrated = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&major,
+                                   cudaDevAttrComputeCapabilityMajor, dev);
+            cudaDeviceGetAttribute(&integrated,
+                                   cudaDevAttrIntegrated, dev);
+            enabled = !(integrated && major >= 12);
+            if (!enabled) {
+                fprintf(stderr,
+                        "ds4: decode graph capture off by default on integrated Blackwell (DS4_CUDA_DECODE_GRAPHS=1 to force)\n");
+            }
         }
     }
     return enabled && g_n_gpus == 1;
@@ -2762,6 +2812,12 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         }
     }
 
+    /* Recreate MMQ process-global scratch after a previous engine teardown.
+     * The later dispatch initializer is intentionally cached, while CUDA
+     * engines may be opened and closed repeatedly in one process. */
+    if (g_n_gpus == 1) {
+        (void)ds4_mmq_init(g_gpu[0].device_id);
+    }
     g_cublas_ready = 1;
     return 1;
 }
@@ -2776,6 +2832,7 @@ extern "C" int ds4_gpu_init(void) {
 
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
+    ds4_mmq_cleanup();
     g_current_logical_tier = -1;
 
     /* Multi-GPU teardown: events, streams, cublas handles, scratch
@@ -4841,6 +4898,10 @@ __global__ static void matmul_f16_small_out_batch_kernel(
     }
 }
 
+/* The vec2 form halves load instructions while preserving each lane's scalar
+ * accumulation order. It is enabled by default only on integrated Blackwell;
+ * DS4_CUDA_NO_F16_PAIR_VEC2 restores scalar loads. */
+template <bool VEC2>
 __global__ static void matmul_f16_pair_ordered_chunks_kernel(
         float *out0,
         float *out1,
@@ -4864,7 +4925,23 @@ __global__ static void matmul_f16_pair_ordered_chunks_kernel(
     if (k1 > in_dim) k1 = in_dim;
     const __half *wr0 = row < out0_dim ? w0 + row * in_dim : w0;
     const __half *wr1 = row < out1_dim ? w1 + row * in_dim : w1;
-    for (uint64_t i = k0; i < k1; i++) {
+    uint64_t i = k0;
+    if constexpr (VEC2) {
+        for (; i + 1u < k1; i += 2u) {
+            const float2 xv = *(const float2 *)(x + i);
+            const __half2 hw0 = *(const __half2 *)(wr0 + i);
+            const __half2 hw1 = *(const __half2 *)(wr1 + i);
+            if (row < out0_dim) {
+                sum0 += __low2float(hw0) * xv.x;
+                sum0 += __high2float(hw0) * xv.y;
+            }
+            if (row < out1_dim) {
+                sum1 += __low2float(hw1) * xv.x;
+                sum1 += __high2float(hw1) * xv.y;
+            }
+        }
+    }
+    for (; i < k1; i++) {
         const float xv = x[i];
         if (row < out0_dim) sum0 += __half2float(wr0[i]) * xv;
         if (row < out1_dim) sum1 += __half2float(wr1[i]) * xv;
@@ -16199,15 +16276,30 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
                ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
                                            in_dim, out_dim, x, n_tok);
     }
-    matmul_f16_pair_ordered_chunks_kernel<<<(unsigned)out_dim, 32>>>(
-        (float *)out0->ptr,
-        (float *)out1->ptr,
-        w0,
-        w1,
-        (const float *)x->ptr,
-        in_dim,
-        out_dim,
-        out_dim);
+    /* Decode (n_tok==1): two cuBLAS GEMVs beat the fused ordered-chunks pair
+     * kernel on bandwidth-bound parts. The pair kernel remains for quality
+     * mode, no-cuBLAS builds, and the rollback switches. */
+    if (g_cublas_ready && !g_quality_mode &&
+        getenv("DS4_CUDA_NO_F16_CUBLAS_ONE") == NULL &&
+        getenv("DS4_CUDA_NO_F16_PAIR_CUBLAS_ONE") == NULL) {
+        return ds4_gpu_matmul_f16_tensor(out0, model_map, model_size,
+                                           weight0_offset, in_dim, out_dim,
+                                           x, n_tok) &&
+               ds4_gpu_matmul_f16_tensor(out1, model_map, model_size,
+                                           weight1_offset, in_dim, out_dim,
+                                           x, n_tok);
+    }
+    if (cuda_f16_pair_vec2_ok() && (in_dim & 63u) == 0u) {
+        matmul_f16_pair_ordered_chunks_kernel<true>
+            <<<(unsigned)out_dim, 32>>>(
+                (float *)out0->ptr, (float *)out1->ptr, w0, w1,
+                (const float *)x->ptr, in_dim, out_dim, out_dim);
+    } else {
+        matmul_f16_pair_ordered_chunks_kernel<false>
+            <<<(unsigned)out_dim, 32>>>(
+                (float *)out0->ptr, (float *)out1->ptr, w0, w1,
+                (const float *)x->ptr, in_dim, out_dim, out_dim);
+    }
     return cuda_ok(cudaGetLastError(), "matmul_f16_pair_ordered_chunks launch");
 }
 
@@ -26339,7 +26431,7 @@ extern "C" int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
     uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
     const float *base = (const float *)split->ptr;
-    hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((float *)out_hc->ptr,
+    hc_expand_kernel<<<(n_elem + 255) / 256, 256, 0, cuda_decode_stream()>>>((float *)out_hc->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)block_out->ptr,
@@ -26375,7 +26467,7 @@ extern "C" int ds4_gpu_hc_expand_add2_split_tensor(ds4_gpu_tensor *out_hc, const
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
     uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
     const float *base = (const float *)split->ptr;
-    hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((float *)out_hc->ptr,
+    hc_expand_kernel<<<(n_elem + 255) / 256, 256, 0, cuda_decode_stream()>>>((float *)out_hc->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)block_add->ptr,
                                                     (const float *)block_add2->ptr,
@@ -26401,7 +26493,7 @@ extern "C" int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
-    if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") == NULL) {
+    if (cuda_q8_hc_expand_fused_ok()) {
         return cuda_matmul_q8_0_hc_expand_tensor_labeled(out_hc, shared_out,
                                                         model_map, model_size,
                                                         weight_offset,
@@ -26437,7 +26529,7 @@ extern "C" int ds4_gpu_shared_down_hc_expand_add_q8_0_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
-    if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") == NULL) {
+    if (cuda_q8_hc_expand_fused_ok()) {
         return cuda_matmul_q8_0_hc_expand_tensor_labeled(out_hc, shared_out,
                                                         model_map, model_size,
                                                         weight_offset,
@@ -26476,7 +26568,7 @@ extern "C" int ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor(
         const ds4_gpu_tensor *split,
         uint32_t n_embd,
         uint32_t n_hc) {
-    if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") != NULL) return 0;
+    if (!cuda_q8_hc_expand_fused_ok()) return 0;
     return cuda_matmul_q8_0_hc_expand_tensor_labeled(
             out_hc,
             shared_out,
@@ -26512,7 +26604,7 @@ extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
-    if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") == NULL) {
+    if (cuda_q8_hc_expand_fused_ok()) {
         return cuda_matmul_q8_0_hc_expand_tensor_labeled(out_hc, block_out,
                                                         model_map, model_size,
                                                         weight_offset,
