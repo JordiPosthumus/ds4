@@ -1,6 +1,6 @@
 # Spark GB10 production integration
 
-## 2026-09-05 visual-attention memory hardening — rollout in progress
+## 2026-09-05 visual-attention memory hardening — deployed on both Sparks
 
 PR #984 (upstream head 40f7f022) is integrated here. Only the CUDA visual
 attention score/output workspace changes: above 256 MiB of scores it processes
@@ -22,12 +22,37 @@ are 3.85–6.13%; no whole-model decode speedup is claimed.
 
 Final CUDA source SHA256:
 a6055b7208f27706e5f2ca066bfda42917ff35e8797e08599a68e8ddf6026083.
-Tested Spark 2 server SHA256:
+Spark 2 server SHA256:
 24b20977f11b1c98ab33ffd22fa7cd46364ccb76c81db0d54ad6601af109d3a1.
 Spark 2 rollback backup: /home/jordi/ds4-backups/visual-memory-20260905.iN1TA4.
-This source is prepared for sequential deployment; live installation, genuine
-text/image cold-to-warm acceptance and DSG handback must still be recorded for
-each machine before declaring rollout complete. Never clear quarantine manually.
+Spark 1 server SHA256:
+d3d781a92a848e0f79cac7326eb635e25faf775c24c1ba1adbb094479012f73b.
+Spark 1 rollback backup: /home/jordi/ds4-backups/visual-memory-20260905.n45Me2.
+Both use the same tested CUDA object:
+f83877a1592b50f96718797667fa096cb4421a2470611465f1a20be91bb56c83.
+Per-host executables were linked against their existing native engine objects.
+
+Sequential rollout completed on 2026-09-05 UTC: Spark 2 resumed through DSG
+at 16:09, Spark 1 at 16:28 after its admitted work finished naturally. Spark 1
+also passed the focused visual/default/fractional/boundary/memory checks and
+existing CUDA long-context/Q8 bounds/28-shape exactness regressions before
+installation. Live executable hashes, arguments, model API capacities and
+environment were verified. Environment, launcher and unit files match backups.
+
+Fresh two-conversation acceptance started with zero cached tokens on each
+host, then reused the entire prior frontier: Spark 2 text=34/image=148;
+Spark 1 text=30/image=144. Every continuation needed only 10 new tokens.
+At 16:29 both workers were healthy, undrained and unquarantined, serving work.
+No manual quarantine clearing or gateway/recovery policy changes. Automatic
+recovery profile adoption was still pending admitted work; no new receipt is
+claimed. M3 production was not modified or drained for this patch.
+
+Residual issues are separate: pre-existing NVRM NV_ERR_NO_MEMORY warnings still
+appear during startup (no Linux OOM kill in the checked deployment windows).
+The existing full-budget disk-cache policy evicted a freshly saved 105662-token
+shutdown checkpoint on Spark 1 while saving the second resident slot. This is
+recorded for separate investigation, not fixed or introduced by the CUDA diff.
+No claim that all historical OOMs or all cache-loss cases are resolved.
 
 ## Previous validated production state
 
