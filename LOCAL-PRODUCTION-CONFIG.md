@@ -1,10 +1,10 @@
 # Spark GB10 production integration
 
 This branch is the Spark integration, not the Mac production branch. The
-2026-09-05 Q8 update was validated and deployed on Spark 2, then installed on
-Spark 1 during its separately authorized drained system-maintenance window.
-Both have the same CUDA source/object and were returned to DSG after reboot,
-effective-configuration verification and real text/image cache-reuse checks.
+2026-09-05 shared-scale padding follow-up is deployed on Spark 2 and staged on
+Spark 1 while its admitted work drains. Spark 2 passed installed regressions,
+effective-configuration and real text/image cache checks, then returned to DSG.
+Spark 1 still runs the preceding b6fdb1b6 integration until its drain completes.
 
 Preserved configuration: DeepSeek-V4-Flash-Vision-Exp
 IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8 and its existing vision encoder, 262144 total
@@ -17,21 +17,28 @@ No launcher, environment, model, cache format, or sampling changes are needed.
 The CUDA-only delta adds bounded Q8 raw reads and accelerates GB10 Q8
 attention-output prefill. Activation preparation retains the exact maximum
 tree/rounding. Exact INT8 MMA reuses existing aligned Q8 weights without an
-extra allocation or quantization. Decode dispatch and all existing Spark
-optimizations are preserved. Rollback switches are
-DS4_CUDA_NO_Q8_0_QUANT_WARPS=1 and DS4_CUDA_NO_Q8_MMA_ALIGNED=1; they are not
-set in normal production.
+extra weight allocation or quantization. Its shared scale rows now have one
+padding element each, adding 192 bytes of on-chip shared memory per thread
+block. This changes addressing, not math. Decode dispatch and all existing
+Spark optimizations are preserved. Independent rollback switches are
+DS4_CUDA_NO_Q8_0_QUANT_WARPS=1, DS4_CUDA_NO_Q8_MMA_ALIGNED=1 and
+DS4_CUDA_NO_Q8_MMA_SCALE_PADDING=1; none is set in normal production.
 
-Source SHA256: 2fe326cb4b38c22b831b11a8cdc97170b5616356d8b80e0423d3d16a1024962a.
-Native tested CUDA object: 4b0615ed1d0ef7f84905801d4f2abcac001f7118b1b2e0d667bb67e87fffd2cb.
-Balanced tests measured +7.52% prefill at 32K and +4.17% at 131K, with
-unchanged logits. Independent upstream binaries confirmed +7.28–7.48%
-warmed prefill and unchanged decode. The final integration matched the old
-production binary on all 8,403,200 vocabulary floats at 32768 -> 36864 plus
-64 teacher-forced tokens, retaining both resident slots and the full context
-allocation. Focused API tests and memory checking pass.
+Source SHA256: 4c2b799bce8616ededddba552f374d3e1d8c105c2e761a08291f256719659e7d.
+Native tested CUDA object: b06b7dea330a6d31c7eb95cdbe5dc639974d5f930de21534f4e9e0f75b846b9a.
+Padding adds +2.51% prefill at 32K and +1.45% at an unaligned 131K frontier
+relative to the already-optimized production path, with 30,768,640 exact float
+comparisons in balanced runs. A final host capability guard/comment cleanup
+followed those timings. Independent final upstream binaries measured the
+complete #979 package at +10.65–10.75% warmed prefill; decode differences were
+below 0.6%, not a demonstrated decode improvement. All frontier vectors matched.
+The final production object also reproduced the retained baseline's 8,403,200
+vocabulary floats at 32768 -> 36864 plus 64 teacher-forced steps, retaining the
+encoder, both resident slots and full context allocation. Final 28-shape/eight-
+combination API memcheck/synccheck and CUDA regression passed.
 
-Baseline rollback is 3a0f780e and its verified binary backup. Deployment must
+Immediate padding rollback is b6fdb1b6 and its verified per-host binary backup;
+the older full-Q8 rollback remains 3a0f780e. Deployment must
 wait until isolated model tests exit, verify unchanged launch settings and
 real text/image cold-to-warm reuse, then resume each maintained Spark through
 DSG and confirm drained=false, is_healthy=true, quarantine=null. Never force a resume
@@ -40,13 +47,14 @@ by clearing quarantine or altering gateway settings.
 The upstream PR branches contain only their individual generic CUDA changes
 and tests; this local integration/configuration history is not submitted there.
 
-Spark 1 is an unpacked deployment with source verified against 3a0f780e before
-applying the Q8 delta. Its locally relinked binary is
+Spark 1 is an unpacked deployment, not a Git checkout. Its preceding binary is
 8cee6391ef6c65c86312ad532135e85bd9e5af2a4b14b88cd8893f128bf0bd52;
-Spark 2's is 86137abdbbb4fbd4935818c31c5ef5bd37a5b3d08c1eb408e0d01cd7b4600de6.
-Both use the exact CUDA object above. Spark 1's full model-free CUDA regression
-passed before the system update. No launcher or model files were copied
-between hosts. Their separate path-specific settings remain unchanged.
+Spark 2's padding-enabled binary is
+67afa96e1370c15574e512a26ae1d2e11358dcff4515f49c5748f5ab3c986cfa.
+Its backup is /home/jordi/ds4-backups/q8-scale-deploy-20260905.oOmTdW.
+No launcher or model files are copied between hosts. Their separate path-
+specific settings remain unchanged; only source/test/object and a locally
+relinked executable are installed after a verified idle drain.
 
 System maintenance uses the existing supported Ubuntu/DGX package channels,
 preserving their NVIDIA driver pins. As inspected on 2026-09-05, both already

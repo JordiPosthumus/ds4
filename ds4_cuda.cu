@@ -6640,7 +6640,7 @@ __device__ __forceinline__ static uint32_t bitrev5(uint32_t i) {
     return ((i & 1u) << 4) | ((i & 2u) << 2) | (i & 4u) | ((i & 8u) >> 2) | ((i & 16u) >> 4);
 }
 
-template <uint32_t T, bool ALIGNED = false>
+template <uint32_t T, bool ALIGNED = false, bool PAD = false>
 __global__ static void matmul_q8_0_mma_exact_kernel(
         float *out,
         const unsigned char *w,
@@ -6654,8 +6654,9 @@ __global__ static void matmul_q8_0_mma_exact_kernel(
         uint64_t out_stride,      /* output token stride in floats (>= out_dim) */
         const __half *aligned_scales = NULL) {
     extern __shared__ unsigned char q8mma_sh[];
-    __half *sh_ws = (__half *)q8mma_sh;                    /* 64 rows x blocks */
-    float *sh_xs = (float *)(q8mma_sh + 64u * blocks * 2u); /* 16 toks x blocks */
+    const uint32_t pitch = (uint32_t)blocks + (PAD ? 1u : 0u);
+    __half *sh_ws = (__half *)q8mma_sh;                   /* 64 rows x pitch */
+    float *sh_xs = (float *)(q8mma_sh + 64u * pitch * 2u); /* 16 toks x pitch */
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
     const uint64_t row_base = (uint64_t)blockIdx.x * 64u;
@@ -6667,14 +6668,14 @@ __global__ static void matmul_q8_0_mma_exact_kernel(
         const uint32_t b = idx - rl * (uint32_t)blocks;
         uint64_t row = row_base + rl;
         if (row >= out_dim) row = out_dim - 1u;
-        sh_ws[idx] = ALIGNED ? aligned_scales[row * blocks + b]
+        sh_ws[PAD ? rl * pitch + b : idx] = ALIGNED ? aligned_scales[row * blocks + b]
             : *(const __half *)(w + row * blocks * 34u + (uint64_t)b * 34u);
     }
     for (uint32_t idx = threadIdx.x; idx < 16u * (uint32_t)blocks; idx += blockDim.x) {
         const uint32_t tl = idx / (uint32_t)blocks;
         const uint32_t b = idx - tl * (uint32_t)blocks;
         const uint64_t tok = tok_base + tl;
-        sh_xs[idx] = tok < n_tok ? xscale[tok * a_stride_blocks + b] : 0.0f;
+        sh_xs[PAD ? tl * pitch + b : idx] = tok < n_tok ? xscale[tok * a_stride_blocks + b] : 0.0f;
     }
     __syncthreads();
 
@@ -6737,10 +6738,10 @@ __global__ static void matmul_q8_0_mma_exact_kernel(
                 int32_t c0 = 0, c1 = 0, c2 = 0, c3 = 0;
                 mma_m16n8k32_s8(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
                 /* term = ws * xs * dot, same expression as reference */
-                const float ws0 = __half2float(sh_ws[rl_ws0 * (uint32_t)blocks + b]);
-                const float ws1 = __half2float(sh_ws[(rl_ws0 + 1u) * (uint32_t)blocks + b]);
-                const float xsA = sh_xs[tl_xsA * (uint32_t)blocks + b];
-                const float xsB = sh_xs[tl_xsB * (uint32_t)blocks + b];
+                const float ws0 = __half2float(sh_ws[rl_ws0 * pitch + b]);
+                const float ws1 = __half2float(sh_ws[(rl_ws0 + 1u) * pitch + b]);
+                const float xsA = sh_xs[tl_xsA * pitch + b];
+                const float xsB = sh_xs[tl_xsB * pitch + b];
                 t0 += ws0 * xsA * (float)c0;
                 t1 += ws1 * xsA * (float)c1;
                 t2 += ws0 * xsB * (float)c2;
@@ -6821,7 +6822,7 @@ static int cuda_q4_mma_ok(void) {
     }
     return cached;
 }
-static int cuda_q8_mma_attr_ready[DS4_MAX_GPUS][5];
+static int cuda_q8_mma_attr_ready[DS4_MAX_GPUS][6];
 static int cuda_q8_mma_try_launch(
         float *out,
         const unsigned char *w,
@@ -6848,6 +6849,25 @@ static int cuda_q8_mma_try_launch(
     const int ti = T == 32u ? 0 : (T == 64u ? 1 : (T == 128u ? 2 : 3));
     dim3 grid(((unsigned)out_dim + 63u) / 64u, ((unsigned)n_tok + 15u) / 16u, 1);
     if (T == 32u && aligned_w && aligned_scales) {
+        /* One spare scale per row separates same-column shared-bank reads.
+         * Codes, scales and the accumulation order are unchanged. */
+        if ((blocks & 31u) == 0u &&
+            getenv("DS4_CUDA_NO_Q8_MMA_SCALE_PADDING") == NULL) {
+            if (!cuda_q8_mma_attr_ready[dev][5]) {
+                cudaFuncAttributes fn_attr;
+                if (cudaFuncGetAttributes(&fn_attr,
+                        matmul_q8_0_mma_exact_kernel<32u, true, true>) != cudaSuccess ||
+                    fn_attr.binaryVersion < 80 || fn_attr.ptxVersion < 80 ||
+                    cudaFuncSetAttribute(matmul_q8_0_mma_exact_kernel<32u, true, true>,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize, 49344) != cudaSuccess)
+                    return 0;
+                cuda_q8_mma_attr_ready[dev][5] = 1;
+            }
+            matmul_q8_0_mma_exact_kernel<32u, true, true><<<grid, 256, shmem + 192>>>(
+                out, aligned_w, xq, xscale, in_dim, out_dim, n_tok, blocks,
+                a_stride_blocks, out_stride, aligned_scales);
+            return cuda_ok(cudaGetLastError(), "padded exact Q8 MMA launch") ? 1 : -1;
+        }
         if (!cuda_q8_mma_attr_ready[dev][4]) {
             cudaFuncAttributes fn_attr;
             if (cudaFuncGetAttributes(&fn_attr,

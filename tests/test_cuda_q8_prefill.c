@@ -96,13 +96,15 @@ static int check_shape(uint64_t width, uint64_t rank, uint32_t groups,
     out = ds4_gpu_tensor_alloc((ny + 4) * sizeof(float));
     CHECK(heads && low && out);
     CHECK(ds4_gpu_tensor_write(heads, 0, x, nx * sizeof(float)));
-    for (unsigned variant = 0; variant < 4; variant++) {
+    for (unsigned variant = 0; variant < 8; variant++) {
         fprintf(stderr, "Q8 fixture width=%llu rank=%llu groups=%u tokens=%u artifact=%d variant=%u\n",
                 (unsigned long long)width, (unsigned long long)rank, groups, tokens, artifact, variant);
         if (variant & 1) unsetenv("DS4_CUDA_NO_Q8_0_QUANT_WARPS");
         else setenv("DS4_CUDA_NO_Q8_0_QUANT_WARPS", "1", 1);
         if (variant & 2) unsetenv("DS4_CUDA_NO_Q8_MMA_ALIGNED");
         else setenv("DS4_CUDA_NO_Q8_MMA_ALIGNED", "1", 1);
+        if (variant & 4) unsetenv("DS4_CUDA_NO_Q8_MMA_SCALE_PADDING");
+        else setenv("DS4_CUDA_NO_Q8_MMA_SCALE_PADDING", "1", 1);
         for (size_t i = 0; i < nl + ny + 8; i++) got[i] = 123456.0f;
         CHECK(ds4_gpu_tensor_write(low, 0, got, (nl + 4) * sizeof(float)));
         CHECK(ds4_gpu_tensor_write(out, 0, got + nl + 4, (ny + 4) * sizeof(float)));
@@ -153,7 +155,9 @@ int main(void) {
     }
     /* A partial eight-warp CTA and ragged rows in the exact MMA tile. */
     if (check_shape(257, 65, 3, 17, 0) ||
-        check_shape(4096, 65, 128, 17, 1)) return 1;
-    fprintf(stderr, "PASS: Q8 prefill paths are byte-identical across 26 shapes\n");
+        check_shape(4096, 65, 128, 17, 1) ||
+        check_shape(8192, 128, 4, 8, 1) ||
+        check_shape(4064, 128, 4, 8, 0)) return 1;
+    fprintf(stderr, "PASS: Q8 prefill paths are byte-identical across 28 shapes\n");
     return 0;
 }
