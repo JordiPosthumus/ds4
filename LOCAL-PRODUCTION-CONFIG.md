@@ -1,5 +1,36 @@
 # Spark GB10 production integration
 
+## 2026-09-05 visual-attention memory hardening — rollout in progress
+
+PR #984 (upstream head 40f7f022) is integrated here. Only the CUDA visual
+attention score/output workspace changes: above 256 MiB of scores it processes
+up to eight independent heads at a time, preserving full attention keys/masks
+and precision. Unsplit calls keep their original batch size and unpack kernel.
+No model, sampling, context/output, residency/concurrency, launcher, cache,
+warm-weight or reserve settings change. All settings listed below remain.
+
+The original 140127-token image request asked for an 18.13 GiB allocation;
+the protected candidate replay completed with a 2.33 GiB largest allocation.
+This fixes that reproduced workspace failure, not every possible OOM. Final
+GB10 tests cover full-output byte comparisons, two input families, ragged groups,
+wrapped/image/mask boundaries, 262144 frontier, independent scalar references,
+CUDA memcheck/synccheck (zero errors), existing CUDA/server tests, and four
+restores of a real image-conditioned 36K prompt. All 4,266,240 final model logits
+match baseline through 32 teacher-forced decode steps. CPU/default Mac builds
+passed without loading a model there. Affected large attention-call speedups
+are 3.85–6.13%; no whole-model decode speedup is claimed.
+
+Final CUDA source SHA256:
+a6055b7208f27706e5f2ca066bfda42917ff35e8797e08599a68e8ddf6026083.
+Tested Spark 2 server SHA256:
+24b20977f11b1c98ab33ffd22fa7cd46364ccb76c81db0d54ad6601af109d3a1.
+Spark 2 rollback backup: /home/jordi/ds4-backups/visual-memory-20260905.iN1TA4.
+This source is prepared for sequential deployment; live installation, genuine
+text/image cold-to-warm acceptance and DSG handback must still be recorded for
+each machine before declaring rollout complete. Never clear quarantine manually.
+
+## Previous validated production state
+
 This branch is the Spark integration, not the Mac production branch. The
 2026-09-05 shared-scale padding follow-up is deployed on both Sparks. Each
 passed installed regressions, effective-configuration and real text/image
