@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 16432)
-Total output lines: 1008
-
 # Local DS4 production configuration
 
 This file records the authoritative local DS4 setup for Jordi's Mac Studio. It
@@ -402,7 +399,92 @@ test was present but could not run while the production model remained loaded.
 The first live cancellation then exposed a Metal-only allocator error: Metal
 tensors report no CUDA/ROCm tier (`-1`), but the checkpoint code fed that value
 to the tiered allocator, so capture always failed and multimodal fallback
-invalidat…1432 tokens truncated…3702a233fea5a57792d551906392d1670b`;
+invalidated a 289,203-token live frontier. `7d61f2b` uses the ordinary
+single-device allocator when no logical tier exists. After the owner-authorized
+stop, the real Vision-Exp regression passed: 300 generated steps wrapped the
+raw KV ring, restore returned to the exact prompt frontier, and all 300
+regenerated full-logit vectors matched byte for byte. A live abort/retry after
+the next start remains the production acceptance check.
+
+22. `ds4_server.c` (`c6a8d6f`) — disk-cache lookup now retries a raw rendered-
+    prompt miss with the decoded text of the already-tokenized prompt. Continued
+    checkpoints are written with that token-text representation; tokenizer
+    canonicalization can therefore make the original request bytes differ even
+    when the entire saved token prefix is identical. The raw lookup remains the
+    fast first path, and the existing loader still validates the checkpoint.
+    This does not change cache files, cache admission, image-conditioned disk
+    policy, or live rewind reuse.
+
+23. `ds-stop.sh`, `ds-ds4-startup.sh`, and `ds-startup.sh` — a launchd-managed
+    server now receives exactly one graceful stop request, both through the
+    named stop aliases and when a start command replaces its own prior instance.
+    `launchctl remove` already sends `SIGTERM`; the old scripts immediately sent
+    a second `SIGTERM`, and DS4 intentionally treats a second stop signal as an
+    emergency exit. That could terminate the process after `shutdown requested`
+    but before resident slots were written with `reason=shutdown`. Unmanaged
+    lock-file fallback processes still receive one explicit `SIGTERM`, and a
+    failed launchd removal retains the same fallback. This is a local launcher
+    correction, not an upstream server patch.
+
+24. `ds4.c`, `ds4.h`, `ds4_kvstore.[ch]`, and `ds4_server.c` (`552f6b8`) —
+    completed image-conditioned checkpoints may now survive resident-slot
+    eviction and graceful process restart. The disk key prepends an exact image
+    count plus every token span and 32-byte encoder fingerprint to canonical
+    rendered token text. The loader reattaches image metadata only after that
+    key matches and only when every image ends within the restored frontier.
+    Text-only requests and changed, moved, missing, or additional images cannot
+    select the checkpoint. Existing text-only cache files and payload ABI remain
+    unchanged. Appended-image disk recovery is intentionally excluded; live
+    appended-image reuse remains the separate #927 behavior.
+
+Isolated live validation for items 21–23 on 2026-09-02 used the production
+Vision-Exp model on port 8001 with model-specific scratch KV directories. Text
+and image-stream cancellations restored their exact prompt frontiers; a
+token-equivalent raw-text alias restored 34,816 tokens across a real restart;
+an interrupted 31,614-token suffix retained at least the validated disk
+frontier and subsequently wrote continued checkpoints at 49,152 and 65,536;
+ten completed no-thinking conversations retained independent live slots with
+the first resuming at token 830; Pi-style tool history resumed at token 1,198;
+two unrelated conversations with a 1,450-plus-token shared prefix occupied
+separate slots and the first resumed at token 1,459 with rewind reuse disabled;
+an inline image returned by an OpenAI `tool` message replayed from exact live
+image-conditioned KV;
+an appended second image reused the exact first-image frontier while changing
+the original image intentionally rebuilt; and a text disk restore into an
+image-used slot cleared stale image identity and reused token 34,816 on retry.
+For the stop-script test, cold and continued writes were disabled in an empty
+scratch cache: the directory remained empty after an 816-token request, the
+single graceful stop wrote exactly one `reason=shutdown` checkpoint, and an
+actual restart restored all 816 tokens. The same empty-cache experiment also
+passed when the second `start-ds-ds4` invocation replaced its own launchd
+instance: self-replacement created the sole 816-token checkpoint and the new
+server restored it. The reusable harness is
+`local-performance/ds4_cache_acceptance.py`; it never starts, stops, or
+reconfigures a server itself.
+
+Re-verified after items 21–22 and the Metal allocator correction (`7d61f2b`,
+2026-09-02): optimized Metal server/test/agent builds, server and agent tests,
+CPU portability build, ASan+UBSan server tests, launcher syntax, and
+`git diff --check` passed. The focused real-model cancellation checkpoint test
+passed on Apple M3 Ultra with the Vision-Exp MXFP4 model. The next-start binary
+SHA-256 is
+`0b19999ed74d64cde759a1f0621fe4d87c742e5764e6d83dd60a175beb93f049`;
+the immediate binary rollback is `ds4-server.bak-20260902T033458Z` with
+SHA-256 `6d91f5bbae4ced66c9273805ca489d83df0c0f0862abc73d6c44b4cb1f58eef4`.
+The service was owner-authorized to stop during the failed cold prefill and was
+left stopped for the focused model test and handoff.
+
+Re-verified after item 24 (`552f6b8`, 2026-09-02): clean optimized Metal
+server/test/agent builds, focused server and agent suites, the CPU portability
+build, ASan+UBSan server tests, and `git diff --check` passed. Two independent
+real-model runs used Vision-Exp MXFP4 on Apple M3 Ultra, one from the clean
+upstream PR worktree and one from the combined production candidate. With cold
+and continued writes disabled, graceful shutdown wrote a 1,044-token
+`key=vision-token-text` checkpoint; restart restored it in 10.7–11.0 ms and
+resumed at token 1,044. Replacing the red image with blue rebuilt at token 0,
+and replaying the same words without an image also rebuilt at token 0. The
+next-start binary SHA-256 is
+`64ab494635d9d62c834c6f2156d4333702a233fea5a57792d551906392d1670b`;
 the immediate binary rollback is `ds4-server.bak-20260902T050000Z` with
 SHA-256 `0b19999ed74d64cde759a1f0621fe4d87c742e5764e6d83dd60a175beb93f049`.
 The live production PID 97796 started at 00:44:02 before this binary was built;
