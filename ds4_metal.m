@@ -2775,6 +2775,12 @@ int ds4_gpu_device_is_pre_m5_apple_silicon(void) {
             g_metal_device_name[8] == ' ');
 }
 
+int ds4_gpu_device_is_m3_apple_silicon(void) {
+    return strncmp(g_metal_device_name, "Apple M3", 8) == 0 &&
+           (g_metal_device_name[8] == '\0' ||
+            g_metal_device_name[8] == ' ');
+}
+
 int ds4_gpu_device_is_m5_apple_silicon(void) {
     return strncmp(g_metal_device_name, "Apple M5", 8) == 0 &&
            (g_metal_device_name[8] == '\0' ||
