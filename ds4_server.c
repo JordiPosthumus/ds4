@@ -9373,6 +9373,7 @@ static void id_list_push_unique(stop_list *ids, const char *id);
 
 struct server {
     ds4_engine *engine;
+    ds4_backend backend;
     ds4_tp *tp_leader;
     server_slot *slots;
     int slot_count;
@@ -10958,6 +10959,12 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     pthread_mutex_lock(&s->inference_mu);
+    /* Disk payloads intentionally carry no image identity. If this slot held
+     * vision state, discard it before restoring a text-only checkpoint so the
+     * next sync does not reject the fresh payload as a stale image match. */
+    if (ds4_session_has_vision_state(slot->session)) {
+        ds4_session_invalidate(slot->session);
+    }
     pthread_mutex_lock(&s->kv_mu);
     int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, slot->session,
                                            prompt_text, effective_prompt, &lr,
@@ -12145,6 +12152,13 @@ static int server_prefill_quantum(server *s) {
     return server_prefill_quantum_for(s, generation_active);
 }
 
+/* Retain each backend's validated slice boundaries. CUDA/ROCm keep the
+ * existing relative quantum: realigning CUDA slices changed full logits in
+ * the controlled GB10 evaluation. Metal's realignment is independently tested. */
+static int server_prefill_alignment_for(ds4_backend backend, int cap) {
+    return backend == DS4_BACKEND_METAL ? cap : 0;
+}
+
 /* A vision block may extend a scheduling slice past the backend's absolute
  * prefill boundary. On the following slice, stop at the next boundary instead
  * of carrying that offset forever. This avoids turning every later 4096-token
@@ -12216,8 +12230,8 @@ static int server_session_sync(server *s, server_slot *slot,
             initialized = true;
         }
         int quantum = server_prefill_quantum(s);
-        int alignment = s->engine ?
-            (int)ds4_engine_prefill_quantum(s->engine) : 0;
+        int alignment = server_prefill_alignment_for(s->backend, s->engine ?
+            (int)ds4_engine_prefill_quantum(s->engine) : 0);
         int target = server_prefill_slice_target(
             done, prompt->len, quantum, alignment);
 
@@ -12288,8 +12302,8 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
             initialized = true;
         }
         int quantum = server_prefill_quantum(s);
-        int alignment = s->engine ?
-            (int)ds4_engine_prefill_quantum(s->engine) : 0;
+        int alignment = server_prefill_alignment_for(s->backend, s->engine ?
+            (int)ds4_engine_prefill_quantum(s->engine) : 0);
         int target = server_multimodal_prefill_slice_target(
             done, prompt->len, quantum, alignment, images, image_count);
         size_t prefix_images = 0;
@@ -15734,6 +15748,7 @@ int main(int argc, char **argv) {
 
     server s = {0};
     s.engine = engine;
+    s.backend = cfg.engine.backend;
     s.tp_leader = tp_leader;
     s.ctx_size = cfg.ctx_size;
     s.slot_count = slot_count;
@@ -15990,6 +16005,9 @@ static void test_mixed_prefill_quantum_option(void) {
 }
 
 static void test_prefill_slice_realigns_after_vision_block(void) {
+    TEST_ASSERT(server_prefill_alignment_for(DS4_BACKEND_METAL, 4096) == 4096);
+    TEST_ASSERT(server_prefill_alignment_for(DS4_BACKEND_CUDA, 4096) == 0);
+    TEST_ASSERT(server_prefill_alignment_for(DS4_BACKEND_CPU, 4096) == 0);
     /* The production incident ended an image block 145 tokens beyond the
      * 40960 boundary. The next idle slice must stop at 45056, not 45201. */
     TEST_ASSERT(server_prefill_slice_target(41105, 220831, 4096, 4096) ==
@@ -16006,6 +16024,15 @@ static void test_prefill_slice_realigns_after_vision_block(void) {
                     41105, 220831, 4096, 4096, &image, 1) == 45056);
     TEST_ASSERT(server_multimodal_prefill_slice_target(
                     45056, 220831, 4096, 4096, &image, 1) == 49152);
+
+    /* The common source must not silently opt CUDA into Metal's realignment. */
+    const int cuda_alignment = server_prefill_alignment_for(DS4_BACKEND_CUDA, 4096);
+    TEST_ASSERT(server_prefill_slice_target(
+                    41105, 220831, 4096, cuda_alignment) == 45201);
+    TEST_ASSERT(server_multimodal_prefill_slice_target(
+                    36864, 220831, 4096, cuda_alignment, &image, 1) == 41105);
+    TEST_ASSERT(server_multimodal_prefill_slice_target(
+                    41105, 220831, 4096, cuda_alignment, &image, 1) == 45201);
 
     /* Do not inflate the small quantum used to interleave prefill and decode. */
     TEST_ASSERT(server_prefill_slice_target(41105, 220831, 64, 4096) ==
