@@ -1,10 +1,10 @@
 # Spark GB10 production integration
 
 This branch is the Spark integration, not the Mac production branch. The
-2026-09-05 shared-scale padding follow-up is deployed on Spark 2 and staged on
-Spark 1 while its admitted work drains. Spark 2 passed installed regressions,
-effective-configuration and real text/image cache checks, then returned to DSG.
-Spark 1 still runs the preceding b6fdb1b6 integration until its drain completes.
+2026-09-05 shared-scale padding follow-up is deployed on both Sparks. Each
+passed installed regressions, effective-configuration and real text/image
+cache checks, then returned to DSG healthy, undrained and unquarantined.
+Spark 2 returned first; Spark 1's admitted work finished before its update.
 
 Preserved configuration: DeepSeek-V4-Flash-Vision-Exp
 IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8 and its existing vision encoder, 262144 total
@@ -47,11 +47,13 @@ by clearing quarantine or altering gateway settings.
 The upstream PR branches contain only their individual generic CUDA changes
 and tests; this local integration/configuration history is not submitted there.
 
-Spark 1 is an unpacked deployment, not a Git checkout. Its preceding binary is
-8cee6391ef6c65c86312ad532135e85bd9e5af2a4b14b88cd8893f128bf0bd52;
+Spark 1 is an unpacked deployment, not a Git checkout. Its current binary is
+484e8699f77a1fd7891dc77b449a0fe82d0f12daebaf2f9cccb29f830530e765;
 Spark 2's padding-enabled binary is
 67afa96e1370c15574e512a26ae1d2e11358dcff4515f49c5748f5ab3c986cfa.
-Its backup is /home/jordi/ds4-backups/q8-scale-deploy-20260905.oOmTdW.
+Padding rollback backups are
+/home/jordi/ds4-backups/q8-scale-deploy-20260905.3UhHTl on Spark 1 and
+/home/jordi/ds4-backups/q8-scale-deploy-20260905.oOmTdW on Spark 2.
 No launcher or model files are copied between hosts. Their separate path-
 specific settings remain unchanged; only source/test/object and a locally
 relinked executable are installed after a verified idle drain.
@@ -72,3 +74,13 @@ Startup still logged driver NV_ERR_NO_MEMORY warnings during artifact
 preparation on both hosts; initialization continued and the acceptance tests
 passed. Their exact cause and the earlier reboot remain unresolved. These
 short acceptance checks are not a long-context soak or a new speed benchmark.
+
+Padding follow-up handback: Spark 2 at approximately 02:25 UTC, Spark 1 at
+02:39 UTC. Both reused all 19 text and 136 image-conditioned prior tokens in
+the post-restart check. Spark 2 also restored a 189373-token disk checkpoint,
+leaving only 65 tokens to prefill in its next large conversation. Each live
+executable matched its recorded installed hash. The same pre-existing driver
+memory warnings appeared during both startups; neither this padding update
+nor the earlier package update is a demonstrated fix for the old OOM/reboot.
+The upstream optimization remains one clean commit in #979, head 67d0c9f;
+the raw-loader bounds fix remains separate in #978.
