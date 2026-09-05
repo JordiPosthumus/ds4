@@ -1,5 +1,45 @@
 # Spark GB10 production integration
 
+## 2026-09-05 unused disk-checkpoint aging — PR #986
+
+Upstream head 7eca111 replaces the eviction score's permanent unused-checkpoint
+prior with the existing six-hour freshness factor. This prevents days-old
+unused, denser dumps from retaining that score indefinitely and displacing
+new shutdown checkpoints. Existing hit evidence, role/prefix weights, hard
+budget, cache file format and lookup identity stay unchanged. This is not a
+retention pin, per-conversation quota or duplicate-tip cleanup policy: recent
+checkpoints can still be evicted under pressure. No inference math changes.
+
+Default/CPU builds, focused server regressions and changed-unit ASan/UBSan
+passed. Native GB10 baseline/candidate restart A/B used real new KV payloads
+and identical prompts, with unrelated synthetic old metadata supplying cache
+pressure. After restart the old binary reused 0 of the first conversation's
+2071 prior tokens; the candidate reused all 2071. Both reused all 6167 tokens
+of the second conversation. Both candidate continuations prefilled ten tokens.
+The tiny test cache still evicted a fresh snapshot during a later cleanup
+shutdown against recently hit snapshots; that separate policy boundary is
+disclosed in the PR. No full aggregate model-quality or throughput claim.
+
+Production settings below are unchanged, byte-verified against backups. In
+particular, the test-only 256 MiB cache and disabled cold/continued saves are
+NOT production defaults: production retains 349525 MiB, cold=262144 and
+continued=16384. Rewind remains disabled. Model, vision, 262144 context/output,
+2 residents/1 active, 2048/64 quanta, warm weights and 4096 MiB reserve remain.
+Only kvstore/server source, their native objects, executable and this record
+change. The server-source delta is regression tests, not scheduling behavior.
+
+Spark 2 candidate executable SHA256:
+390709a038687ce1977842d8515f44bd070b58ec2dadd3e6fc4ed677c852a614.
+Spark 2 rollback: /home/jordi/ds4-backups/kv-aging-20260905.ZjhaoT.
+Spark 1 staged executable SHA256:
+6465283cce4d24c59a3c6fa235fd4d0ae2eaf195facdb28db147633cb6c72dbb.
+Spark 1 rollback: /home/jordi/ds4-backups/kv-aging-20260905.kE2NiL.
+Shared kvstore source SHA256:
+404a369448ca97728ae4422a9d2f7360c27171771ce528df799dfd80e97aa222.
+Sequential production acceptance/DSG handback is still in progress; do not
+read a staged hash as evidence that both hosts are already upgraded.
+The Mac production branch/service has not been changed for this patch.
+
 ## 2026-09-05 visual-attention memory hardening — deployed on both Sparks
 
 PR #984 (upstream head 40f7f022) is integrated here. Only the CUDA visual
