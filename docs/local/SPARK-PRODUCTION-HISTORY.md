@@ -1,0 +1,182 @@
+# Spark GB10 production integration
+
+## 2026-09-05 unused disk-checkpoint aging — PR #986
+
+Upstream head 7eca111 replaces the eviction score's permanent unused-checkpoint
+prior with the existing six-hour freshness factor. This prevents days-old
+unused, denser dumps from retaining that score indefinitely and displacing
+new shutdown checkpoints. Existing hit evidence, role/prefix weights, hard
+budget, cache file format and lookup identity stay unchanged. This is not a
+retention pin, per-conversation quota or duplicate-tip cleanup policy: recent
+checkpoints can still be evicted under pressure. No inference math changes.
+
+Default/CPU builds, focused server regressions and changed-unit ASan/UBSan
+passed. Native GB10 baseline/candidate restart A/B used real new KV payloads
+and identical prompts, with unrelated synthetic old metadata supplying cache
+pressure. After restart the old binary reused 0 of the first conversation's
+2071 prior tokens; the candidate reused all 2071. Both reused all 6167 tokens
+of the second conversation. Both candidate continuations prefilled ten tokens.
+The tiny test cache still evicted a fresh snapshot during a later cleanup
+shutdown against recently hit snapshots; that separate policy boundary is
+disclosed in the PR. No full aggregate model-quality or throughput claim.
+
+Production settings below are unchanged, byte-verified against backups. In
+particular, the test-only 256 MiB cache and disabled cold/continued saves are
+NOT production defaults: production retains 349525 MiB, cold=262144 and
+continued=16384. Rewind remains disabled. Model, vision, 262144 context/output,
+2 residents/1 active, 2048/64 quanta, warm weights and 4096 MiB reserve remain.
+Only kvstore/server source, their native objects, executable and this record
+change. The server-source delta is regression tests, not scheduling behavior.
+
+Spark 2 candidate executable SHA256:
+390709a038687ce1977842d8515f44bd070b58ec2dadd3e6fc4ed677c852a614.
+Spark 2 rollback: /home/jordi/ds4-backups/kv-aging-20260905.ZjhaoT.
+Spark 1 staged executable SHA256:
+6465283cce4d24c59a3c6fa235fd4d0ae2eaf195facdb28db147633cb6c72dbb.
+Spark 1 rollback: /home/jordi/ds4-backups/kv-aging-20260905.kE2NiL.
+Shared kvstore source SHA256:
+404a369448ca97728ae4422a9d2f7360c27171771ce528df799dfd80e97aa222.
+Sequential production acceptance/DSG handback is still in progress; do not
+read a staged hash as evidence that both hosts are already upgraded.
+The Mac production branch/service has not been changed for this patch.
+
+## 2026-09-05 visual-attention memory hardening — deployed on both Sparks
+
+PR #984 (upstream head 40f7f022) is integrated here. Only the CUDA visual
+attention score/output workspace changes: above 256 MiB of scores it processes
+up to eight independent heads at a time, preserving full attention keys/masks
+and precision. Unsplit calls keep their original batch size and unpack kernel.
+No model, sampling, context/output, residency/concurrency, launcher, cache,
+warm-weight or reserve settings change. All settings listed below remain.
+
+The original 140127-token image request asked for an 18.13 GiB allocation;
+the protected candidate replay completed with a 2.33 GiB largest allocation.
+This fixes that reproduced workspace failure, not every possible OOM. Final
+GB10 tests cover full-output byte comparisons, two input families, ragged groups,
+wrapped/image/mask boundaries, 262144 frontier, independent scalar references,
+CUDA memcheck/synccheck (zero errors), existing CUDA/server tests, and four
+restores of a real image-conditioned 36K prompt. All 4,266,240 final model logits
+match baseline through 32 teacher-forced decode steps. CPU/default Mac builds
+passed without loading a model there. Affected large attention-call speedups
+are 3.85–6.13%; no whole-model decode speedup is claimed.
+
+Final CUDA source SHA256:
+a6055b7208f27706e5f2ca066bfda42917ff35e8797e08599a68e8ddf6026083.
+Spark 2 server SHA256:
+24b20977f11b1c98ab33ffd22fa7cd46364ccb76c81db0d54ad6601af109d3a1.
+Spark 2 rollback backup: /home/jordi/ds4-backups/visual-memory-20260905.iN1TA4.
+Spark 1 server SHA256:
+d3d781a92a848e0f79cac7326eb635e25faf775c24c1ba1adbb094479012f73b.
+Spark 1 rollback backup: /home/jordi/ds4-backups/visual-memory-20260905.n45Me2.
+Both use the same tested CUDA object:
+f83877a1592b50f96718797667fa096cb4421a2470611465f1a20be91bb56c83.
+Per-host executables were linked against their existing native engine objects.
+
+Sequential rollout completed on 2026-09-05 UTC: Spark 2 resumed through DSG
+at 16:09, Spark 1 at 16:28 after its admitted work finished naturally. Spark 1
+also passed the focused visual/default/fractional/boundary/memory checks and
+existing CUDA long-context/Q8 bounds/28-shape exactness regressions before
+installation. Live executable hashes, arguments, model API capacities and
+environment were verified. Environment, launcher and unit files match backups.
+
+Fresh two-conversation acceptance started with zero cached tokens on each
+host, then reused the entire prior frontier: Spark 2 text=34/image=148;
+Spark 1 text=30/image=144. Every continuation needed only 10 new tokens.
+At 16:29 both workers were healthy, undrained and unquarantined, serving work.
+No manual quarantine clearing or gateway/recovery policy changes. Automatic
+recovery profile adoption was still pending admitted work; no new receipt is
+claimed. M3 production was not modified or drained for this patch.
+
+Residual issues are separate: pre-existing NVRM NV_ERR_NO_MEMORY warnings still
+appear during startup (no Linux OOM kill in the checked deployment windows).
+The existing full-budget disk-cache policy evicted a freshly saved 105662-token
+shutdown checkpoint on Spark 1 while saving the second resident slot. This is
+recorded for separate investigation, not fixed or introduced by the CUDA diff.
+No claim that all historical OOMs or all cache-loss cases are resolved.
+
+## Previous validated production state
+
+This branch is the Spark integration, not the Mac production branch. The
+2026-09-05 shared-scale padding follow-up is deployed on both Sparks. Each
+passed installed regressions, effective-configuration and real text/image
+cache checks, then returned to DSG healthy, undrained and unquarantined.
+Spark 2 returned first; Spark 1's admitted work finished before its update.
+
+Preserved configuration: DeepSeek-V4-Flash-Vision-Exp
+IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8 and its existing vision encoder, 262144 total
+context/output ceiling, two resident sessions, one active request, 2048-token
+prefill chunks, 64-token mixed quantum, 349525 MiB model-specific disk cache,
+262144 cold-anchor ceiling, continued checkpoints every 16384 tokens, warm
+weights enabled, 4096 MiB optional Q8-to-FP16 cache reserve, rewind disabled.
+No launcher, environment, model, cache format, or sampling changes are needed.
+
+The CUDA-only delta adds bounded Q8 raw reads and accelerates GB10 Q8
+attention-output prefill. Activation preparation retains the exact maximum
+tree/rounding. Exact INT8 MMA reuses existing aligned Q8 weights without an
+extra weight allocation or quantization. Its shared scale rows now have one
+padding element each, adding 192 bytes of on-chip shared memory per thread
+block. This changes addressing, not math. Decode dispatch and all existing
+Spark optimizations are preserved. Independent rollback switches are
+DS4_CUDA_NO_Q8_0_QUANT_WARPS=1, DS4_CUDA_NO_Q8_MMA_ALIGNED=1 and
+DS4_CUDA_NO_Q8_MMA_SCALE_PADDING=1; none is set in normal production.
+
+Source SHA256: 4c2b799bce8616ededddba552f374d3e1d8c105c2e761a08291f256719659e7d.
+Native tested CUDA object: b06b7dea330a6d31c7eb95cdbe5dc639974d5f930de21534f4e9e0f75b846b9a.
+Padding adds +2.51% prefill at 32K and +1.45% at an unaligned 131K frontier
+relative to the already-optimized production path, with 30,768,640 exact float
+comparisons in balanced runs. A final host capability guard/comment cleanup
+followed those timings. Independent final upstream binaries measured the
+complete #979 package at +10.65–10.75% warmed prefill; decode differences were
+below 0.6%, not a demonstrated decode improvement. All frontier vectors matched.
+The final production object also reproduced the retained baseline's 8,403,200
+vocabulary floats at 32768 -> 36864 plus 64 teacher-forced steps, retaining the
+encoder, both resident slots and full context allocation. Final 28-shape/eight-
+combination API memcheck/synccheck and CUDA regression passed.
+
+Immediate padding rollback is b6fdb1b6 and its verified per-host binary backup;
+the older full-Q8 rollback remains 3a0f780e. Deployment must
+wait until isolated model tests exit, verify unchanged launch settings and
+real text/image cold-to-warm reuse, then resume each maintained Spark through
+DSG and confirm drained=false, is_healthy=true, quarantine=null. Never force a resume
+by clearing quarantine or altering gateway settings.
+
+The upstream PR branches contain only their individual generic CUDA changes
+and tests; this local integration/configuration history is not submitted there.
+
+Spark 1 is an unpacked deployment, not a Git checkout. Its current binary is
+484e8699f77a1fd7891dc77b449a0fe82d0f12daebaf2f9cccb29f830530e765;
+Spark 2's padding-enabled binary is
+67afa96e1370c15574e512a26ae1d2e11358dcff4515f49c5748f5ab3c986cfa.
+Padding rollback backups are
+/home/jordi/ds4-backups/q8-scale-deploy-20260905.3UhHTl on Spark 1 and
+/home/jordi/ds4-backups/q8-scale-deploy-20260905.oOmTdW on Spark 2.
+No launcher or model files are copied between hosts. Their separate path-
+specific settings remain unchanged; only source/test/object and a locally
+relinked executable are installed after a verified idle drain.
+
+System maintenance uses the existing supported Ubuntu/DGX package channels,
+preserving their NVIDIA driver pins. As inspected on 2026-09-05, both already
+run driver 580.173.02 and DGX OS 7.5.0; no newer supported driver or fwupd
+device firmware was offered. Ordinary firmware-package/desktop updates must
+not be presented as a confirmed fix for Spark 2's earlier memory-related
+instability. Timestamped system and build backups are retained on each host.
+
+Post-maintenance acceptance on both hosts reused all 19 text and 136
+image-conditioned prior tokens in separate resident conversations. Spark 2's
+first resumed production request also loaded its saved 144666-token vision
+checkpoint from disk, leaving only 536 tokens to prefill. Both workers were
+verified healthy, undrained and unquarantined at handback on 2026-09-05 UTC.
+Startup still logged driver NV_ERR_NO_MEMORY warnings during artifact
+preparation on both hosts; initialization continued and the acceptance tests
+passed. Their exact cause and the earlier reboot remain unresolved. These
+short acceptance checks are not a long-context soak or a new speed benchmark.
+
+Padding follow-up handback: Spark 2 at approximately 02:25 UTC, Spark 1 at
+02:39 UTC. Both reused all 19 text and 136 image-conditioned prior tokens in
+the post-restart check. Spark 2 also restored a 189373-token disk checkpoint,
+leaving only 65 tokens to prefill in its next large conversation. Each live
+executable matched its recorded installed hash. The same pre-existing driver
+memory warnings appeared during both startups; neither this padding update
+nor the earlier package update is a demonstrated fix for the old OOM/reboot.
+The upstream optimization remains one clean commit in #979, head 67d0c9f;
+the raw-loader bounds fix remains separate in #978.

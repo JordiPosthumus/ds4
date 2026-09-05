@@ -32,6 +32,7 @@ extern "C" {
 //   device: CUDA device ordinal (0 for the primary GPU).
 // Returns 0 on success.
 int ds4_mmq_init(int device);
+void ds4_mmq_cleanup(void);
 void ds4_mmq_set_aligned_q81_scratch(void *ptr, size_t bytes);
 
 // Query whether ds4_mmq is willing to handle a given matmul. Returns
@@ -344,6 +345,12 @@ int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
     float           clamp,
     cudaStream_t    stream);
 
+/* Optional fused entries return this before enqueueing work when their
+ * capability/shape/scratch preflight cannot engage.  Callers may safely retry
+ * a materialized fallback only for this result; zero is success and negative
+ * values may follow partial enqueue. */
+#define DS4_MMQ_NOT_APPLICABLE 1
+
 /* Aligned-artifact production fast path: gate/up stay in registers, weighted
  * SwiGLU is quantized directly into down_q8_scratch, and only the pair-major
  * down output is materialized.  Caller-owned scratch keeps this hot path free
@@ -577,6 +584,11 @@ int ds4_mmq_q2_K_aligned_derepack(
 // they do not replace).  n_tokens == 1 and K % 1024 == 0 only; other shapes
 // return non-zero so the caller can fall back to ds4_mmq_q8_0_dense_vec.
 uint64_t ds4_mmq_q8_0_aligned_bytes(int M, int K);
+
+// Enable decode shapes validated on integrated sm_121 (GB10). The CUDA
+// backend sets this after device discovery; other devices retain the generic
+// aligned kernel. DS4_CUDA_NO_Q8_ALIGNED_PERSISTENT is the runtime rollback.
+void ds4_mmq_set_gb10_optimizations(int enabled);
 
 int ds4_mmq_q8_0_aligned_dense_vec(
     const void  * W_aligned,

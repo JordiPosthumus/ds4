@@ -1,5 +1,6 @@
 #include "ds4_gpu.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +18,99 @@ static double getenv_seconds(const char *name, double fallback) {
     char *end = NULL;
     const double v = strtod(s, &end);
     return end != s && v > 0.0 ? v : fallback;
+}
+
+static float qat_value(uint64_t i) {
+    static const float levels[] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    };
+    const float scale = ldexpf(1.0f, (int)((i / 32u) % 7u) - 4);
+    const float sign = ((i * 0x9e3779b97f4a7c15ull) >> 63) ? -1.0f : 1.0f;
+    return sign * scale * levels[(i * 13u + i / 17u) & 7u];
+}
+
+static float topk_adversarial_value(uint64_t i) {
+    uint32_t x = (uint32_t)i ^ (uint32_t)(i >> 32);
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    /* Deliberate collisions exercise the value/index tie break. */
+    if ((i % 29u) == 0u) return 0.5f;
+    if ((i % 113u) == 0u) return -0.0f;
+    return (float)(int32_t)(x & 0x1ffffu) * (1.0f / 65536.0f) - 1.0f;
+}
+
+static int check_stream_topk_matches_reference(void) {
+    static const uint32_t n_comp_cases[] = {8193u, 8448u, 32768u};
+    const uint32_t n_tokens = 32u;
+    const uint32_t top_k = 512u;
+
+    for (uint32_t c = 0; c < sizeof(n_comp_cases) / sizeof(n_comp_cases[0]); c++) {
+        const uint32_t n_comp = n_comp_cases[c];
+        const uint64_t score_count = (uint64_t)n_comp * n_tokens;
+        const uint64_t selected_count = (uint64_t)n_tokens * top_k;
+        float *scores_host = malloc((size_t)score_count * sizeof(*scores_host));
+        uint32_t *stream_host = malloc((size_t)selected_count * sizeof(*stream_host));
+        uint32_t *reference_host = malloc((size_t)selected_count * sizeof(*reference_host));
+        ds4_gpu_tensor *scores = ds4_gpu_tensor_alloc(score_count * sizeof(float));
+        ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(selected_count * sizeof(uint32_t));
+        int rc = 1;
+        if (!scores_host || !stream_host || !reference_host || !scores || !selected) {
+            goto cleanup;
+        }
+        for (uint64_t i = 0; i < score_count; i++) {
+            scores_host[i] = topk_adversarial_value(i + (uint64_t)c * 0x100000001b3ull);
+        }
+        if (!ds4_gpu_tensor_write(scores, 0, scores_host,
+                                  score_count * sizeof(float))) {
+            goto cleanup;
+        }
+
+        unsetenv("DS4_CUDA_NO_TOPK_STREAM");
+        if (!ds4_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens, top_k) ||
+            !ds4_gpu_synchronize() ||
+            !ds4_gpu_tensor_read(selected, 0, stream_host,
+                                  selected_count * sizeof(uint32_t))) {
+            goto cleanup;
+        }
+
+        setenv("DS4_CUDA_NO_TOPK_STREAM", "1", 1);
+        if (!ds4_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens, top_k) ||
+            !ds4_gpu_synchronize() ||
+            !ds4_gpu_tensor_read(selected, 0, reference_host,
+                                  selected_count * sizeof(uint32_t))) {
+            goto cleanup;
+        }
+        unsetenv("DS4_CUDA_NO_TOPK_STREAM");
+
+        for (uint64_t i = 0; i < selected_count; i++) {
+            if (stream_host[i] != reference_host[i]) {
+                fprintf(stderr,
+                        "stream top-k mismatch n_comp=%u token=%llu rank=%llu got=%u expected=%u\n",
+                        n_comp,
+                        (unsigned long long)(i / top_k),
+                        (unsigned long long)(i % top_k),
+                        stream_host[i], reference_host[i]);
+                goto cleanup;
+            }
+        }
+        fprintf(stderr,
+                "cuda-regression: stream top-k matches reference n_comp=%u n_tokens=%u\n",
+                n_comp, n_tokens);
+        rc = 0;
+
+cleanup:
+        unsetenv("DS4_CUDA_NO_TOPK_STREAM");
+        ds4_gpu_tensor_free(selected);
+        ds4_gpu_tensor_free(scores);
+        free(reference_host);
+        free(stream_host);
+        free(scores_host);
+        if (rc != 0) return rc;
+    }
+    return 0;
 }
 
 static int check_large_topk(void) {
@@ -90,7 +184,7 @@ static int check_decode_attention_overflow_path(void) {
     const uint32_t n_head = 8;
     const uint32_t head_dim = 512;
     const uint32_t n_raw = 128;
-    const uint32_t n_comp = 8100;
+    const uint32_t n_comp = 8192;
     const uint64_t q_count = (uint64_t)n_head * head_dim;
     const uint64_t raw_count = (uint64_t)n_raw * head_dim;
     const uint64_t comp_count = (uint64_t)n_comp * head_dim;
@@ -137,7 +231,7 @@ static int check_decode_attention_overflow_path(void) {
         for (uint32_t h = 0; h < n_head; h++) {
             const float v = heads_host[(uint64_t)h * head_dim];
             if (v < 0.90f) {
-                fprintf(stderr, "attention fallback ignored compressed rows for head=%u value=%f\n",
+                fprintf(stderr, "long attention ignored compressed rows for head=%u value=%f\n",
                         h, (double)v);
                 rc = 1;
             }
@@ -156,10 +250,119 @@ static int check_decode_attention_overflow_path(void) {
     return rc;
 }
 
+static int check_b1_indexer_wmma(void) {
+    const uint32_t n_comp = 8192u;
+    const uint32_t n_head = 64u;
+    const uint32_t head_dim = 128u;
+    const uint32_t top_k = 512u;
+    const uint64_t q_count = (uint64_t)n_head * head_dim;
+    const uint64_t cache_count = (uint64_t)n_comp * head_dim;
+    float *q_host = malloc((size_t)q_count * sizeof(*q_host));
+    float *weights_host = malloc((size_t)n_head * sizeof(*weights_host));
+    float *cache_host = malloc((size_t)cache_count * sizeof(*cache_host));
+    float *direct_host = malloc((size_t)n_comp * sizeof(*direct_host));
+    float *wmma_host = malloc((size_t)n_comp * sizeof(*wmma_host));
+    uint32_t *direct_topk = malloc((size_t)top_k * sizeof(*direct_topk));
+    uint32_t *wmma_topk = malloc((size_t)top_k * sizeof(*wmma_topk));
+    if (!q_host || !weights_host || !cache_host || !direct_host ||
+        !wmma_host || !direct_topk || !wmma_topk) {
+        free(wmma_topk);
+        free(direct_topk);
+        free(wmma_host);
+        free(direct_host);
+        free(cache_host);
+        free(weights_host);
+        free(q_host);
+        return 1;
+    }
+
+    for (uint64_t i = 0; i < q_count; i++) {
+        q_host[i] = qat_value(i + 7u);
+    }
+    for (uint32_t i = 0; i < n_head; i++) {
+        weights_host[i] = 0.25f + (float)((i * 19u) % 31u) / 31.0f;
+    }
+    for (uint64_t i = 0; i < cache_count; i++) {
+        cache_host[i] = qat_value(i + (i / head_dim) * 97u + 23u);
+    }
+
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(n_head * sizeof(float));
+    ds4_gpu_tensor *cache = ds4_gpu_tensor_alloc(cache_count * sizeof(float));
+    ds4_gpu_tensor *scores = ds4_gpu_tensor_alloc(n_comp * sizeof(float));
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(top_k * sizeof(uint32_t));
+    int rc = 1;
+    if (!q || !weights || !cache || !scores || !selected ||
+        !ds4_gpu_tensor_write(q, 0, q_host, q_count * sizeof(float)) ||
+        !ds4_gpu_tensor_write(weights, 0, weights_host,
+                              n_head * sizeof(float)) ||
+        !ds4_gpu_tensor_write(cache, 0, cache_host,
+                              cache_count * sizeof(float))) {
+        goto cleanup;
+    }
+
+    setenv("DS4_CUDA_NO_INDEXER_WMMA", "1", 1);
+    if (!ds4_gpu_indexer_score_one_tensor(scores, q, weights, cache,
+                                          n_comp, n_head, head_dim,
+                                          1.0f / sqrtf(8192.0f)) ||
+        !ds4_gpu_indexer_topk_tensor(selected, scores, n_comp, 1u, top_k) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(scores, 0, direct_host,
+                             n_comp * sizeof(float)) ||
+        !ds4_gpu_tensor_read(selected, 0, direct_topk,
+                             top_k * sizeof(uint32_t))) {
+        goto cleanup;
+    }
+    unsetenv("DS4_CUDA_NO_INDEXER_WMMA");
+    if (!ds4_gpu_indexer_score_one_tensor(scores, q, weights, cache,
+                                          n_comp, n_head, head_dim,
+                                          1.0f / sqrtf(8192.0f)) ||
+        !ds4_gpu_indexer_topk_tensor(selected, scores, n_comp, 1u, top_k) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(scores, 0, wmma_host,
+                             n_comp * sizeof(float)) ||
+        !ds4_gpu_tensor_read(selected, 0, wmma_topk,
+                             top_k * sizeof(uint32_t))) {
+        goto cleanup;
+    }
+
+    float max_abs = 0.0f;
+    for (uint32_t i = 0; i < n_comp; i++) {
+        const float delta = fabsf(direct_host[i] - wmma_host[i]);
+        if (delta > max_abs) max_abs = delta;
+    }
+    uint32_t topk_diff = 0u;
+    for (uint32_t i = 0; i < top_k; i++) {
+        if (direct_topk[i] != wmma_topk[i]) topk_diff++;
+    }
+    fprintf(stderr,
+            "cuda-regression: B1 indexer n_comp=%u max_abs=%g topk_diff=%u\n",
+            n_comp, (double)max_abs, topk_diff);
+    rc = max_abs <= 1.0e-3f && topk_diff == 0u ? 0 : 1;
+
+cleanup:
+    unsetenv("DS4_CUDA_NO_INDEXER_WMMA");
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(scores);
+    ds4_gpu_tensor_free(cache);
+    ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(q);
+    free(wmma_topk);
+    free(direct_topk);
+    free(wmma_host);
+    free(direct_host);
+    free(cache_host);
+    free(weights_host);
+    free(q_host);
+    return rc;
+}
+
 int main(void) {
     if (!ds4_gpu_init()) return 1;
     int rc = check_large_topk();
+    if (check_stream_topk_matches_reference() != 0) rc = 1;
     if (check_decode_attention_overflow_path() != 0) rc = 1;
+    if (check_b1_indexer_wmma() != 0) rc = 1;
     ds4_gpu_cleanup();
     if (rc == 0) puts("cuda long-context regression: OK");
     return rc;
