@@ -164,6 +164,13 @@ tests/test_mxfp4_metal.o: tests/test_mxfp4_metal.c ds4_gpu.h
 tests/test_mxfp4_metal: tests/test_mxfp4_metal.o ds4_metal.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
+tests/test_mxfp4_small_prefill: tests/test_mxfp4_small_prefill.c ds4_metal.o ds4_image.o ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_mxfp4_small_prefill.c ds4_metal.o ds4_image.o $(METAL_LDLIBS)
+
+.PHONY: test-mxfp4-small-prefill
+test-mxfp4-small-prefill: tests/test_mxfp4_small_prefill
+	./tests/test_mxfp4_small_prefill
+
 check-mxfp4-half-lut:
 	python3 metal/generate_mxfp4_half_lut.py --check
 

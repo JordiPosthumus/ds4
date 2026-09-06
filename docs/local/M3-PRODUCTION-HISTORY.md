@@ -1006,3 +1006,26 @@ commands are retained in
 `local-performance/pr959-production-20260904T121730Z/`. Rollback requires
 explicit approval and the server must be stopped before restoring the matching
 source and binary; the KV cache needs no deletion or conversion.
+
+## 2026-09-06 short-prefill MXFP4 dispatch extraction — M3 deployment
+
+The owner authorized production installation of the tested 26-line extraction
+from Ivan Fioravanti's PR #954, after independent repeated performance and
+byte-exact numerical checks plus the full focused API gate. This enables the
+existing optimized MXFP4 dispatch for eligible 32–2,047-token prefills. It
+provides approximately 6–18% faster engine prefill on the measured short shapes;
+ordinary decode has no demonstrated gain. M2 Q2 and Spark CUDA deployments are
+outside this change. Only `ds4-server` is replaced among local executables.
+
+All source/configuration files and original executables are backed up before
+the change. DSG maintenance owns the drain; admitted work completes before the
+service stops. Captured checkpoint inode versions are retained with hard links.
+Handback requires the exact tested binary, unchanged launch arguments/environment,
+full 262144 context/output, ten residents, one active request, 4096/64 quanta,
+unchanged cache policy, eligible checkpoint lookups and fresh text/image
+cold-to-warm hits before releasing the owned lock and resuming.
+
+The final record, exact deltas and rollback backup are under
+`local-performance/prefill-attribution-20260906T174237Z/production-install-20260906T203740Z/`; `deployment-complete.json` and `handback-fleet.json` establish the
+actual running version. See `LOCAL-PRODUCTION-CONFIG.md` and the linked
+short-prefill results for numerical coverage, timings and their limits.

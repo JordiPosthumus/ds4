@@ -64,3 +64,43 @@ preserve every unrelated setting. Verify each host's effective configuration,
 real cache reuse, then resume through DSG and require healthy=true,
 drained=false, quarantine=null. Never clear quarantine or change recovery
 policy manually to force handback.
+
+## M3 short-prefill dispatch update, 2026-09-06
+
+Jordi authorized installing the validated short-prefill extraction from
+[Ivan Fioravanti's PR #954](https://github.com/antirez/ds4/pull/954). The runtime
+delta is 16 added and 10 removed lines in `ds4_metal.m` on production `960e973`.
+It enables existing resident pre-M5 MXFP4 specializations for eligible
+32–2,047-token prefills; established quality, residency and tensor-parallel
+guards remain. No kernels, arithmetic, sampling or checkpoint formats change.
+The included regression fixture and Makefile target protect the dispatch gates.
+Only the M3 serving executable is deployed; other command-line binaries and
+other hosts retain their previous deployments.
+
+On M3 Ultra / 512 GiB with the existing Vision-Exp MXFP4 model, paired engine
+prefill gains were 16.42% at 512 new tokens, 6.31% at 2,047, 17.85% for 91 new
+tokens after 110,290 cached, and 15.98% for 128 after 261,888 cached. The
+2,048-token control was flat. These exclude HTTP/restore overhead and establish
+no ordinary decode-speed gain. Independent process confirmation, byte-exact
+full-vocabulary traces through full context, guarded GPU cases, image suffixes,
+ten live sessions, cancellation/tool replay and bidirectional disk reuse passed.
+The final near-capacity reference drift and corrected API fixture-order failure
+are disclosed in the full report.
+
+All machine settings in the table above remain unchanged. Normal `start-ds-ds4`
+uses the improvement without extra flags. The existing aggregate rollback
+`DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_SMALL_PREFILL` is documented for a separately
+authorized rollback; it is absent from production's environment. Rewind remains
+disabled and cold-anchor checkpoints remain enabled. Rollback needs matching
+source and serving binary restoration during authorized DSG maintenance; it
+requires no KV deletion or conversion.
+
+Installed serving binary SHA256:
+`8ca6acc68a256ebe05fc7c334a80de2aa437febf73af0a3c3cc69677e95d7e2c`.
+Previous serving binary SHA256:
+`59e0ed435b08814a99608c31958fa2f22fcddc7e2737ee43d4e077b45c740b15`.
+
+The timestamped backup and live deployment receipt are in
+`local-performance/prefill-attribution-20260906T174237Z/production-install-20260906T203740Z/`.
+The measured evidence is
+[LOSSLESS-SHORT-PREFILL-RESULTS.md](local-performance/prefill-attribution-20260906T174237Z/LOSSLESS-SHORT-PREFILL-RESULTS.md).
