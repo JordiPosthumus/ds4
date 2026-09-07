@@ -6,6 +6,8 @@ Measured on one GB10 Spark and one M3 Ultra. The source comparison is pristine u
 
 **M3 Ultra:** decode changes range from -4.26% to +5.46%; continued-prefill changes range from +20.17% to +30.13%. At 262,016 context, decode changes from 25.53 to 25.70 tok/s (+0.63%). The tables include every measured shape, including slower ones.
 
+**M3 follow-up:** the short-decode slowdown did not reproduce in a reversed-order comparison or a replay of the exact original full-runtime executable. The original observations below are retained, but do not establish a repeatable −4.26% patch regression. See the [causal controls, independent repeats and limits](m3-attribution/README.md).
+
 See [the exact scope](STACK-MANIFEST.md) and [reproduction instructions](REPRODUCE.md). All comparisons below are within the same machine and model.
 
 | Machine | Backend and model | Context | Resident / active | Prefill cap |
@@ -15,7 +17,7 @@ See [the exact scope](STACK-MANIFEST.md) and [reproduction instructions](REPRODU
 
 The model filenames are `DeepSeek-V4-Flash-Vision-Exp-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8.gguf` on Spark and `DeepSeek-V4-Flash-Vision-Exp-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out.gguf` on M3. Both use `DeepSeek-V4-Flash-Vision-Encoder.gguf`. Compiler and platform details are recorded in `toolchains.json` and the native-build receipts.
 
-Both builds receive the same corpus and teacher tokens, and occupy every resident session. Each machine uses one stock process followed by one complete-stack process. Decode and continued prefill have two warmups and four timed trials per shape per process. Each table compares the medians of the four trials within each process. There is no independent process repeat or reversed-order control; treat the size of the change as an observed paired result rather than a precise general speed guarantee. Raw CSVs retain the individual trials.
+Both builds receive the same corpus and teacher tokens, and occupy every resident session. Each machine uses one stock process followed by one complete-stack process. Decode and continued prefill have two warmups and four timed trials per shape per process. Each table compares the medians of the four trials within each process. These original full sweeps have no independent process repeat or reversed-order control; treat their changes as observed paired results rather than precise general speed guarantees. The later M3 short-context controls are reported separately above. Raw CSVs retain the individual trials.
 
 Warm weights and ordinary kernel/cache settings remain enabled. Spark uses `DS4_CUDA_INDEXED_DECODE_GATHER=1` and its existing 4096 MiB optional Q8-to-FP16 cache reserve in both arms; stock ignores the gathering option. The adaptive cache is not disabled or forced to a fixed allocation. Its actual startup decisions are part of the captured evidence.
 

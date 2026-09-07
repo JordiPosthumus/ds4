@@ -1,0 +1,605 @@
+{
+  "runs": {
+    "old_stock": {
+      "native": [
+        {
+          "context": 32,
+          "mode": 0,
+          "trials": [
+            43.324127241,
+            43.344177342,
+            43.326876377,
+            43.3212159
+          ],
+          "median": 43.325501809
+        },
+        {
+          "context": 512,
+          "mode": 0,
+          "trials": [
+            44.071804422,
+            44.080110568,
+            44.083583865,
+            44.080538964
+          ],
+          "median": 44.080324766000004
+        },
+        {
+          "context": 2048,
+          "mode": 0,
+          "trials": [
+            43.37285044,
+            43.348393771,
+            43.343674383,
+            43.389269049
+          ],
+          "median": 43.3606221055
+        },
+        {
+          "context": 8192,
+          "mode": 0,
+          "trials": [
+            38.972405084,
+            38.974055554,
+            38.962325885,
+            38.983291209
+          ],
+          "median": 38.973230319
+        },
+        {
+          "context": 32768,
+          "mode": 0,
+          "trials": [
+            36.65676453,
+            36.603326579,
+            36.647593566,
+            36.609182563
+          ],
+          "median": 36.6283880645
+        },
+        {
+          "context": 131072,
+          "mode": 0,
+          "trials": [
+            30.232336698,
+            30.25931999,
+            30.242458792,
+            30.237058539
+          ],
+          "median": 30.2397586655
+        },
+        {
+          "context": 262016,
+          "mode": 0,
+          "trials": [
+            25.54164374,
+            25.531435832,
+            25.535475914,
+            25.516164892
+          ],
+          "median": 25.533455873
+        }
+      ],
+      "causal": []
+    },
+    "old_full": {
+      "native": [
+        {
+          "context": 32,
+          "mode": 0,
+          "trials": [
+            43.986065768,
+            43.8861724,
+            43.104296787,
+            43.091791963
+          ],
+          "median": 43.4952345935
+        },
+        {
+          "context": 512,
+          "mode": 0,
+          "trials": [
+            43.006951211,
+            43.033400696,
+            42.951258776,
+            43.021563627
+          ],
+          "median": 43.014257419
+        },
+        {
+          "context": 2048,
+          "mode": 0,
+          "trials": [
+            42.34156171,
+            42.285677375,
+            42.31646317,
+            42.363623325
+          ],
+          "median": 42.32901244
+        },
+        {
+          "context": 8192,
+          "mode": 0,
+          "trials": [
+            37.453006798,
+            37.159471481,
+            37.174601493,
+            37.477874774
+          ],
+          "median": 37.3138041455
+        },
+        {
+          "context": 32768,
+          "mode": 0,
+          "trials": [
+            37.58362727,
+            37.62110218,
+            37.600184508,
+            37.585451412
+          ],
+          "median": 37.59281796
+        },
+        {
+          "context": 131072,
+          "mode": 0,
+          "trials": [
+            31.921377897,
+            31.862674382,
+            31.892199343,
+            31.889068227
+          ],
+          "median": 31.890633785
+        },
+        {
+          "context": 262016,
+          "mode": 0,
+          "trials": [
+            25.728772547,
+            25.508907731,
+            25.960566513,
+            25.661594293
+          ],
+          "median": 25.69518342
+        }
+      ],
+      "causal": []
+    },
+    "new_full": {
+      "native": [
+        {
+          "context": 32,
+          "mode": 0,
+          "trials": [
+            45.37457966,
+            45.379508472,
+            45.340221239,
+            45.385184417
+          ],
+          "median": 45.377044065999996
+        },
+        {
+          "context": 512,
+          "mode": 0,
+          "trials": [
+            44.984143975,
+            45.033544673,
+            45.021730962,
+            45.086847209
+          ],
+          "median": 45.0276378175
+        },
+        {
+          "context": 2048,
+          "mode": 0,
+          "trials": [
+            44.294378345,
+            44.319976269,
+            44.295351638,
+            44.360892277
+          ],
+          "median": 44.3076639535
+        },
+        {
+          "context": 8192,
+          "mode": 0,
+          "trials": [
+            39.749596322,
+            39.746001145,
+            39.740615817,
+            39.741909157
+          ],
+          "median": 39.743955151
+        }
+      ],
+      "causal": [
+        {
+          "context": 512,
+          "mode": 0,
+          "trials": [
+            45.030894029,
+            45.084494377,
+            45.157578614,
+            45.08534265
+          ],
+          "median": 45.0849185135
+        },
+        {
+          "context": 512,
+          "mode": 1,
+          "trials": [
+            44.935519297,
+            44.93302326,
+            44.938635762,
+            45.006956586
+          ],
+          "median": 44.9370775295
+        },
+        {
+          "context": 8192,
+          "mode": 0,
+          "trials": [
+            39.725114719,
+            39.722058191,
+            39.805036811,
+            39.783452715
+          ],
+          "median": 39.754283717
+        },
+        {
+          "context": 8192,
+          "mode": 1,
+          "trials": [
+            39.672635159,
+            39.704411597,
+            39.671792449,
+            39.681336992
+          ],
+          "median": 39.6769860755
+        }
+      ]
+    },
+    "new_stock": {
+      "native": [
+        {
+          "context": 32,
+          "mode": 0,
+          "trials": [
+            43.083576371,
+            43.084029463,
+            43.062569235,
+            43.010810955
+          ],
+          "median": 43.073072803
+        },
+        {
+          "context": 512,
+          "mode": 0,
+          "trials": [
+            43.867405758,
+            43.911452383,
+            43.868345224,
+            43.868557367
+          ],
+          "median": 43.8684512955
+        },
+        {
+          "context": 2048,
+          "mode": 0,
+          "trials": [
+            43.189581177,
+            43.238693934,
+            43.182943351,
+            43.24168253
+          ],
+          "median": 43.2141375555
+        },
+        {
+          "context": 8192,
+          "mode": 0,
+          "trials": [
+            38.846782782,
+            38.839630857,
+            38.829157211,
+            38.841982862
+          ],
+          "median": 38.840806859500006
+        }
+      ],
+      "causal": [
+        {
+          "context": 512,
+          "mode": 0,
+          "trials": [
+            43.732601657,
+            43.576004787,
+            43.684043973,
+            43.698007543
+          ],
+          "median": 43.691025758
+        },
+        {
+          "context": 512,
+          "mode": 1,
+          "trials": [
+            43.667776929,
+            43.576229064,
+            43.69169352,
+            43.72776813
+          ],
+          "median": 43.6797352245
+        },
+        {
+          "context": 8192,
+          "mode": 0,
+          "trials": [
+            38.670372527,
+            38.662108394,
+            38.714802682,
+            38.633717075
+          ],
+          "median": 38.6662404605
+        },
+        {
+          "context": 8192,
+          "mode": 1,
+          "trials": [
+            38.668877187,
+            38.717175,
+            38.700409767,
+            38.612527242
+          ],
+          "median": 38.684643476999995
+        }
+      ]
+    },
+    "original_full_replay": {
+      "native": [
+        {
+          "context": 32,
+          "mode": 0,
+          "trials": [
+            45.260318105,
+            45.194668026,
+            45.186901206,
+            45.31873523
+          ],
+          "median": 45.2274930655
+        },
+        {
+          "context": 512,
+          "mode": 0,
+          "trials": [
+            44.83421578,
+            44.870553751,
+            44.914573895,
+            44.904743602
+          ],
+          "median": 44.88764867650001
+        },
+        {
+          "context": 2048,
+          "mode": 0,
+          "trials": [
+            44.211804482,
+            44.15138432,
+            44.18228847,
+            44.180997369
+          ],
+          "median": 44.18164291950001
+        },
+        {
+          "context": 8192,
+          "mode": 0,
+          "trials": [
+            39.56314808,
+            39.585271037,
+            39.593218648,
+            39.574428437
+          ],
+          "median": 39.579849737
+        }
+      ],
+      "causal": []
+    }
+  },
+  "numerical": {
+    "full_old_new_32": {
+      "vectors": 129,
+      "elements": 16677120,
+      "bitwise_different": 0,
+      "bitwise_equal": true,
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "argmax_different": 0
+    },
+    "stock_old_new_32": {
+      "vectors": 129,
+      "elements": 16677120,
+      "bitwise_different": 0,
+      "bitwise_equal": true,
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "argmax_different": 0
+    },
+    "full_old_new_512": {
+      "vectors": 129,
+      "elements": 16677120,
+      "bitwise_different": 0,
+      "bitwise_equal": true,
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "argmax_different": 0
+    },
+    "stock_old_new_512": {
+      "vectors": 129,
+      "elements": 16677120,
+      "bitwise_different": 0,
+      "bitwise_equal": true,
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "argmax_different": 0
+    },
+    "full_old_new_2048": {
+      "vectors": 129,
+      "elements": 16677120,
+      "bitwise_different": 0,
+      "bitwise_equal": true,
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "argmax_different": 0
+    },
+    "stock_old_new_2048": {
+      "vectors": 129,
+      "elements": 16677120,
+      "bitwise_different": 0,
+      "bitwise_equal": true,
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "argmax_different": 0
+    },
+    "full_old_new_8192": {
+      "vectors": 129,
+      "elements": 16677120,
+      "bitwise_different": 0,
+      "bitwise_equal": true,
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "argmax_different": 0
+    },
+    "stock_old_new_8192": {
+      "vectors": 129,
+      "elements": 16677120,
+      "bitwise_different": 0,
+      "bitwise_equal": true,
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "argmax_different": 0
+    },
+    "original_executable_old_replay_32": {
+      "vectors": 129,
+      "elements": 16677120,
+      "bitwise_different": 0,
+      "bitwise_equal": true,
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "argmax_different": 0
+    },
+    "original_executable_old_replay_512": {
+      "vectors": 129,
+      "elements": 16677120,
+      "bitwise_different": 0,
+      "bitwise_equal": true,
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "argmax_different": 0
+    },
+    "original_executable_old_replay_2048": {
+      "vectors": 129,
+      "elements": 16677120,
+      "bitwise_different": 0,
+      "bitwise_equal": true,
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "argmax_different": 0
+    },
+    "original_executable_old_replay_8192": {
+      "vectors": 129,
+      "elements": 16677120,
+      "bitwise_different": 0,
+      "bitwise_equal": true,
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "argmax_different": 0
+    },
+    "raw_default_legacy_512": {
+      "vectors": 128,
+      "elements": 16547840,
+      "bitwise_different": 0,
+      "bitwise_equal": true,
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "argmax_different": 0
+    },
+    "same_full_prefix_full_stock_512": {
+      "vectors": 128,
+      "elements": 16547840,
+      "bitwise_different": 0,
+      "bitwise_equal": true,
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "argmax_different": 0
+    },
+    "full_native_control_512": {
+      "vectors": 128,
+      "elements": 16547840,
+      "bitwise_different": 0,
+      "bitwise_equal": true,
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "argmax_different": 0
+    },
+    "stock_native_control_512": {
+      "vectors": 128,
+      "elements": 16547840,
+      "bitwise_different": 0,
+      "bitwise_equal": true,
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "argmax_different": 0
+    },
+    "stock_native_imported_512": {
+      "vectors": 128,
+      "elements": 16547840,
+      "bitwise_different": 16547832,
+      "bitwise_equal": false,
+      "max_abs": 3.7871532440185547,
+      "rmse": 0.31954128178815266,
+      "argmax_different": 3
+    },
+    "raw_default_legacy_8192": {
+      "vectors": 128,
+      "elements": 16547840,
+      "bitwise_different": 0,
+      "bitwise_equal": true,
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "argmax_different": 0
+    },
+    "same_full_prefix_full_stock_8192": {
+      "vectors": 128,
+      "elements": 16547840,
+      "bitwise_different": 16547810,
+      "bitwise_equal": false,
+      "max_abs": 3.466526985168457,
+      "rmse": 0.18519435210998017,
+      "argmax_different": 2
+    },
+    "full_native_control_8192": {
+      "vectors": 128,
+      "elements": 16547840,
+      "bitwise_different": 0,
+      "bitwise_equal": true,
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "argmax_different": 0
+    },
+    "stock_native_control_8192": {
+      "vectors": 128,
+      "elements": 16547840,
+      "bitwise_different": 0,
+      "bitwise_equal": true,
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "argmax_different": 0
+    },
+    "stock_native_imported_8192": {
+      "vectors": 128,
+      "elements": 16547840,
+      "bitwise_different": 16547834,
+      "bitwise_equal": false,
+      "max_abs": 5.193360328674316,
+      "rmse": 0.2835985442801982,
+      "argmax_different": 1
+    }
+  }
+}

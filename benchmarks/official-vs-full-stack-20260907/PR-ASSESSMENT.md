@@ -4,7 +4,9 @@ This assessment reuses the completed standalone tests, targeted model checks and
 
 **There is no PR in this set that the completed evidence identifies as a known bad change.** The useful distinction is between supported fixes, workload-dependent features and performance claims that need careful scope. Passing tests is evidence for the tested cases, not a guarantee for every model and backend.
 
-The combined run is mixed on M3: continued prefill improves 20–30%, while decode changes range from -4.26% to +5.46%, and the 8K prefix sweep is 5.01% slower. Spark decode improves 5–20% across the measured contexts. These are one-pair observations of the entire bundle, including additional changes; they do not identify an individual PR as the cause of a slower or faster shape. The bundle also changes numerical outputs and is not established as universally lossless.
+The [M3 attribution follow-up](m3-attribution/README.md) found that the original short-decode slowdown did not repeat; the same original executable produced faster readings. Raw-attention rollback and prefix-origin controls do not implicate a PR. No PR is withdrawn on this evidence, and no universal speed or quality guarantee follows.
+
+The original combined run is mixed on M3: continued prefill improves 20–30%, while decode changes range from -4.26% to +5.46%, and the 8K prefix sweep is 5.01% slower. Spark decode improves 5–20% across the measured contexts. These are one-pair observations of the entire bundle, including additional changes; they do not identify an individual PR as the cause of a slower or faster shape. The bundle also changes numerical outputs and is not established as universally lossless.
 
 | PR | Assessment | Why it is useful; limit on the claim |
 | --- | --- | --- |
@@ -24,4 +26,4 @@ The combined run is mixed on M3: continued prefill improves 20–30%, while deco
 
 The uncertain claims are broad ones: “every PR makes inference faster,” “the individual percentages add up,” “the complete-stack gain belongs to these 13 alone,” or “a short timing comparison proves universal model quality.” We should not make those claims.
 
-The shared comparison uses one stock/stack process pair on Spark and one on M3, retaining four timing trials inside each process. Existing standalone validation remains the evidence for each PR's individual mechanism.
+The original full-context comparison uses one stock/stack process pair on Spark and one on M3, retaining four timing trials inside each process. The follow-up adds a reversed short-context M3 pair, same-process causal controls and an exact original-executable replay. Existing standalone validation remains the evidence for each PR's individual mechanism.

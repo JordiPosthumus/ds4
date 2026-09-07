@@ -1,0 +1,27 @@
+{
+  "created_at": "2026-09-07T19:50:09.937345+00:00",
+  "source_pins": {
+    "upstream": "f62ca29a308724cde5bc99134ede19104b2a3260",
+    "candidate": "d311463ea56f8939b44f6e84e38ae0a304da4549"
+  },
+  "corpus_sha256": "443b3169e6b07837484df10b392115f11baa4258232bf91801a025b0967f8807",
+  "causal_frontend_sha256": "adac399ec67e1eff93b2c6bfb3781f93ba5762dae5f275ff8548f5a7227103d2",
+  "native_runtime_objects_unchanged": true,
+  "causal_binaries": {
+    "stock": "5775205737bf371c89998224d2eda7c9763470e4c9d01855bcddb92cd71753bf",
+    "full": "d118c851f2655b1f393ec4e0d6fe53515fa1bc2c5f0fa8280549876682a5aae5"
+  },
+  "original_full_binary_sha256": "58eae2b8dac7ec04cda2886ffd05db71b8988f17ae40c1fb153fb2c9ca9406c1",
+  "process_order": [
+    "full causal frontend",
+    "stock causal frontend",
+    "original full executable short replay"
+  ],
+  "original_executable_stop": {
+    "after": "PASS frontier=8192 internal replay",
+    "signal": "SIGTERM",
+    "owned_benchmark_only": true,
+    "all_requested_native_measurements_completed": true,
+    "full_sweep_claimed": false
+  }
+}
