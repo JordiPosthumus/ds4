@@ -130,3 +130,30 @@ capacity and bidirectional cache tests are required before accepting this
 candidate. Passing M2 tests does not establish CUDA correctness, M3-specific
 performance, 262144 capacity, or ten-resident behavior. DSpark activation and
 production rollout are separate decisions.
+
+## Shared Metal decode candidate, 2026-09-07
+
+The candidate extends the existing gathered attention staging to eligible raw-only
+rows on pre-M5 Apple Silicon. M2 gains the same inverse-RoPE fusion already used
+on M3, with the established quality, SSD-streaming and tensor-parallel exclusions.
+A raw fallback clears an unconsumed fusion intent before the caller applies its
+standalone inverse rotation. The kernels, arithmetic/reduction order, model and
+cache format remain unchanged. The earlier M3 short-prefill dispatch stays enabled.
+
+The default dispatch has explicit evaluation/rollback controls:
+`DS4_METAL_DISABLE_DECODE_RAW_GATHERED_ATTN`,
+`DS4_METAL_DISABLE_DECODE_RAW_PACKED32`, and
+`DS4_METAL_DISABLE_M2_ATTN_INV_ROPE_FUSE`. They are absent from ordinary launchers;
+setting one requires a separately authorized rollback. None of the model,
+context/output, resident/active, prefill, warm-weight or checkpoint settings above
+changes. Cold anchors remain enabled; live-KV rewind remains disabled.
+
+`make test-metal-decode-raw-attention` compares eighteen mode transitions for each
+of 86 cases, including ring wrap, retained outputs, inverse rotation, quality and
+shape fallbacks, FP16/F32 compressed rows, exact 8192-row acceptance and rejection
+above it. Full-capacity text/image/resident traces and API/cache acceptance are
+separate requirements. Per-machine comparison and serving receipts are recorded
+under `local-performance/upstream-integration-m2-20260907T013000Z/`; this section
+alone does not assert a deployment. The owner authorized selecting a validated
+faster build independently for each host, with original source/binary/cache
+rollback retained and DSG handback verified.

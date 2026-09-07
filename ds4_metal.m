@@ -3818,12 +3818,20 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_reduce_rope_pipeline(
     return pipeline;
 }
 
+static int ds4_gpu_tp_world_is_two(void);
+
 int ds4_gpu_decode_attn_rope_fuse_available(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (g_rope_tail_inplace_pair_affine_pipeline == nil) return 0;
     if (getenv("DS4_METAL_DISABLE_INPLACE_ROPE_PAIR") != NULL) return 0;
     if (getenv("DS4_METAL_DISABLE_AFFINE_ROPE_PAIR") != NULL) return 0;
-    if (!ds4_gpu_device_name_contains("M3") && !ds4_gpu_device_name_contains("M5")) return 0;
+    const bool m2_fuse_enabled =
+        ds4_gpu_device_name_contains("M2") &&
+        !g_quality_mode && !g_ssd_streaming_mode &&
+        !ds4_gpu_tp_world_is_two() &&
+        getenv("DS4_METAL_DISABLE_M2_ATTN_INV_ROPE_FUSE") == NULL;
+    if (!m2_fuse_enabled && !ds4_gpu_device_name_contains("M3") &&
+        !ds4_gpu_device_name_contains("M5")) return 0;
     return 1;
 }
 
@@ -5384,7 +5392,6 @@ typedef struct {
     NSUInteger  smem;
 } ds4_gpu_mv_dispatch;
 
-static int ds4_gpu_tp_world_is_two(void);
 
 static ds4_gpu_mv_dispatch ds4_gpu_make_q8_0_mv_dispatch(void) {
     const uint64_t default_nsg = ds4_gpu_tp_world_is_two() ? 2u : 4u;
@@ -27417,9 +27424,9 @@ static int ds4_gpu_encode_flash_kv_stage_f16(
         bool                 shared_pad,
         bool                *did_fuse_pad) {
     if (did_fuse_pad) *did_fuse_pad = false;
-    if (!cb || !raw || !comp || !dst || raw_cap == 0 ||
+    if (!cb || !raw || !dst || raw_cap == 0 ||
         raw_start >= raw_cap || n_raw == 0 || n_raw > raw_cap ||
-        n_comp == 0 || head_dim == 0) {
+        (n_comp != 0 && !comp) || head_dim == 0) {
         return 0;
     }
 
@@ -27487,7 +27494,11 @@ static int ds4_gpu_encode_flash_kv_stage_f16(
         [enc setComputePipelineState:g_flash_kv_stage_f16_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:raw offset:raw_offset atIndex:1];
-        [enc setBuffer:comp offset:comp_offset atIndex:2];
+        /* Metal still requires a binding at index 2 when the compressed side
+         * is empty; bind raw as the dummy, matching the mask/pad trick. */
+        [enc setBuffer:(n_comp ? comp : raw)
+                 offset:(n_comp ? comp_offset : raw_offset)
+                atIndex:2];
         [enc setBuffer:dst offset:dst_offset atIndex:3];
         [enc setBuffer:(use_pad_fusion ? mask : dst)
                  offset:(use_pad_fusion ? mask_offset : dst_offset)
@@ -27512,6 +27523,9 @@ static int ds4_gpu_encode_flash_kv_stage_f16(
                                               dst,
                                               dst_offset)) {
         return 0;
+    }
+    if (n_comp == 0) {
+        return 1;
     }
     return ds4_gpu_encode_copy_to_f16_1d(
         cb,
@@ -29282,7 +29296,9 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         ds4_gpu_ported_m5_decode_feature_enabled(
             "DS4_METAL_DISABLE_PRE_M5_FLASH_ATTN_PACKED32_REDUCE",
             NULL) &&
-        !g_quality_mode && use_mask == 0u && comp_kv_f16 != 0u && n_comp != 0u &&
+        !g_quality_mode && use_mask == 0u && comp_kv_f16 != 0u &&
+        (n_comp != 0u ||
+         getenv("DS4_METAL_DISABLE_DECODE_RAW_PACKED32") == NULL) &&
         n_head == 64u && head_dim == 512u && nsg == 1u && nwg == 32u &&
         n_keys <= 1024u && g_decode_attn_rope_fuse != 0 &&
         g_decode_attn_rope_args.head_dim == 512 &&
@@ -30911,11 +30927,22 @@ int ds4_gpu_attention_decode_heads_tensor(
         id<MTLBuffer> sinks_buf = ds4_gpu_wrap_model_range(model_map, model_size, sinks_offset, sink_bytes, &sinks_inner);
         if (!sinks_buf) return 0;
 
-        if (n_comp == 0) {
-            /* The raw-only path stages through the same kernel when it
-             * stages at all; a pending deferred kv task that nothing
-             * consumes must run before the attention reads the cache. */
-            if (g_kv_task.pending && !ds4_gpu_kv_norm_task_flush()) return 0;
+        if (n_comp == 0 && g_kv_task.pending &&
+            !ds4_gpu_kv_norm_task_flush()) return 0;
+        /* PR954 raw-row staging extraction: keep the established attention
+         * kernels and reduction topology, while sharing staging/padding and
+         * the inverse-RoPE tail already used by mixed attention. */
+        const bool gathered_raw =
+            n_comp == 0 && use_mask == 0 && n_head == 64u &&
+            head_dim == 512u && !g_quality_mode && !g_ssd_streaming_mode &&
+            !ds4_gpu_tp_world_is_two() &&
+            ds4_gpu_device_is_pre_m5_apple_silicon() &&
+            getenv("DS4_METAL_DISABLE_DECODE_RAW_GATHERED_ATTN") == NULL;
+        if (n_comp == 0 && !gathered_raw) {
+            /* This encoder leaves inverse RoPE to its caller. Discard the
+             * unused intent before another attention dispatch can consume it. */
+            g_decode_attn_rope_fuse = 0;
+            g_decode_attn_rope_fuse_used = 0;
             int owned = 0;
             id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
             if (!cb) return 0;
