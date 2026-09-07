@@ -118,7 +118,10 @@ The merge retains local cache provenance, cancellation restoration, scheduler
 ownership, kernel paths and M3 short-prefill dispatch. Upstream's speculative
 rewind/rebuild path supersedes the old narrow GLM-only tail handler; exactly
 one boundary handler restores the retained prefix and verifies checkpoint
-position and image identity. Direct speculation remains unavailable to session-
+position and image identity. A fallback that rebuilds compressed history first
+retires the request's cancellation checkpoint; fast rewinds retain it. This
+extends the existing destructive-rebuild invariant to upstream's new boundary
+path. Direct speculation remains unavailable to session-
 batched serving. The existing optional `DS4_RETAIN_LAUNCH_PLIST` preservation
 hook is carried into tracked source without changing its default behavior.
 

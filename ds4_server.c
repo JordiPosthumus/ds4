@@ -12388,11 +12388,34 @@ static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
     return ok;
 }
 
+/* Cancellation rollback omits append-only compressed history. Retire it
+ * before any fallback replaces that history, including speculative rewinds. */
+static bool begin_destructive_checkpoint_rebuild(
+        ds4_session_rewrite_result rewrite_result,
+        ds4_cancel_checkpoint **checkpoint, char *checkpoint_err,
+        size_t checkpoint_errlen, bool *prompt_frontier_preservable) {
+    if (rewrite_result != DS4_SESSION_REWRITE_REBUILD_NEEDED) return false;
+    if (checkpoint) {
+        ds4_session_cancel_checkpoint_free(*checkpoint);
+        *checkpoint = NULL;
+    }
+    if (checkpoint_err && checkpoint_errlen) {
+        snprintf(checkpoint_err, checkpoint_errlen,
+                 "rollback retired before destructive checkpoint rebuild");
+    }
+    if (prompt_frontier_preservable) *prompt_frontier_preservable = false;
+    return true;
+}
+
 /* A recurrent cache cannot always be truncated in place. Match the agent's
  * boundary handling and rebuild the retained prefix when rewind invalidates
  * it, retaining image conditioning as well. */
 static int server_generation_rewind(server *s, server_slot *slot,
                                      const request *r, int pos,
+                                     ds4_cancel_checkpoint **cancel_checkpoint,
+                                     char *cancel_checkpoint_err,
+                                     size_t cancel_checkpoint_errlen,
+                                     bool *prompt_frontier_preservable,
                                      char *err, size_t errlen) {
     pthread_mutex_lock(&s->inference_mu);
     ds4_session_rewind(slot->session, pos);
@@ -12409,6 +12432,12 @@ static int server_generation_rewind(server *s, server_slot *slot,
         ds4_tokens_free(&prefix);
         snprintf(err, errlen, "speculative rewind did not retain frontier %d", pos);
         return 1;
+    }
+    if (rebuild) {
+        begin_destructive_checkpoint_rebuild(
+            DS4_SESSION_REWRITE_REBUILD_NEEDED, cancel_checkpoint,
+            cancel_checkpoint_err, cancel_checkpoint_errlen,
+            prompt_frontier_preservable);
     }
     int rc = rebuild ? server_session_sync_multimodal(s, slot, &prefix,
         r->images, r->image_count, err, errlen) : 0;
@@ -12728,23 +12757,6 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
  * tool id.  If a client sends a tool call without an id we know, the fallback
  * renderer still builds valid DSML from JSON, and this function either rewrites
  * the short suffix in place or reloads an older disk checkpoint before replay. */
-static bool begin_destructive_tool_checkpoint_rebuild(
-        ds4_session_rewrite_result rewrite_result,
-        ds4_cancel_checkpoint **checkpoint, char *checkpoint_err,
-        size_t checkpoint_errlen, bool *prompt_frontier_preservable) {
-    if (rewrite_result != DS4_SESSION_REWRITE_REBUILD_NEEDED) return false;
-    if (checkpoint) {
-        ds4_session_cancel_checkpoint_free(*checkpoint);
-        *checkpoint = NULL;
-    }
-    if (checkpoint_err && checkpoint_errlen) {
-        snprintf(checkpoint_err, checkpoint_errlen,
-                 "rollback retired before destructive tool checkpoint rebuild");
-    }
-    if (prompt_frontier_preservable) *prompt_frontier_preservable = false;
-    return true;
-}
-
 static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
                                          job *j, const char *ctx,
                                          uint64_t trace_id, const char *content,
@@ -12809,7 +12821,7 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         ds4_session_rewrite_from_common(slot->session, &canonical, common,
                                         err, sizeof(err));
     pthread_mutex_unlock(&s->inference_mu);
-    const bool rebuild_needed = begin_destructive_tool_checkpoint_rebuild(
+    const bool rebuild_needed = begin_destructive_checkpoint_rebuild(
         rr, cancel_checkpoint, cancel_checkpoint_err,
         cancel_checkpoint_errlen, prompt_frontier_preservable);
     if (rr == DS4_SESSION_REWRITE_OK) {
@@ -14047,7 +14059,10 @@ decode_again:
             /* Logits after a rewind belong to the discarded suffix. Re-eval
              * the last kept token before sampling under a different mode. */
             int pos = tail_rewind_to - (resample ? 1 : 0);
-            if (server_generation_rewind(s, slot, &j->req, pos, err, sizeof(err)) != 0 ||
+            if (server_generation_rewind(s, slot, &j->req, pos,
+                    &cancel_checkpoint, cancel_checkpoint_err,
+                    sizeof(cancel_checkpoint_err),
+                    &cancel_prompt_frontier_preservable, err, sizeof(err)) != 0 ||
                 (resample && server_eval_token(s, slot, toks[kept - 1], err, sizeof(err)) != 0)) {
                 finish = "error";
                 stop_decode = true;
@@ -21123,11 +21138,11 @@ static void test_destructive_tool_rebuild_retires_cancel_checkpoint(void) {
     ds4_cancel_checkpoint *checkpoint = NULL;
     char err[96] = {0};
     bool prompt_frontier_preservable = true;
-    TEST_ASSERT(begin_destructive_tool_checkpoint_rebuild(
+    TEST_ASSERT(begin_destructive_checkpoint_rebuild(
         DS4_SESSION_REWRITE_REBUILD_NEEDED, &checkpoint, err, sizeof(err),
         &prompt_frontier_preservable));
     TEST_ASSERT(checkpoint == NULL);
-    TEST_ASSERT(strstr(err, "destructive tool checkpoint rebuild") != NULL);
+    TEST_ASSERT(strstr(err, "destructive checkpoint rebuild") != NULL);
     TEST_ASSERT(!prompt_frontier_preservable);
     TEST_ASSERT(!cancel_prompt_frontier_can_be_preserved(4096, 4096,
                                                          prompt_frontier_preservable,
@@ -21135,7 +21150,7 @@ static void test_destructive_tool_rebuild_retires_cancel_checkpoint(void) {
 
     err[0] = '\0';
     prompt_frontier_preservable = true;
-    TEST_ASSERT(!begin_destructive_tool_checkpoint_rebuild(
+    TEST_ASSERT(!begin_destructive_checkpoint_rebuild(
         DS4_SESSION_REWRITE_OK, &checkpoint, err, sizeof(err),
         &prompt_frontier_preservable));
     TEST_ASSERT(prompt_frontier_preservable);
@@ -21300,7 +21315,7 @@ static void test_cancelled_request_restore_orchestration(void) {
     ds4_cancel_checkpoint *retired = NULL;
     char checkpoint_err[96] = {0};
     bool preservable = true;
-    TEST_ASSERT(begin_destructive_tool_checkpoint_rebuild(
+    TEST_ASSERT(begin_destructive_checkpoint_rebuild(
         DS4_SESSION_REWRITE_REBUILD_NEEDED, &retired,
         checkpoint_err, sizeof(checkpoint_err), &preservable));
     TEST_ASSERT(!preservable && retired == NULL);
@@ -21314,7 +21329,7 @@ static void test_cancelled_request_restore_orchestration(void) {
     TEST_ASSERT(session.restore_calls == 0);
     TEST_ASSERT(session.match_calls == 1);
     TEST_ASSERT(session.invalidate_calls == 1);
-    TEST_ASSERT(strstr(result.err, "destructive tool checkpoint rebuild") != NULL);
+    TEST_ASSERT(strstr(result.err, "destructive checkpoint rebuild") != NULL);
 }
 
 static void test_cancelled_request_rebases_continued_frontier(void) {

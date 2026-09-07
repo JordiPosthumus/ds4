@@ -15,7 +15,7 @@ import shlex
 import subprocess
 import tempfile
 
-from test_dspark_eos_contract import extract
+from test_server_cancel_rebuild import extract
 
 
 PRELUDE = r'''
@@ -33,6 +33,12 @@ typedef struct { int inference_mu; } server;
 typedef struct { ds4_session *session; } server_slot;
 typedef struct { const ds4_vision_span *images; size_t image_count; } request;
 typedef struct { request req; bool cancelled; } job;
+typedef struct { int id; } ds4_cancel_checkpoint;
+typedef enum { DS4_SESSION_REWRITE_OK, DS4_SESSION_REWRITE_REBUILD_NEEDED } ds4_session_rewrite_result;
+static int snapshot_releases;
+static void ds4_session_cancel_checkpoint_free(ds4_cancel_checkpoint *p) {
+    if (p) snapshot_releases++;
+}
 enum { FAST, REBUILD, WRONG_VISION, WRONG_POSITION };
 enum { SYNC_OK, SYNC_ERROR, SYNC_BAD_POSITION, SYNC_BAD_VISION, SYNC_INVALID };
 static int locked, rewinds, syncs, evals, invalidations, rewind_mode, sync_mode, eval_error;
@@ -62,7 +68,7 @@ static bool ds4_session_vision_state_matches(ds4_session *s,const ds4_vision_spa
 static void ds4_session_invalidate(ds4_session *s) { CHECK(locked); invalidations++; s->valid=false; }
 static int server_session_sync_multimodal(server *srv,server_slot *slot,const ds4_tokens *p,
         const ds4_vision_span *images,size_t n,char *err,size_t errlen) {
-    (void)srv; CHECK(!locked && images==&image_span && n==1); syncs++;
+    (void)srv; CHECK(!locked && images==&image_span && n==1 && snapshot_releases==1); syncs++;
     if(sync_mode==SYNC_ERROR) { snprintf(err,errlen,"sync failed"); return 1; }
     slot->session->tokens=*p;
     slot->session->pos=p->len+(sync_mode==SYNC_BAD_POSITION);
@@ -85,7 +91,13 @@ static int boundary(server *s,server_slot *slot,job *j,int block_start,int ntok,
     int toks[17]; for(int i=0;i<ntok;i++) toks[i]=1000+block_start+i;
     char err[160]={0}; const char *finish=initial_error?"error":"length";
     bool stop_decode=false; uint64_t trace_id=0;
+    ds4_cancel_checkpoint checkpoint={1},*cancel_checkpoint=&checkpoint;
+    char cancel_checkpoint_err[160]={0};
+    bool cancel_prompt_frontier_preservable=true;
     PRODUCTION_BOUNDARY
+    CHECK(snapshot_releases==syncs);
+    CHECK((cancel_checkpoint==NULL)==(syncs>0));
+    CHECK(cancel_prompt_frontier_preservable==(syncs==0));
     if(stop_decode) { CHECK(!strcmp(finish,"error") && err[0]); return 1; }
     return 0;
 }
@@ -94,7 +106,7 @@ static int boundary(server *s,server_slot *slot,job *j,int block_start,int ntok,
 TESTS = r'''
 static ds4_session fresh(int block) {
     CHECK(!locked && !allocations);
-    rewinds=syncs=evals=invalidations=eval_error=0; rewind_mode=FAST; sync_mode=SYNC_OK;
+    rewinds=syncs=evals=invalidations=eval_error=snapshot_releases=0; rewind_mode=FAST; sync_mode=SYNC_OK;
     ds4_session s={.pos=3+block,.logits_pos=3+block,.valid=true,.vision=true};
     s.tokens.len=s.pos; for(int i=0;i<s.pos;i++) s.tokens.ids[i]=1000+i; return s;
 }
@@ -149,12 +161,13 @@ def main():
     args = parser.parse_args()
     raw = args.source.read_bytes()
     source = raw.decode()
+    retirement = extract(source, 'begin_destructive_checkpoint_rebuild')
     helper = extract(source, 'server_generation_rewind')
     target = extract(source, 'speculative_tail_rewind_target')
     start = source.index('        const int tail_rewind_to = speculative_tail_rewind_target(', source.index('decode_again:'))
     end = source.index('        if (stop_decode) break;', start)
     boundary = source[start:end]
-    code = PRELUDE + target + '\n' + helper + WRAPPER.replace('PRODUCTION_BOUNDARY', boundary) + TESTS
+    code = PRELUDE + retirement + '\n' + target + '\n' + helper + WRAPPER.replace('PRODUCTION_BOUNDARY', boundary) + TESTS
     compiler = shlex.split(os.environ.get('CC', 'cc'))
     if args.output:
         args.output.mkdir(parents=True, exist_ok=False)
