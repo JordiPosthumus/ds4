@@ -60,6 +60,14 @@ preallocates independent KV states and queues requests when all slots are busy.
 Choose context and slot count together: a context that fits once may not fit
 four times. Idle slots can be cached before reuse; active requests are not evicted.
 
+`--max-active-requests N` separates resident KV capacity from compute
+concurrency. It requires `--batched-session`, may not exceed the resident
+session count, and defaults to that count so existing behavior is unchanged.
+For example, `--batched-session 10 --max-active-requests 1` retains up to ten
+independent live checkpoints while processing complete requests one at a time;
+additional requests wait in the server queue instead of occupying another
+resident slot.
+
 | Backend/model | Decode execution |
 | --- | --- |
 | Metal, resident Flash | Native shared-expert/QKV batching where supported |
@@ -84,6 +92,8 @@ Start with the matching language GGUF and `--vision FILE`; see
 
 OpenAI chat and Responses accept inline PNG/JPEG data URIs. Anthropic accepts
 base64 image sources. Remote URLs and server-side file paths are rejected.
+OpenAI `role=tool` / `role=function` messages may also carry inline image
+blocks. Assistant and system images are rejected.
 Image blocks preserve their order in the request. The limit is 16 images and
 a 64 MiB HTTP body.
 
@@ -110,6 +120,11 @@ workloads, the controls are `--kv-cache-min-tokens`,
 `--kv-cache-cold-max-tokens`, `--kv-cache-continued-interval-tokens`,
 `--kv-cache-boundary-trim-tokens`, and `--kv-cache-boundary-align-tokens`.
 Check `./ds4-server --help` for their defaults.
+
+Continued-save intervals are rounded up to the cold-boundary alignment. The
+cache writes the first valid live checkpoint at or beyond each absolute
+frontier. Restored unaligned checkpoints can therefore leave restart points
+even when fixed-size prefill chunks step over every exact interval boundary.
 
 Quantization variants may share compatible prefixes. Add
 `--kv-cache-reject-different-quant` for same-quant reuse only.

@@ -348,6 +348,119 @@ cleanup:
     ds4_session_free(reference);
 }
 
+static void test_cancel_checkpoint_roundtrip(void) {
+    /* A 512-row ring holds the previous SWA window plus a 256-token prefill
+     * chunk; 607 decode steps then overwrite every prompt-era ring slot.
+     * Start beyond the sparse-index threshold at a non-ratio-aligned frontier.
+     * Restore must recover the indexer/compressor state and raw window. */
+    enum { PROMPT_TOKENS = 4609, STEPS = 607, CONTEXT = 6144 };
+    if (test_model_backend() != DS4_BACKEND_METAL &&
+        test_model_backend() != DS4_BACKEND_CUDA) {
+        fprintf(stderr,
+                "ds4-test: cancellation checkpoint requires a GPU graph backend; skipped\n");
+        return;
+    }
+    ds4_engine *engine = test_get_engine(false);
+    ds4_session *session = NULL;
+    ds4_session *other_session = NULL;
+    ds4_cancel_checkpoint *checkpoint = NULL;
+    ds4_tokens prompt = {0};
+    char err[192] = {0};
+    float *reference_logits = NULL;
+    float *restored_logits = NULL;
+    int reference_tokens[STEPS] = {0};
+    char *saved_raw_cap = NULL;
+    char *saved_prefill_chunk = NULL;
+    bool raw_cap_overridden = false;
+
+    if (!engine) return;
+    if (ds4_engine_is_glm_dsa(engine)) {
+        fprintf(stderr,
+                "ds4-test: cancellation checkpoint requires DeepSeek; skipped\n");
+        return;
+    }
+
+    const int vocab = ds4_engine_vocab_size(engine);
+    TEST_ASSERT(vocab > 0);
+    if (vocab <= 0) return;
+    reference_logits = malloc((size_t)STEPS * (size_t)vocab * sizeof(float));
+    restored_logits = malloc((size_t)vocab * sizeof(float));
+    TEST_ASSERT(reference_logits != NULL && restored_logits != NULL);
+    if (!reference_logits || !restored_logits) goto cleanup;
+
+    saved_raw_cap = test_save_env("DS4_METAL_GRAPH_RAW_CAP");
+    saved_prefill_chunk = test_save_env("DS4_METAL_PREFILL_CHUNK");
+    setenv("DS4_METAL_GRAPH_RAW_CAP", "512", 1);
+    setenv("DS4_METAL_PREFILL_CHUNK", "256", 1);
+    raw_cap_overridden = true;
+    TEST_ASSERT(ds4_session_create(&session, engine, CONTEXT) == 0);
+    if (!session) goto cleanup;
+    ds4_chat_begin(engine, &prompt);
+    ds4_chat_append_message(
+        engine, &prompt, "user",
+        "Count upward in words, one number per line, without commentary.");
+    ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+    TEST_ASSERT(prompt.len > 0);
+    while (prompt.len < PROMPT_TOKENS) {
+        ds4_tokens_push(&prompt, prompt.v[prompt.len - 1]);
+    }
+    int sync_rc = ds4_session_sync(session, &prompt, err, sizeof(err));
+    TEST_ASSERT(sync_rc == 0);
+    if (sync_rc != 0) goto cleanup;
+    const int prompt_pos = ds4_session_pos(session);
+    TEST_ASSERT(prompt_pos == prompt.len);
+    TEST_ASSERT(ds4_session_cancel_checkpoint_capture(
+                    session, &checkpoint, err, sizeof(err)) == 0);
+    TEST_ASSERT(checkpoint != NULL);
+    TEST_ASSERT(ds4_session_cancel_checkpoint_pos(checkpoint) == prompt_pos);
+    if (!checkpoint) goto cleanup;
+    TEST_ASSERT(ds4_session_create(&other_session, engine, CONTEXT) == 0);
+    if (!other_session) goto cleanup;
+    TEST_ASSERT(ds4_session_cancel_checkpoint_restore(
+                    other_session, checkpoint, err, sizeof(err)) != 0);
+    err[0] = '\0';
+
+    for (int step = 0; step < STEPS; step++) {
+        float *expected = reference_logits + (size_t)step * (size_t)vocab;
+        TEST_ASSERT(ds4_session_copy_logits(session, expected, vocab) == vocab);
+        reference_tokens[step] = ds4_session_argmax(session);
+        TEST_ASSERT(reference_tokens[step] >= 0);
+        TEST_ASSERT(ds4_session_eval(session, reference_tokens[step],
+                                     err, sizeof(err)) == 0);
+    }
+    TEST_ASSERT(ds4_session_pos(session) == prompt_pos + STEPS);
+
+    TEST_ASSERT(ds4_session_cancel_checkpoint_restore(
+                    session, checkpoint, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_checkpoint_valid(session));
+    TEST_ASSERT(ds4_session_pos(session) == prompt_pos);
+    for (int step = 0; step < STEPS; step++) {
+        const float *expected =
+            reference_logits + (size_t)step * (size_t)vocab;
+        TEST_ASSERT(ds4_session_copy_logits(session, restored_logits, vocab) ==
+                    vocab);
+        TEST_ASSERT(memcmp(restored_logits, expected,
+                           (size_t)vocab * sizeof(float)) == 0);
+        TEST_ASSERT(ds4_session_argmax(session) == reference_tokens[step]);
+        TEST_ASSERT(ds4_session_eval(session, reference_tokens[step],
+                                     err, sizeof(err)) == 0);
+    }
+    TEST_ASSERT(ds4_session_pos(session) == prompt_pos + STEPS);
+
+cleanup:
+    if (err[0]) fprintf(stderr, "ds4-test: cancellation checkpoint: %s\n", err);
+    ds4_session_cancel_checkpoint_free(checkpoint);
+    ds4_session_free(other_session);
+    ds4_session_free(session);
+    ds4_tokens_free(&prompt);
+    free(restored_logits);
+    free(reference_logits);
+    if (raw_cap_overridden) {
+        test_restore_env("DS4_METAL_GRAPH_RAW_CAP", saved_raw_cap);
+        test_restore_env("DS4_METAL_PREFILL_CHUNK", saved_prefill_chunk);
+    }
+}
+
 static uint64_t test_round_up_u64(uint64_t n, uint64_t align) {
     return (n + align - 1) & ~(align - 1);
 }
@@ -1296,12 +1409,21 @@ static void test_metal_f16_compressor_pair_state_store_exact_case(
                         10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f,
                         1.0e-6f, false, test_decode_pack, false) != 0);
 
+        const bool fused_supported = ds4_gpu_device_is_m3_apple_silicon() ||
+                                      ds4_gpu_device_is_m5_apple_silicon();
         TEST_ASSERT(ds4_gpu_matmul_f16_pair_compressor_store_tensor(
                         fused_kv, fused_score,
                         fused_state_kv, fused_state_score,
                         model_raw, model_bytes, 0, score_weight_offset,
                         ape_offset, ape_type, in_dim, width, x,
-                        ratio, pos) == 1);
+                        ratio, pos) == (fused_supported ? 1 : 0));
+        if (!fused_supported) {
+            /* Exercise the actual M1/M2/M4 fallback, without enabling an
+             * unvalidated hardware-specific production kernel. */
+            TEST_ASSERT(ds4_gpu_matmul_f16_pair_tensor(
+                            fused_kv, fused_score, model_raw, model_bytes,
+                            0, score_weight_offset, in_dim, width, x, 1) != 0);
+        }
         if (test_decode_pack) {
             TEST_ASSERT(unsetenv(decode_pack_disable_env) == 0);
             TEST_ASSERT(unsetenv(exact_reduction_disable_env) == 0);
@@ -1314,7 +1436,7 @@ static void test_metal_f16_compressor_pair_state_store_exact_case(
                         ape_offset, ape_type, norm_offset, 0,
                         head_dim, ratio, pos, 0, 0, 0,
                         10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f,
-                        1.0e-6f, true, test_decode_pack, false) != 0);
+                        1.0e-6f, fused_supported, test_decode_pack, false) != 0);
 
         TEST_ASSERT(ds4_gpu_tensor_read(
                         ref_kv, 0, ref_kv_host, out_bytes) != 0);
@@ -2928,7 +3050,12 @@ static void test_metal_gathered_kv_stage_exact(void) {
                             comp, 1, n_comp, head_dim) != 0);
 
             ds4_gpu_set_quality(false);
-            TEST_ASSERT(setenv(envs[0], "1", 1) == 0);
+            /* Require fusion only on its supported devices. Else compare
+             * the normal fallback too, including every byte and guard. */
+            if (ds4_gpu_device_is_m3_apple_silicon() ||
+                ds4_gpu_device_is_m5_apple_silicon()) {
+                TEST_ASSERT(setenv(envs[0], "1", 1) == 0);
+            }
             TEST_ASSERT(ds4_gpu_flash_kv_stage_f16_tensor(
                             fused, raw, raw_cap, raw_starts[ci], n_raw,
                             comp, 1, n_comp, head_dim) != 0);
@@ -4748,6 +4875,155 @@ static void test_metal_router_weights_batch_exact(void) {
 }
 #endif
 
+#if defined(__APPLE__)
+/*
+ * E4M3FN conversion equivalence.
+ *
+ * The FP8 KV cache requires the Metal conversion and the CPU reference in
+ * ds4.c to agree exactly, and nothing in the tree tested that. Without a test
+ * any rewrite of dsv4_e4m3fn_dequant -- which is currently a 7-step serial
+ * binary search per element on the decode critical path -- is an argument
+ * rather than a proof.
+ *
+ * The oracle below is deliberately NOT a copy of either implementation: it is
+ * a linear scan built straight from the E4M3FN format definition, so it
+ * validates the shipped binary search as well as anything that replaces it.
+ *
+ * Codes 0..126 are the valid magnitudes (code 127 is NaN in the FN variant,
+ * which is why the search bounds stop at 126); code 126 is the 448 maximum.
+ */
+static float test_e4m3fn_code_value(int code) {
+    static const float exp_scale[16] = {
+        0.0f,   0.015625f, 0.03125f, 0.0625f,
+        0.125f, 0.25f,     0.5f,     1.0f,
+        2.0f,   4.0f,      8.0f,     16.0f,
+        32.0f,  64.0f,     128.0f,   256.0f,
+    };
+    const int exp = (code >> 3) & 0x0f;
+    const int mant = code & 0x07;
+    return exp == 0 ? (float)mant * 0.001953125f
+                    : (1.0f + (float)mant * 0.125f) * exp_scale[exp];
+}
+
+/* Nearest representable magnitude, ties to the even code index. */
+static float test_e4m3fn_reference(float x) {
+    const float sign = x < 0.0f ? -1.0f : 1.0f;
+    float ax = fabsf(x);
+    if (ax > 448.0f) ax = 448.0f;
+
+    int best = 0;
+    for (int code = 1; code <= 126; code++) {
+        if (test_e4m3fn_code_value(code) <= ax) best = code;
+    }
+    if (best < 126) {
+        const float best_diff = fabsf(ax - test_e4m3fn_code_value(best));
+        const float next_diff = fabsf(ax - test_e4m3fn_code_value(best + 1));
+        if (next_diff < best_diff ||
+            (next_diff == best_diff && ((best + 1) & 1) == 0 && (best & 1) != 0)) {
+            best++;
+        }
+    }
+    return sign * test_e4m3fn_code_value(best);
+}
+
+static void test_metal_e4m3fn_dequant_exact(void) {
+    float *in = NULL;
+    float *got = NULL;
+    uint32_t n = 0;
+    const uint32_t cap = 64u * 1024u;
+
+    in = (float *)malloc((size_t)cap * sizeof(float));
+    got = (float *)malloc((size_t)cap * sizeof(float));
+    TEST_ASSERT(in != NULL && got != NULL);
+    if (!in || !got) { free(in); free(got); return; }
+
+#define TEST_E4M3_PUSH(v) do { if (n < cap) in[n++] = (float)(v); } while (0)
+
+    /* Every representable magnitude, both signs: each must map to itself. */
+    for (int code = 0; code <= 126; code++) {
+        const float v = test_e4m3fn_code_value(code);
+        TEST_E4M3_PUSH(v);
+        TEST_E4M3_PUSH(-v);
+    }
+
+    /* Midpoints between adjacent magnitudes, and one ULP either side of each.
+     * This is the round-half-to-even path, which a rewrite is most likely to
+     * get wrong and which random sampling essentially never hits. */
+    for (int code = 0; code < 126; code++) {
+        const float a = test_e4m3fn_code_value(code);
+        const float b = test_e4m3fn_code_value(code + 1);
+        const float mid = (a + b) * 0.5f;
+        TEST_E4M3_PUSH(mid);
+        TEST_E4M3_PUSH(-mid);
+        TEST_E4M3_PUSH(nextafterf(mid, 0.0f));
+        TEST_E4M3_PUSH(-nextafterf(mid, 0.0f));
+        TEST_E4M3_PUSH(nextafterf(mid, 1000.0f));
+        TEST_E4M3_PUSH(-nextafterf(mid, 1000.0f));
+    }
+
+    /* Zero, signed zero, and the saturating clamp above the 448 maximum. */
+    TEST_E4M3_PUSH(0.0f);
+    TEST_E4M3_PUSH(-0.0f);
+    TEST_E4M3_PUSH(448.0f);
+    TEST_E4M3_PUSH(-448.0f);
+    TEST_E4M3_PUSH(448.5f);
+    TEST_E4M3_PUSH(-448.5f);
+    TEST_E4M3_PUSH(1.0e9f);
+    TEST_E4M3_PUSH(-1.0e9f);
+
+    /* Subnormal range: below the smallest normal, where the exp == 0 branch
+     * applies and where a half-precision intermediate would flush to zero. */
+    for (int i = 0; i < 64; i++) {
+        TEST_E4M3_PUSH((float)i * 0.0001220703125f);
+        TEST_E4M3_PUSH(-(float)i * 0.0001220703125f);
+    }
+
+    /* Deterministic sweep across the whole range. */
+    uint64_t rng = 0x9E3779B97F4A7C15ull;
+    while (n < cap) {
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        const double u = (double)((rng >> 11) & ((1ull << 53) - 1)) /
+                         (double)(1ull << 53);
+        TEST_E4M3_PUSH((float)((u * 2.0 - 1.0) * 448.0));
+    }
+#undef TEST_E4M3_PUSH
+
+    TEST_ASSERT(ds4_gpu_test_e4m3fn_dequant(in, got, n) != 0);
+
+    uint32_t mismatches = 0;
+    float worst_in = 0.0f, worst_ref = 0.0f, worst_got = 0.0f;
+    for (uint32_t i = 0; i < n; i++) {
+        const float ref = test_e4m3fn_reference(in[i]);
+        uint32_t rb, gb;
+        memcpy(&rb, &ref, sizeof(rb));
+        memcpy(&gb, &got[i], sizeof(gb));
+        /* Bit-exact, treating +0 and -0 as equal (the sign of zero is not
+         * meaningful here and both implementations return +0 for -0). */
+        if (rb != gb && !(ref == 0.0f && got[i] == 0.0f)) {
+            if (mismatches == 0) {
+                worst_in = in[i];
+                worst_ref = ref;
+                worst_got = got[i];
+            }
+            mismatches++;
+        }
+    }
+    if (mismatches != 0) {
+        fprintf(stderr,
+                "ds4-test: E4M3 mismatch %u/%u, first: in=%.9g ref=%.9g got=%.9g\n",
+                mismatches, n, (double)worst_in, (double)worst_ref,
+                (double)worst_got);
+    }
+    TEST_ASSERT(mismatches == 0);
+    fprintf(stderr, "ds4-test: E4M3 dequant exactness: %u inputs, %u mismatches\n",
+            n, mismatches);
+
+    free(in);
+    free(got);
+}
+
+#endif
+
 static void test_metal_kernel_group(void) {
     test_metal_f16_matvec_fast_nr0_4();
     test_metal_f16_prefill_matmul();
@@ -4773,6 +5049,7 @@ static void test_metal_kernel_group(void) {
     test_metal_hc_rms_scale_project_f16_exact();
     test_metal_router_simd_finalize_exact();
     test_metal_router_weights_batch_exact();
+    test_metal_e4m3fn_dequant_exact();
 #endif
 }
 
@@ -6830,6 +7107,7 @@ typedef struct {
 static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_GPU
     {"--session-snapshot", "session-snapshot", "session snapshot and recurrent-state round trip", test_session_snapshot_roundtrip},
+    {"--cancel-checkpoint", "cancel-checkpoint", "request cancellation restores the exact prompt decode frontier", test_cancel_checkpoint_roundtrip},
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
     {"--tool-call-quality", "tool-call-quality", "model tool call and post-result stop regression", test_tool_call_quality},
     {"--think-tool-recovery", "think-tool-recovery", "recover a complete tool call emitted inside unclosed reasoning", test_think_tool_recovery},

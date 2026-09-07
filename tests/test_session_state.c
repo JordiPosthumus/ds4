@@ -46,6 +46,40 @@ static void test_rewind(void) {
     ds4_session_free(s);
 }
 
+static void test_cancel_checkpoint_backend_scope(void) {
+    ds4_engine e = {0};
+    ds4_session *s = calloc(1, sizeof(*s));
+    assert(s);
+    s->engine = &e;
+    ds4_tokens_push(&s->checkpoint, 1);
+    s->checkpoint_valid = true;
+    ds4_cancel_checkpoint *checkpoint = NULL;
+    char err[256];
+    const ds4_backend backends[] = {DS4_BACKEND_METAL, DS4_BACKEND_CUDA};
+    for (size_t i = 0; i < sizeof(backends) / sizeof(*backends); i++) {
+        e.backend = backends[i];
+        assert(ds4_session_cancel_checkpoint_capture(s, &checkpoint,
+                    err, sizeof(err)) != 0 && checkpoint == NULL);
+#ifdef DS4_NO_GPU
+        assert(strstr(err, "not compiled in"));
+#else
+        /* Both local GPU backends pass the scope guard, then fail before
+         * allocation because this synthetic session has no raw cache. */
+        assert(strstr(err, "raw KV cache is unavailable"));
+#endif
+        e.tp.active = true;
+        assert(ds4_session_cancel_checkpoint_capture(s, &checkpoint,
+                    err, sizeof(err)) != 0 && checkpoint == NULL);
+        assert(strstr(err, "require a local graph session"));
+        e.tp.active = false;
+    }
+    e.backend = DS4_BACKEND_CPU;
+    assert(ds4_session_cancel_checkpoint_capture(s, &checkpoint,
+                err, sizeof(err)) != 0 && checkpoint == NULL);
+    assert(strstr(err, "require a local graph session"));
+    ds4_session_free(s);
+}
+
 static void test_session_memory(void) {
     const uint64_t gib = UINT64_C(1) << 30;
     ds4_engine e = { .backend = DS4_BACKEND_METAL,
@@ -343,6 +377,7 @@ static void test_glm_spec_rollback(void) {
 
 int main(void) {
     test_rewind();
+    test_cancel_checkpoint_backend_scope();
     test_session_memory();
     test_payload_tokens();
     test_snapshot_bytes();

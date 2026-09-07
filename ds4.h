@@ -211,6 +211,14 @@ typedef struct {
     uint64_t cap;
 } ds4_session_snapshot;
 
+/* Opaque, request-local Metal rollback state captured after prompt
+ * synchronization. Unlike ds4_session_snapshot this preserves only the
+ * mutable decode frontier, so servers can discard a cancelled generation
+ * without rewinding a different request or copying the full compressed KV
+ * history. The checkpoint remains valid across append-only decode/prefill;
+ * callers must discard it before loading or rebuilding compressed history. */
+typedef struct ds4_cancel_checkpoint ds4_cancel_checkpoint;
+
 typedef struct {
     char *path;
     uint64_t bytes;
@@ -242,6 +250,7 @@ void ds4_engine_close(ds4_engine *e);
 void ds4_engine_summary(ds4_engine *e);
 int ds4_engine_vocab_size(ds4_engine *e);
 uint32_t ds4_engine_prefill_chunk(ds4_engine *e);
+uint32_t ds4_engine_prefill_quantum(ds4_engine *e);
 int ds4_engine_power(ds4_engine *e);
 int ds4_engine_set_power(ds4_engine *e, int power_percent);
 const char *ds4_engine_model_name(ds4_engine *e);
@@ -301,6 +310,14 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
  * KV files with the previously-zero reserved byte remain Flash-compatible;
  * Pro and later shapes must use nonzero ids. */
 int ds4_engine_model_id(ds4_engine *e);
+/* 24-bit fingerprint of the weights actually loaded, from samples of the
+ * GGUF tensor data.  model_id only identifies the model *shape*, so two
+ * GGUFs with different weights (a fine-tune, a requant) share it; the
+ * fingerprint is what tells them apart in the disk KV cache header
+ * (issue #805).  Never returns 0: that value is reserved for headers
+ * written before the fingerprint existed. */
+uint32_t ds4_engine_weights_fp24(ds4_engine *e);
+uint32_t ds4_weights_fp24_of_fd(int fd, uint64_t data_start, uint64_t file_size);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
 bool ds4_engine_is_glm53(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
@@ -428,19 +445,47 @@ int ds4_session_sync_multimodal(ds4_session *s,
                                 size_t image_count,
                                 char *err,
                                 size_t errlen);
+/* Existing live images must retain their token spans and fingerprints.  A
+ * newly appended image is safe only when it begins beyond the live frontier. */
+bool ds4_session_vision_prefix_matches(const ds4_session *s,
+                                       const ds4_vision_span *images,
+                                       size_t image_count);
 /* Return true only when every image that conditioned the live checkpoint has
  * the same token span and embedding fingerprint in the supplied prompt. */
 bool ds4_session_vision_state_matches(const ds4_session *s,
                                       const ds4_vision_span *images,
                                       size_t image_count);
+/* Inspect the exact image identities that condition the live checkpoint. */
+size_t ds4_session_vision_identity_count(const ds4_session *s);
+bool ds4_session_vision_identity(const ds4_session *s, size_t index,
+                                 uint32_t *token_start,
+                                 uint32_t *token_count,
+                                 uint8_t fingerprint[32]);
+/* Attach already-verified request identities after restoring a disk payload.
+ * Every image must end at or before the restored token frontier. */
+bool ds4_session_restore_vision_identities(ds4_session *s,
+                                           const ds4_vision_span *images,
+                                           size_t image_count);
 /* True while a session contains, or is actively syncing, image-conditioned
- * state. Such state must not be written to the text-keyed disk KV cache. */
+ * state. Such state needs an image-identity-aware disk cache key. */
 bool ds4_session_has_vision_state(const ds4_session *s);
+/* Text-keyed disk payloads deliberately contain no image identity.  Once one
+ * replaces a session, discard image metadata left by the slot's prior owner. */
+void ds4_session_clear_text_restore_vision_state(ds4_session *s);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
         char *err, size_t errlen);
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
+bool ds4_session_checkpoint_valid(const ds4_session *s);
+/* Test helpers (ds4-test): allocate a session shell holding only the given
+ * checkpoint tokens, for server-side routing/probe unit tests.  Not usable
+ * for inference; free with ds4_session_free_test_checkpoint(). */
+ds4_session *ds4_session_new_test_checkpoint(const int *tokens, int n);
+ds4_session *ds4_session_new_test_vision_checkpoint(
+        const int *tokens, int n,
+        const ds4_vision_span *images, size_t image_count);
+void ds4_session_free_test_checkpoint(ds4_session *s);
 int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_session_argmax_ignoring_eos(ds4_session *s,
@@ -535,6 +580,14 @@ void ds4_session_invalidate(ds4_session *s);
  * the checkpoint becomes invalid: sync the retained prefix before eval.
  * Callers retaining images must use sync_multimodal for that rebuild. */
 void ds4_session_rewind(ds4_session *s, int pos);
+int ds4_session_cancel_checkpoint_capture(ds4_session *s,
+                                          ds4_cancel_checkpoint **out,
+                                          char *err, size_t errlen);
+int ds4_session_cancel_checkpoint_restore(ds4_session *s,
+                                          const ds4_cancel_checkpoint *checkpoint,
+                                          char *err, size_t errlen);
+int ds4_session_cancel_checkpoint_pos(const ds4_cancel_checkpoint *checkpoint);
+void ds4_session_cancel_checkpoint_free(ds4_cancel_checkpoint *checkpoint);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);

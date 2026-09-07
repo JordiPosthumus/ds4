@@ -459,7 +459,7 @@ static void test_unicode_output_and_footer(void) {
     char queued[181];
     for (int i = 0; i < 60; i++) memcpy(queued + i * 3, "\xe4\xb8\xad", 3);
     queued[180] = 0;
-    agent_prompt_queue_push(&q, xstrdup(queued));
+    agent_prompt_queue_push(&q, queued);
     agent_status st = {0};
     char footer[4096];
     build_footer_text(&st, &q, 40, footer, sizeof(footer));

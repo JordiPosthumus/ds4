@@ -71,7 +71,7 @@ endif
 .PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
-.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
+.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut test-indexer-scorers test-indexer-topk
 .PHONY: test-metal-moe-prefill test-metal-dense-mpp
 
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -83,8 +83,11 @@ help:
 	@echo "  make test         Build and run tests"
 	@echo "  make metal-decode-schedule-bench  Build the balanced Metal decode schedule benchmark"
 	@echo "  make metal-prefill-variant-bench  Build the balanced Metal prefill variant benchmark"
+	@echo "  make test-indexer-scorers  Compare all pre-M5 indexer scorers byte-for-byte"
+	@echo "  make test-indexer-topk  Compare canonical and streaming indexer top-k"
 	@echo "  make check-mxfp4-half-lut  Verify the checked-in MXFP4 half LUT matches the generator"
 	@echo "  make test-mxfp4-metal  Check the MXFP4 half LUT, then run Metal MXFP4 exactness tests"
+	@echo "  make test-argsort-metal  Run the Metal top-k argsort correctness test"
 	@echo "  make dspark-verify-depth  Run DSpark speculative verification smoke if support GGUF is present"
 	@echo "  make mtp-verify-depth  Run legacy MTP speculative verification smoke if MTP GGUF is present"
 	@echo "  make clean        Remove build outputs"
@@ -138,17 +141,51 @@ speed-bench/metal_prefill_variant_bench: speed-bench/metal_prefill_variant_bench
 
 metal-prefill-variant-bench: speed-bench/metal_prefill_variant_bench
 
+tests/test_indexer_scorers.o: tests/test_indexer_tiled4.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_indexer_scorers: tests/test_indexer_scorers.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-indexer-scorers: tests/test_indexer_scorers
+	./tests/test_indexer_scorers
+
+tests/test_topk_ab.o: tests/test_topk_ab.c ds4_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
+
+tests/test_topk_ab: tests/test_topk_ab.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-indexer-topk: tests/test_topk_ab
+	./tests/test_topk_ab
+
 tests/test_mxfp4_metal.o: tests/test_mxfp4_metal.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
 tests/test_mxfp4_metal: tests/test_mxfp4_metal.o ds4_metal.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
+tests/test_mxfp4_small_prefill: tests/test_mxfp4_small_prefill.c ds4_metal.o ds4_image.o ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_mxfp4_small_prefill.c ds4_metal.o ds4_image.o $(METAL_LDLIBS)
+
+.PHONY: test-mxfp4-small-prefill
+test-mxfp4-small-prefill: tests/test_mxfp4_small_prefill
+	./tests/test_mxfp4_small_prefill
+
 check-mxfp4-half-lut:
 	python3 metal/generate_mxfp4_half_lut.py --check
 
 test-mxfp4-metal: check-mxfp4-half-lut tests/test_mxfp4_metal
 	./tests/test_mxfp4_metal
+
+tests/test_argsort_metal.o: tests/test_argsort_metal.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_argsort_metal: tests/test_argsort_metal.o ds4_metal.o ds4_image.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-argsort-metal: tests/test_argsort_metal
+	./tests/test_argsort_metal
 
 tests/test_metal_moe_prefill.o: tests/test_metal_moe_prefill.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
@@ -158,6 +195,16 @@ tests/test_metal_moe_prefill: tests/test_metal_moe_prefill.o $(CORE_OBJS)
 
 test-metal-moe-prefill: tests/test_metal_moe_prefill
 	./tests/test_metal_moe_prefill
+
+tests/test_metal_decode_raw_attention.o: tests/test_metal_decode_raw_attention.c ds4_gpu.h
+	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
+
+tests/test_metal_decode_raw_attention: tests/test_metal_decode_raw_attention.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: test-metal-decode-raw-attention
+test-metal-decode-raw-attention: tests/test_metal_decode_raw_attention
+	./tests/test_metal_decode_raw_attention
 
 tests/test_metal_ssd_experts.o: tests/test_metal_ssd_experts.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
@@ -298,14 +345,47 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_eval_case
 	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o ds4_eval_cases.o ds4_help.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 
-cuda-regression: tests/cuda_long_context_smoke
+cuda-regression: tests/cuda_long_context_smoke tests/test_cuda_q8_mma_bounds tests/test_cuda_q8_prefill
 	./tests/cuda_long_context_smoke
+	./tests/test_cuda_q8_mma_bounds
+	./tests/test_cuda_q8_prefill
 
 tests/test_mxfp4_cuda: tests/test_mxfp4_cuda.cu $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -o $@ $^ $(CUDA_LDLIBS)
 
 test-mxfp4-cuda: tests/test_mxfp4_cuda
 	./tests/test_mxfp4_cuda
+
+tests/test_cuda_visual_attention: tests/test_cuda_visual_attention.cu ds4_cuda.o ds4_image.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -I. -o $@ $^ $(CUDA_LDLIBS)
+
+.PHONY: test-cuda-visual-attention
+test-cuda-visual-attention: tests/test_cuda_visual_attention
+	./tests/test_cuda_visual_attention
+	./tests/test_cuda_visual_attention --fractional
+	./tests/test_cuda_visual_attention --boundaries
+	./tests/test_cuda_visual_attention --memory
+
+tests/test_cuda_indexed_gather: tests/test_cuda_indexed_gather.cu ds4_cuda.o ds4_image.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -I. -o $@ $^ $(CUDA_LDLIBS)
+
+.PHONY: test-cuda-indexed-gather test-cuda-topk-warp check-cuda-topk-warp-source
+test-cuda-indexed-gather: tests/test_cuda_indexed_gather
+	./tests/test_cuda_indexed_gather
+
+check-cuda-topk-warp-source:
+	python3 tests/check_cuda_topk_warp_source.py
+
+tests/cuda_topk_warp/screen: tests/cuda_topk_warp/screen.cu tests/cuda_topk_warp/reference-kernels.cuh tests/cuda_topk_warp/candidate-kernels.cuh ds4_cuda.cu tests/check_cuda_topk_warp_source.py
+	python3 tests/check_cuda_topk_warp_source.py
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -o $@ $<
+
+tests/cuda_topk_warp/screen-structural: tests/cuda_topk_warp/screen-structural.cu tests/cuda_topk_warp/reference-kernels.cuh tests/cuda_topk_warp/candidate-kernels.cuh ds4_cuda.cu tests/check_cuda_topk_warp_source.py
+	python3 tests/check_cuda_topk_warp_source.py
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -o $@ $<
+
+test-cuda-topk-warp: check-cuda-topk-warp-source tests/cuda_topk_warp/screen
+	cd tests/cuda_topk_warp && ./screen
 endif
 
 ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_linux_memory.h
@@ -559,7 +639,19 @@ ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h ds
 ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_unavailable.cu
 
-tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o $(MMQ_OBJS)
+tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/test_cuda_q8_mma_bounds.o: tests/test_cuda_q8_mma_bounds.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_cuda_q8_mma_bounds: tests/test_cuda_q8_mma_bounds.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/test_cuda_q8_prefill.o: tests/test_cuda_q8_prefill.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_cuda_q8_prefill: tests/test_cuda_q8_prefill.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/test_layer_pack.o: tests/test_layer_pack.c ds4_layer_pack.h
@@ -620,19 +712,19 @@ ifneq ($(UNAME_S),Darwin)
 tests/test_gpu_xdev.o: tests/test_gpu_xdev.c ds4_gpu.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_gpu_xdev: tests/test_gpu_xdev.o ds4_cuda.o $(MMQ_OBJS)
+tests/test_gpu_xdev: tests/test_gpu_xdev.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/test_gpu_model_cache.o: tests/test_gpu_model_cache.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_gpu_model_cache: tests/test_gpu_model_cache.o ds4_cuda.o $(MMQ_OBJS)
+tests/test_gpu_model_cache: tests/test_gpu_model_cache.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/test_gpu_lookup_cache_strict.o: tests/test_gpu_lookup_cache_strict.c ds4_gpu.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_gpu_lookup_cache_strict: tests/test_gpu_lookup_cache_strict.o ds4_cuda.o $(MMQ_OBJS)
+tests/test_gpu_lookup_cache_strict: tests/test_gpu_lookup_cache_strict.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 ds4_cuda_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
@@ -647,7 +739,7 @@ tests/test_engine_mgpu_refusal: tests/test_engine_mgpu_refusal.o ds4_gpu_args.o 
 tests/test_engine_mgpu_runtime.o: tests/test_engine_mgpu_runtime.c ds4.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_engine_mgpu_runtime: tests/test_engine_mgpu_runtime.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o $(MMQ_OBJS)
+tests/test_engine_mgpu_runtime: tests/test_engine_mgpu_runtime.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_image.o ds4_layer_pack.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/test_engine_correctness.o: tests/test_engine_correctness.c ds4.h ds4_gpu_mgpu.h
@@ -668,7 +760,7 @@ test-cuda-session-batch: tests/test_cuda_session_batch
 tests/test_cuda_mixed_batch.o: tests/test_cuda_mixed_batch.c ds4.h ds4_gpu_args.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_cuda_mixed_batch: tests/test_cuda_mixed_batch.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o $(MMQ_OBJS)
+tests/test_cuda_mixed_batch: tests/test_cuda_mixed_batch.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_image.o ds4_layer_pack.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 test-cuda-mixed-batch: tests/test_cuda_mixed_batch
@@ -695,8 +787,15 @@ tests/test_prompt_prefix.o: tests/test_prompt_prefix.c ds4_prompt_prefix.h
 tests/test_prompt_prefix: tests/test_prompt_prefix.o ds4_prompt_prefix.o
 	$(CC) $(CFLAGS) -o $@ $^
 
-.PHONY: test-frontends
-test-frontends: ds4_test ds4_agent_test
+.PHONY: test-server-cancel-rebuild
+test-server-cancel-rebuild:
+	python3 tests/test_server_cancel_rebuild.py
+
+.PHONY: test-frontends test-server-speculative-boundary
+test-server-speculative-boundary:
+	python3 tests/test_server_speculative_boundary.py
+
+test-frontends: ds4_test ds4_agent_test test-server-speculative-boundary test-server-cancel-rebuild
 	./ds4_test --server
 	./ds4_agent_test
 
@@ -760,7 +859,10 @@ ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_session_state.o \
 tests/test_session_state_gpu.o: ds4_tool_text.h
 
 clean:
-	rm -f tests/test_metal_ssd_experts
+	rm -f tests/test_cuda_indexed_gather tests/cuda_topk_warp/screen tests/cuda_topk_warp/screen-structural
+	rm -f tests/cuda_topk_warp/reference-selected.u32 tests/cuda_topk_warp/candidate-selected.u32
+	rm -f tests/test_cuda_visual_attention
+	rm -f tests/test_metal_ssd_experts tests/test_metal_decode_raw_attention
 	rm -f tests/test_cuda_q8_scratch
 	rm -f tests/test_cuda_dspark_moe
 	rm -f tests/test_quality_api
@@ -769,4 +871,4 @@ clean:
 	rm -f tests/test_ssd_cache
 	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands
 	rm -f tests/test_metal_tp_spec
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_argsort_metal tests/test_indexer_scorers tests/test_topk_ab tests/test_cuda_q8_mma_bounds tests/test_cuda_q8_prefill
