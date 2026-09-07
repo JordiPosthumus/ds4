@@ -68,6 +68,7 @@ Useful environment overrides:
   DS4_SAVE_INTERVAL (default 16384),
   DS4_COLD_MAX_TOKENS (default 262144; 0 disables cold anchors),
   DS4_LOG_MODE, DS4_TAIL_LOG, DS4_EXTRA_ARGS,
+  DS4_RETAIN_LAUNCH_PLIST (optional new private absolute file),
   DS4_SERVER_MIXED_PREFILL_QUANTUM (default 64),
   DS4_KV_REWIND_REUSE (default 0; enable only for isolation testing),
   DS4_KV_REWIND_MIN_TOKENS (default 256), DS4_PREFILL_TIMING (default 1).
@@ -226,6 +227,21 @@ case "$LOG_MODE" in
     exit 2
     ;;
 esac
+
+# Optional recovery enrollment: retain the exact generated launchd bytes.
+# Validate before stopping anything; a retained definition is never overwritten.
+if [ -n "${DS4_RETAIN_LAUNCH_PLIST:-}" ]; then
+  case "$DS4_RETAIN_LAUNCH_PLIST" in
+    /*) ;;
+    *) echo "DS4_RETAIN_LAUNCH_PLIST must be an absolute path." >&2; exit 2 ;;
+  esac
+  if [ -e "$DS4_RETAIN_LAUNCH_PLIST" ] || [ -L "$DS4_RETAIN_LAUNCH_PLIST" ] ||
+     [ ! -d "$(dirname -- "$DS4_RETAIN_LAUNCH_PLIST")" ] ||
+     [ ! -w "$(dirname -- "$DS4_RETAIN_LAUNCH_PLIST")" ]; then
+    echo "Retained launch definition needs a new file in an existing writable private directory." >&2
+    exit 2
+  fi
+fi
 
 echo "Stopping the previous DS4 service..."
 OLD_SERVER_PID=""
@@ -397,6 +413,9 @@ done
 /usr/bin/plutil -insert ExitTimeOut -integer 120 "$launch_plist"
 /usr/bin/plutil -insert StandardOutPath -string "$LOG_DEST" "$launch_plist"
 /usr/bin/plutil -insert StandardErrorPath -string "$LOG_DEST" "$launch_plist"
+if [ -n "${DS4_RETAIN_LAUNCH_PLIST:-}" ]; then
+  (umask 077; set -o noclobber; cat "$launch_plist" > "$DS4_RETAIN_LAUNCH_PLIST")
+fi
 launchctl bootstrap "gui/$(id -u)" "$launch_plist"
 rm -f "$launch_plist"
 rmdir "$launch_dir"

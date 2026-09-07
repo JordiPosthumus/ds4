@@ -104,3 +104,26 @@ The timestamped backup and live deployment receipt are in
 `local-performance/prefill-attribution-20260906T174237Z/production-install-20260906T203740Z/`.
 The measured evidence is
 [LOSSLESS-SHORT-PREFILL-RESULTS.md](local-performance/prefill-attribution-20260906T174237Z/LOSSLESS-SHORT-PREFILL-RESULTS.md).
+
+## Upstream integration candidate, 2026-09-07
+
+Current upstream `c0a6119` is merged in an isolated shared candidate. This is
+not a deployment record: the M3 retains `f443516`, and the Sparks and M2 retain
+their verified `960e973` installations until an explicit later deployment.
+Validation proceeds on the M2 first, then on one idle Spark reserved through
+DSG. Every machine keeps its per-host settings above and its DSG registration.
+The M2 remains a separate test host outside DSG.
+
+The merge retains local cache provenance, cancellation restoration, scheduler
+ownership, kernel paths and M3 short-prefill dispatch. Upstream's speculative
+rewind/rebuild path supersedes the old narrow GLM-only tail handler; exactly
+one boundary handler restores the retained prefix and verifies checkpoint
+position and image identity. Direct speculation remains unavailable to session-
+batched serving. The existing optional `DS4_RETAIN_LAUNCH_PLIST` preservation
+hook is carried into tracked source without changing its default behavior.
+
+Native/backend, real-model numerical and performance, tool/cancellation,
+capacity and bidirectional cache tests are required before accepting this
+candidate. Passing M2 tests does not establish CUDA correctness, M3-specific
+performance, 262144 capacity, or ten-resident behavior. DSpark activation and
+production rollout are separate decisions.
