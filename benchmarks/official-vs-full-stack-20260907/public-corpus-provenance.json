@@ -1,0 +1,11 @@
+{
+  "upstream": "f62ca29a308724cde5bc99134ede19104b2a3260",
+  "source": "speed-bench/promessi_sposi.txt",
+  "source_sha256": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+  "source_bytes": 1329139,
+  "copies": 2,
+  "between_copies_hex": "",
+  "append": "newline followed by first 65536 bytes of doubled corpus",
+  "corpus_sha256": "443b3169e6b07837484df10b392115f11baa4258232bf91801a025b0967f8807",
+  "corpus_bytes": 2723815
+}

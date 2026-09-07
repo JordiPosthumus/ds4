@@ -1,0 +1,11 @@
+{
+  "time": "2026-09-07T18:02:11.438248+00:00",
+  "passed": true,
+  "result": {
+    "time": "2026-09-07T18:02:10.833943+00:00",
+    "exit": 0,
+    "seconds": 1069.7955669689982
+  },
+  "binary_sha256": "54b0e83988df8665814b73cb9ba736af2f890d80a45c5b5365333d606759fd82",
+  "production_cache_unused": true
+}

@@ -1,0 +1,180 @@
+{
+  "passed": true,
+  "gpu_or_model_executed": false,
+  "source_sha256": "180ffef1b69d378d176a89e28b158f3f2ef84a8fb1e04dca13f7335c0d8499bd",
+  "makefile_sha256": "9eb00f5d6848e4ed75d990d0fb3e5920a32c8f64d514167328fa159b5d558c04",
+  "corpus_sha256": "443b3169e6b07837484df10b392115f11baa4258232bf91801a025b0967f8807",
+  "machine": {
+    "system": "Linux",
+    "release": "6.17.0-1032-nvidia",
+    "version": "#32-Ubuntu SMP PREEMPT_DYNAMIC Wed Aug 19 17:40:46 UTC 2026",
+    "machine": "aarch64",
+    "processor": "aarch64"
+  },
+  "results": [
+    {
+      "label": "stock",
+      "executables": {
+        "ds4": "0d6b245999308f1d7f2f6eaa18da747beea3cfadb6fb5f376d32cf873b6b93ad",
+        "ds4-server": "d03c9cf718a0e957f5cd0aad051e125ca17e5ccac2863f12f31c5e6a94bcec8c",
+        "ds4-bench": "e230ac48d20a87a116e0a10bfba6c1dcc067dfb8b34583a9e677ef05e779a0e3",
+        "stack-bench": "a10d9e67ec9dbbac131c1ad624bcdc9473b3ac990f22a1a51caec09d9f953c20"
+      },
+      "objects": {
+        "cuda/mmq/ds4_ggml_stubs.o": "c44dfb0735c2e4103a38187cdd86cc4d218365eb537406f3a9158e6a7767ad68",
+        "cuda/mmq/ds4_mmq.o": "717a579f43fa9d508b16659286bf14281b918da272557afc3992251bda27256c",
+        "cuda/mmq/ds4_mmq_d2r.o": "c620025e29e0d99cf8fce10767b8a7a7db49c0eaad920b776d68f7f8350b134f",
+        "cuda/mmq/ds4_repack.o": "bc69953cc010dd43ea263be8bf26678182f16636be11f99886ff2eb128bb413c",
+        "cuda/mmq/mmid.o": "ddc3b98b19860d464d2be72e03dd4737a0c32eb802e493971b0c22567849e074",
+        "cuda/mmq/mmvq.o": "68bf8006bdccd8e7c8ba1d23efd5660d65de0b0939ee2a3b7467fecca2f8f0cc",
+        "cuda/mmq/quantize.o": "9b160e217b50df174216fc956644d767249a8be69768a5f8d59994538f95680a",
+        "ds4.o": "4511dd6b9ff57d45e917f726ab47aa8287a727ac738cce41b19a3d3d2ee81550",
+        "ds4_agent.o": "765933943c2c0a3a4f2acfd7fb030186dd0befe7f16c5b28a65e3bd88fbdfbba",
+        "ds4_agent_test.o": "51f7a94ffde46b86cb36419aa8cdf74719763e6684c01cc64016ac35ef62d99b",
+        "ds4_bench.o": "7d992312c209144398a7b6f28e82969ea0e8f0f4a95c4f59904367bb69050b18",
+        "ds4_cli.o": "d098fa00516d380e36d63bfdafc778fc35c11e627a26384b2f4e8aa42f121ae9",
+        "ds4_cuda.o": "53f2ce78b64679b2d6f5c33f4ac8df7992c8f6cfc946d14a6d9f89d9d3de8c29",
+        "ds4_distributed.o": "945dda20df7123a8e5d5fefb3870e3096e655acaa54f6edc120ddb5a5e820268",
+        "ds4_eval.o": "fb4b7e873d4593db2d21fab8a700f5332ce160baa82346a2ae4d58907ca00142",
+        "ds4_eval_cases.o": "8abb979285bb2d1010d483d7e32525a3c5ed33399fda3723081aacd2ba98af0a",
+        "ds4_gpu_args.o": "4994dabc331996d291ff4da33054da3f2589274dfac0e17759b3b456bd8f12f4",
+        "ds4_help.o": "9c6e0a1d00591e637fe1b6364ad24d5269105ca68aaeb73765a0358f66fc6078",
+        "ds4_image.o": "032968d04eb8d1b5d8ed92076a64e25a08db162180be5be010ed08efb5058516",
+        "ds4_kvstore.o": "c871e2024eeb7c9e662642df9d3d020e64b5ff90b43fa6ef6ede825e9d1ca147",
+        "ds4_layer_pack.o": "6499d1294254ace397ade915e4bd885ab275af30f6cb07e4150bfd7bcae44913",
+        "ds4_prompt_prefix.o": "4505f8e5090909f60219f330e475974d76b21dec57c2dd02f1cf072cbf1e85f3",
+        "ds4_server.o": "d44ec0d1f2f4f9c8ed48a084b492a9370db360a233c7c8cda9c77e5b81d2bbfe",
+        "ds4_ssd.o": "cb7acfbdfb0095f4b314f929b6e58e5742f2ae606bc93290bfb1961919e3f834",
+        "ds4_test.o": "bcbd34ac086eee31f958f85e8ad6341e0945e7b17462e3ebfecbc28f569874bd",
+        "ds4_tp.o": "16bf3d81cd1f02b8c76a91baf99a7492c0499e198a4a29b85ef7dc93f55a9e8c",
+        "ds4_web.o": "04f2e28819776b9f79e1549ac5cbdd1191d9184d5fa11fe75a9834c084b16c45",
+        "linenoise.o": "e1bef3127e61fb5f269d802a9faeca1372f4a93395a149b9d8e429c182e2b304",
+        "rax.o": "89f16db652bef033d509a796abfa4309b962e5869dcc19675c84ba0eb6faa472",
+        "stack-bench.o": "72e9b3152e2c71d38e674c2532c11fdace5f6efc2868e407ff9e47178bbbd085"
+      },
+      "commands": [
+        {
+          "command": [
+            "make",
+            "-j2",
+            "CUDA_ARCH=sm_121a",
+            "ds4",
+            "ds4-server",
+            "ds4-bench",
+            "ds4-eval",
+            "ds4-agent"
+          ],
+          "exit": 0,
+          "seconds": 109.14854904302047
+        },
+        {
+          "command": [
+            "make",
+            "-j2",
+            "CUDA_ARCH=sm_121a",
+            "-f",
+            "Makefile",
+            "-f",
+            "/benchmark/benchmark.mk",
+            "STACK_BENCH_SOURCE=/benchmark/stack_bench.c",
+            "stack-bench"
+          ],
+          "exit": 0,
+          "seconds": 0.3586981979897246
+        },
+        {
+          "command": [
+            "make",
+            "-j2",
+            "CUDA_ARCH=sm_121a",
+            "test-frontends"
+          ],
+          "exit": 0,
+          "seconds": 10.308080540009541
+        }
+      ]
+    },
+    {
+      "label": "full",
+      "executables": {
+        "ds4": "349e2efd11c1bcd54e871a1456093718ccdbcb0aa473450a1b9dd93725915038",
+        "ds4-server": "54e01d06f09a62d60034e7ce33bc052a186567d8e3ae6306d4fbd45c141ec373",
+        "ds4-bench": "c6d19814c9ee4f06e02055ed82410ae8e56a422d0b705de30235651d4342c77c",
+        "stack-bench": "54b0e83988df8665814b73cb9ba736af2f890d80a45c5b5365333d606759fd82"
+      },
+      "objects": {
+        "cuda/mmq/ds4_ggml_stubs.o": "7f09874a0cf0b2672390b5f52c4c607fa71777984b23d4cfb7ae63d93e41ff51",
+        "cuda/mmq/ds4_mmq.o": "d6ccf917d54436939252eada98fec17f42b41dfb41c00749b7f7d6f3e6d5923c",
+        "cuda/mmq/ds4_mmq_d2r.o": "721f9caeed299925e974f38c862f22a3774916a213b2f3c12285874d6814f25a",
+        "cuda/mmq/ds4_repack.o": "6ed864ed03f8b8eee9493dbb561da8ce4abd019bf0a3a65fbbfc8e5784aa783e",
+        "cuda/mmq/mmid.o": "8f10c4edb832b0719df9ad1329dbd50aaf27f1a1c32c99c61f05f1dacfd21345",
+        "cuda/mmq/mmvq.o": "b38f1be06b330b567cbb619098e164064863d4cfa723bd61397368389a984d08",
+        "cuda/mmq/quantize.o": "97df3c5dfbba5d2d07f31a392f0cbb8063cd8bd991d691e3e2376acdeab26221",
+        "ds4.o": "7b1015e84a62761f9db09399a92daffeb1a5d8780326072f0cc9978fbda45358",
+        "ds4_agent.o": "457ccc3ad2bafd5f101578393876d7b0c5035a7c7d04e5e02908f6b5cae1dad6",
+        "ds4_agent_test.o": "70068e4b6ea9c9a6c78b2c195a4cc4ad60496e299bd57a70ba47775f61bd886b",
+        "ds4_bench.o": "50e81cdcfeb56cd76b9bedcd63c0de863a9c68459a03ab10e4ec546d14e6c046",
+        "ds4_cli.o": "6cb330bd05cf60b9977a7c922efe77cb386f114ce79b2c1eed668e658e586758",
+        "ds4_cuda.o": "07ec976e77329689ae1e05d8235956b9cb5fd3f51b18ec15e4275eef948a5ded",
+        "ds4_distributed.o": "cb8040c4bf76aee3a56607bc2f17c745a2741aa32e963280d962c6fe70adbb3c",
+        "ds4_eval.o": "6ba6a3248ec434ebd9b5c64f18db03d6c579b47cb650b1367c7eef3e05728f89",
+        "ds4_eval_cases.o": "8959fd2cc5aa6d387f8ea2af87b448618d5417d120b70874dfa3eb2da24349c6",
+        "ds4_gpu_args.o": "47aa0d96b102efd854cbc059e42dd648f67211794c58aeea4f9ff02816a79442",
+        "ds4_help.o": "f8572952afd92e3128094e12cb3a9f230fd4b693646f4878b1c80418dbb59e58",
+        "ds4_image.o": "5396db719b1390ffa733db9d1d9ec9f76b03270edc960483329eeddcbabbbd05",
+        "ds4_kvstore.o": "20931ecd683727912f5f0c72af1615222921ab2cba7575ead367fd53cca8c831",
+        "ds4_layer_pack.o": "42aae3c3dbb1a33b03aab9d5ad28ca2d8c950a859f645d56b4578ab89c5afdca",
+        "ds4_prompt_prefix.o": "95a6e93e33b57db96be9f196e40b25d3050bc9cd682abe1fc4bb2c1c5d2328c0",
+        "ds4_server.o": "347cd58c698dad68695a06ca1d8eabec31aca2a72da46927e3415f5544d7c5fc",
+        "ds4_ssd.o": "45f9712ba3e416d3c1f4ebc634653df8cf3d250215a8c523e45de191285e1211",
+        "ds4_test.o": "3cf4b8caa8a0196664019e34e107704b46b37cc5eec472817cecebc4f5f0478a",
+        "ds4_tp.o": "37ae5c59fe742267560ca51b143554e29056e60fe42e202116b3430b1f097500",
+        "ds4_web.o": "117556408801256ab2af120fbf260ff81566ac67a8329239fef63185f39bd1c7",
+        "linenoise.o": "1a903ef7721f215fd20a1a7dc600d13442121811467281870e3743adba0e8941",
+        "rax.o": "5e1427365b20a2bd054565822086d03e52efbc547ef36646e0097fdac0b773db",
+        "stack-bench.o": "5defff93856bd0be241924a1bebfd575811a36a73d0933e0a3e428c4b0e1463d"
+      },
+      "commands": [
+        {
+          "command": [
+            "make",
+            "-j2",
+            "CUDA_ARCH=sm_121a",
+            "ds4",
+            "ds4-server",
+            "ds4-bench",
+            "ds4-eval",
+            "ds4-agent"
+          ],
+          "exit": 0,
+          "seconds": 109.59966506902128
+        },
+        {
+          "command": [
+            "make",
+            "-j2",
+            "CUDA_ARCH=sm_121a",
+            "-f",
+            "Makefile",
+            "-f",
+            "/benchmark/benchmark.mk",
+            "STACK_BENCH_SOURCE=/benchmark/stack_bench.c",
+            "stack-bench"
+          ],
+          "exit": 0,
+          "seconds": 0.386960142001044
+        },
+        {
+          "command": [
+            "make",
+            "-j2",
+            "CUDA_ARCH=sm_121a",
+            "test-frontends"
+          ],
+          "exit": 0,
+          "seconds": 11.245868992991745
+        }
+      ]
+    }
+  ]
+}

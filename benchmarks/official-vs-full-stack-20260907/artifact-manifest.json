@@ -1,0 +1,178 @@
+{
+  "PR-ASSESSMENT.md": {
+    "bytes": 4915,
+    "sha256": "0a4412229d4e704427e05b09e4bcdba5365a4a6c670a9fee1ac029e45830d73a"
+  },
+  "README.md": {
+    "bytes": 8726,
+    "sha256": "25cf5d7db17191a6d95ec9bb52021eb179122f1532f4396bf2775d72c2f8568c"
+  },
+  "REPRODUCE.md": {
+    "bytes": 5550,
+    "sha256": "b18ee11e4679e73a3b45b584e333c60bf8465b3e50dba612842071baf95fb8bb"
+  },
+  "STACK-MANIFEST.md": {
+    "bytes": 5991,
+    "sha256": "265c27fd370840337bceeb917383569f3b540e05859b0cdb8abcec0544e2fd94"
+  },
+  "analyze_benchmark.py": {
+    "bytes": 7484,
+    "sha256": "1e4c2da54f0c87947457bf95ac2f073ffbd753e278f2a586cbae29692158aa9d"
+  },
+  "analyze_timing_csvs.py": {
+    "bytes": 789,
+    "sha256": "c0f9abba2b0caede318335af74673dd7466a4667d438cd6b9b45fed0936dd00a"
+  },
+  "benchmark.mk": {
+    "bytes": 394,
+    "sha256": "9eb00f5d6848e4ed75d990d0fb3e5920a32c8f64d514167328fa159b5d558c04"
+  },
+  "build_native.py": {
+    "bytes": 2927,
+    "sha256": "e6750e57a2e041e2c64ddf013a3c1bc47a613cfaf427ae24f33f53ece9235d65"
+  },
+  "full-source-manifest.json": {
+    "bytes": 312236,
+    "sha256": "4ec303795f2604e447f4a40cc9abb99e247b363c849aca9370c977f6be5597bb"
+  },
+  "m3-analysis.json": {
+    "bytes": 105878,
+    "sha256": "3cd714d796272353716b0ac98bfd9149cd571fc68831bd947ba0b327c13caf47"
+  },
+  "numerical-summary.json": {
+    "bytes": 495,
+    "sha256": "13d231d85d0af1d5fa79cca40b005b3bcd924eb102e4514e0b0e34ee9b4bcb52"
+  },
+  "public-corpus-provenance.json": {
+    "bytes": 448,
+    "sha256": "630d2533599dd315c33f210d11cb64b8dcac5e9f5c940a080a86d82d6bc40f62"
+  },
+  "raw/m3/0-stock/captured-files.json": {
+    "bytes": 10977,
+    "sha256": "edfdff5f4697ad4058f48dde3615209a59157309492eef1806ff0f4c0b7dfde3"
+  },
+  "raw/m3/0-stock/complete.json": {
+    "bytes": 304,
+    "sha256": "f38cdfe867498b36d5a30af4ae759f149a9182150d74558c18b92558cb607c38"
+  },
+  "raw/m3/0-stock/decode.csv": {
+    "bytes": 3233,
+    "sha256": "849e81894803a2bffe24ba9de4b32e6331c5e62722bf1d2aa9fcc4fe75da977d"
+  },
+  "raw/m3/0-stock/prefill.csv": {
+    "bytes": 291,
+    "sha256": "e1fe954a0be42bd512a7d81b60b6ba7aa7ab807517dd03ad728ca3b746a69f89"
+  },
+  "raw/m3/0-stock/suffix.csv": {
+    "bytes": 2228,
+    "sha256": "1275ebdc9f0ce1294013f9c97d99249bb7bf1c6db3dcf25995cc5762723d2a06"
+  },
+  "raw/m3/0-stock.log": {
+    "bytes": 7600,
+    "sha256": "f7015d7e0787487ef61cffdbe51f0707e0b5cca3229c120456e52619dc0a90c6"
+  },
+  "raw/m3/1-full/captured-files.json": {
+    "bytes": 10977,
+    "sha256": "3a478d6f5a805b29f9615f6ab0adbbdc97a7cc652affb8b8eb42eaf9d67ec46f"
+  },
+  "raw/m3/1-full/complete.json": {
+    "bytes": 304,
+    "sha256": "5a81641bc5ac9a091a12f08af77cfd87822343d1666f38e18a344907e12a6c9e"
+  },
+  "raw/m3/1-full/decode.csv": {
+    "bytes": 3233,
+    "sha256": "d96358e607f295835e051ae4fe91e1a7c627d31dc2a61c3cfc4f0edb94056185"
+  },
+  "raw/m3/1-full/prefill.csv": {
+    "bytes": 291,
+    "sha256": "0914044ddffeba6845b5a26859af984d87ed3b3f565679d49e898f8495d0c686"
+  },
+  "raw/m3/1-full/suffix.csv": {
+    "bytes": 2228,
+    "sha256": "b2e230839b3099e8121953384332dc10766645eccca3b8374418ce2893eacb32"
+  },
+  "raw/m3/1-full.log": {
+    "bytes": 7715,
+    "sha256": "4d326d3752dd8e572d7cfb4eb6d441b8b2cb3422059559eebe94eced5d21f8ec"
+  },
+  "raw/m3/native-builds.json": {
+    "bytes": 7336,
+    "sha256": "c37354d4ea2530853f22aec8c6ce87e5e94d7b02a6a3f8d9faadcafafece047a"
+  },
+  "raw/spark/0-stock/captured-files.json": {
+    "bytes": 3289,
+    "sha256": "65da908f35263c72654a72d244a2b259eb830ed7199d0b266ced2ff137df1eee"
+  },
+  "raw/spark/0-stock/complete.json": {
+    "bytes": 304,
+    "sha256": "565774003c0e38704664c8b1e5f8047ae29d33b7482387050eeb8d95128c25be"
+  },
+  "raw/spark/0-stock/decode.csv": {
+    "bytes": 3257,
+    "sha256": "ba8be2be5f642cf156e3dfd038b74d5bf36523f95bd1d4051ce6803062208a09"
+  },
+  "raw/spark/0-stock/prefill.csv": {
+    "bytes": 290,
+    "sha256": "786e2fa6ae9c0aac3b977daefc0da9e908bc73a604a1952a292adc8ab0a0e6b1"
+  },
+  "raw/spark/0-stock/suffix.csv": {
+    "bytes": 2222,
+    "sha256": "067b36b361a315ad61c8196c049d446429ef3f83cf0140da07c23128f7813628"
+  },
+  "raw/spark/0-stock.log": {
+    "bytes": 8185,
+    "sha256": "8ec00affe146c1a7888d212af7e27a6b52dc871730e27fa7d99478ec7595c111"
+  },
+  "raw/spark/1-full/captured-files.json": {
+    "bytes": 3289,
+    "sha256": "b19153dbd28e25251d59abc4d2867198aab210d40ae3b7ac112952b2204314d3"
+  },
+  "raw/spark/1-full/complete.json": {
+    "bytes": 304,
+    "sha256": "16afd1783073246cc88f2d131eada3a342b42de60df3ea78dddf6c4b6abd9ad2"
+  },
+  "raw/spark/1-full/decode.csv": {
+    "bytes": 3235,
+    "sha256": "98ffc395fb930914f83d55f60babd6d853b3ba243a9b0c11ecb8f80e1d6d5f16"
+  },
+  "raw/spark/1-full/prefill.csv": {
+    "bytes": 290,
+    "sha256": "59b7715cb656262506ed155fb5ee52c09eb4279896a8ca3bc41e5dc73ae01b0a"
+  },
+  "raw/spark/1-full/suffix.csv": {
+    "bytes": 2222,
+    "sha256": "fcdff7592e0a72b5f1e5c6f9a1e2b32ad03875ed5da080ba29f15c52aa9d4c10"
+  },
+  "raw/spark/1-full.log": {
+    "bytes": 8310,
+    "sha256": "b8e24029986c592a0ed8aaa567a6cbe1be2c43f50987b6e7e875b46c12035265"
+  },
+  "raw/spark/native-builds.json": {
+    "bytes": 8898,
+    "sha256": "4f69ce8f18ac5b434a5310fb03f368081942e483539d6a33b6e5a8ad823fb20f"
+  },
+  "report-inputs.json": {
+    "bytes": 157,
+    "sha256": "bfeea1580e6a16f9f43f2a1a02627d83f69def6079efb37494e165698d313a2f"
+  },
+  "source-pins.json": {
+    "bytes": 120,
+    "sha256": "9f3dac67019dfbc48bb8d5f07a0462e8adfeb7773c4e6dacb3ecd7ecbc232fe5"
+  },
+  "spark-analysis.json": {
+    "bytes": 86844,
+    "sha256": "807f7e14ab148b4d961bd17812f2f9b5e890301778b0651f6cbd105a956ca71d"
+  },
+  "stack_bench.c": {
+    "bytes": 10951,
+    "sha256": "180ffef1b69d378d176a89e28b158f3f2ef84a8fb1e04dca13f7335c0d8499bd"
+  },
+  "stock-source-manifest.json": {
+    "bytes": 310514,
+    "sha256": "1c775ba11da77263c405e7b27e7940f1ffe32a229d357b7c668f7719ce46ee0a"
+  },
+  "toolchains.json": {
+    "bytes": 1045,
+    "sha256": "e473e51ca6a186f62c7de2b1fa8360fe5cad16f150f83c7a0a19d575fa5344f7"
+  }
+}

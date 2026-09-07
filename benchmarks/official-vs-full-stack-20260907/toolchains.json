@@ -1,0 +1,18 @@
+{
+  "m3": {
+    "cpu": "Apple M3 Ultra\n",
+    "memory_bytes": "549755813888\n",
+    "os": "ProductName:\t\tmacOS\nProductVersion:\t\t27.0\nBuildVersion:\t\t26A5421a\n",
+    "compiler": "Apple clang version 21.0.0 (clang-2100.3.33.1)\nTarget: arm64-apple-darwin27.0.0\nThread model: posix"
+  },
+  "spark": {
+    "gcc": "gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0\nCopyright (C) 2023 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.",
+    "nvcc": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2025 NVIDIA Corporation\nBuilt on Wed_Aug_20_01:57:39_PM_PDT_2025\nCuda compilation tools, release 13.0, V13.0.88\nBuild cuda_13.0.r13.0/compiler.36424714_0",
+    "gpu": [
+      "name, driver_version, memory.total [MiB], memory.used [MiB], temperature.gpu, power.draw [W]",
+      "NVIDIA GB10, 580.173.02, [N/A], [N/A], 52, 24.62 W"
+    ],
+    "architecture": "aarch64",
+    "cuda_arch": "sm_121a"
+  }
+}

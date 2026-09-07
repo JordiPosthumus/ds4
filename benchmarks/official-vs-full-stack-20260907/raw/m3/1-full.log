@@ -1,0 +1,124 @@
+ds4: warming mapped tensor pages: 145.26 GiB
+ds4: warmed tensor pages in 10.449s (checksum=1145032524)
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 3.633 ms, residency requested in 1242.983 ms, warmup 8.342 ms (mapped 148745.67 MiB from offset 5.09 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+ds4: Metal model views created in 0.075 ms, residency requested in 1205.096 ms, warmup 1.279 ms (mapped 889.64 MiB from offset 0.02 MiB)
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 2.36 GiB (raw 0.36 + compressed 2.01) + buffers 2.00 GiB + resident model 145.26 GiB = 149.63 GiB planned
+ds4: memory detail: ctx=262144 prefill_cap=4096 raw_kv_rows=4352 compressed_kv_rows=65538 backend=metal
+ds4: shared session prefill workspace enabled: cap=4096, 4.20 GiB total GPU memory; each additional session aliases this allocation
+STARTUP seconds=14.840015 context=262144 residents=10 active=1 prefill=4096 warm_weights=1
+ds4: metal indexer prefill scorer using tiled5 (K-register-resident TM=16)
+ds4: metal indexer topk using stream512
+RESIDENT index=1 capacity=262144 occupied=32768
+RESIDENT index=2 capacity=262144 occupied=2048
+RESIDENT index=3 capacity=262144 occupied=2048
+RESIDENT index=4 capacity=262144 occupied=2048
+RESIDENT index=5 capacity=262144 occupied=2048
+RESIDENT index=6 capacity=262144 occupied=2048
+RESIDENT index=7 capacity=262144 occupied=2048
+RESIDENT index=8 capacity=262144 occupied=2048
+RESIDENT index=9 capacity=262144 occupied=2048
+SWEEP context=32 new_tokens=32 tps=87.2070
+DECODE context=32 trial=-2 warmup=1 tps=43.1978 first_ms=22.354
+DECODE context=32 trial=-1 warmup=1 tps=43.5928 first_ms=22.647
+DECODE context=32 trial=0 warmup=0 tps=43.9861 first_ms=22.326
+DECODE context=32 trial=1 warmup=0 tps=43.8862 first_ms=22.466
+DECODE context=32 trial=2 warmup=0 tps=43.1043 first_ms=22.357
+DECODE context=32 trial=3 warmup=0 tps=43.0918 first_ms=22.581
+SUFFIX context=32 trial=-2 warmup=1 tps=271.8222
+SUFFIX context=32 trial=-1 warmup=1 tps=272.8536
+SUFFIX context=32 trial=0 warmup=0 tps=275.7414
+SUFFIX context=32 trial=1 warmup=0 tps=274.2297
+SUFFIX context=32 trial=2 warmup=0 tps=274.9566
+SUFFIX context=32 trial=3 warmup=0 tps=273.4961
+PASS frontier=32 internal replay; all measured operations reached their expected position
+SWEEP context=512 new_tokens=480 tps=457.0397
+DECODE context=512 trial=-2 warmup=1 tps=43.2668 first_ms=22.529
+DECODE context=512 trial=-1 warmup=1 tps=43.0467 first_ms=22.808
+DECODE context=512 trial=0 warmup=0 tps=43.0070 first_ms=23.151
+DECODE context=512 trial=1 warmup=0 tps=43.0334 first_ms=24.505
+DECODE context=512 trial=2 warmup=0 tps=42.9513 first_ms=23.364
+DECODE context=512 trial=3 warmup=0 tps=43.0216 first_ms=23.750
+SUFFIX context=512 trial=-2 warmup=1 tps=269.7173
+SUFFIX context=512 trial=-1 warmup=1 tps=271.3860
+SUFFIX context=512 trial=0 warmup=0 tps=269.3263
+SUFFIX context=512 trial=1 warmup=0 tps=270.9172
+SUFFIX context=512 trial=2 warmup=0 tps=270.5319
+SUFFIX context=512 trial=3 warmup=0 tps=271.7334
+PASS frontier=512 internal replay; all measured operations reached their expected position
+SWEEP context=2048 new_tokens=1536 tps=581.4931
+DECODE context=2048 trial=-2 warmup=1 tps=42.4042 first_ms=22.947
+DECODE context=2048 trial=-1 warmup=1 tps=42.3402 first_ms=24.394
+DECODE context=2048 trial=0 warmup=0 tps=42.3416 first_ms=24.063
+DECODE context=2048 trial=1 warmup=0 tps=42.2857 first_ms=24.117
+DECODE context=2048 trial=2 warmup=0 tps=42.3165 first_ms=24.595
+DECODE context=2048 trial=3 warmup=0 tps=42.3636 first_ms=23.082
+SUFFIX context=2048 trial=-2 warmup=1 tps=250.5986
+SUFFIX context=2048 trial=-1 warmup=1 tps=250.3271
+SUFFIX context=2048 trial=0 warmup=0 tps=250.9730
+SUFFIX context=2048 trial=1 warmup=0 tps=250.6182
+SUFFIX context=2048 trial=2 warmup=0 tps=250.8746
+SUFFIX context=2048 trial=3 warmup=0 tps=249.4869
+PASS frontier=2048 internal replay; all measured operations reached their expected position
+SWEEP context=8192 new_tokens=6144 tps=559.9847
+DECODE context=8192 trial=-2 warmup=1 tps=37.3827 first_ms=25.477
+DECODE context=8192 trial=-1 warmup=1 tps=37.2995 first_ms=26.522
+DECODE context=8192 trial=0 warmup=0 tps=37.4530 first_ms=26.276
+DECODE context=8192 trial=1 warmup=0 tps=37.1595 first_ms=26.534
+DECODE context=8192 trial=2 warmup=0 tps=37.1746 first_ms=26.473
+DECODE context=8192 trial=3 warmup=0 tps=37.4779 first_ms=25.683
+SUFFIX context=8192 trial=-2 warmup=1 tps=241.2404
+SUFFIX context=8192 trial=-1 warmup=1 tps=241.9614
+SUFFIX context=8192 trial=0 warmup=0 tps=241.8096
+SUFFIX context=8192 trial=1 warmup=0 tps=241.7297
+SUFFIX context=8192 trial=2 warmup=0 tps=241.8115
+SUFFIX context=8192 trial=3 warmup=0 tps=240.9779
+PASS frontier=8192 internal replay; all measured operations reached their expected position
+SWEEP context=32768 new_tokens=24576 tps=543.8380
+DECODE context=32768 trial=-2 warmup=1 tps=37.4343 first_ms=26.925
+DECODE context=32768 trial=-1 warmup=1 tps=37.4016 first_ms=27.289
+DECODE context=32768 trial=0 warmup=0 tps=37.5836 first_ms=27.175
+DECODE context=32768 trial=1 warmup=0 tps=37.6211 first_ms=27.123
+DECODE context=32768 trial=2 warmup=0 tps=37.6002 first_ms=27.076
+DECODE context=32768 trial=3 warmup=0 tps=37.5855 first_ms=27.354
+SUFFIX context=32768 trial=-2 warmup=1 tps=234.1590
+SUFFIX context=32768 trial=-1 warmup=1 tps=233.9622
+SUFFIX context=32768 trial=0 warmup=0 tps=233.7985
+SUFFIX context=32768 trial=1 warmup=0 tps=233.9310
+SUFFIX context=32768 trial=2 warmup=0 tps=233.5498
+SUFFIX context=32768 trial=3 warmup=0 tps=233.6295
+PASS frontier=32768 internal replay; all measured operations reached their expected position
+SWEEP context=131072 new_tokens=98304 tps=441.1377
+DECODE context=131072 trial=-2 warmup=1 tps=31.9499 first_ms=31.665
+DECODE context=131072 trial=-1 warmup=1 tps=31.8873 first_ms=33.006
+DECODE context=131072 trial=0 warmup=0 tps=31.9214 first_ms=31.868
+DECODE context=131072 trial=1 warmup=0 tps=31.8627 first_ms=31.874
+DECODE context=131072 trial=2 warmup=0 tps=31.8922 first_ms=35.833
+DECODE context=131072 trial=3 warmup=0 tps=31.8891 first_ms=31.757
+SUFFIX context=131072 trial=-2 warmup=1 tps=201.3674
+SUFFIX context=131072 trial=-1 warmup=1 tps=200.7365
+SUFFIX context=131072 trial=0 warmup=0 tps=201.3547
+SUFFIX context=131072 trial=1 warmup=0 tps=201.4257
+SUFFIX context=131072 trial=2 warmup=0 tps=201.2607
+SUFFIX context=131072 trial=3 warmup=0 tps=201.1766
+PASS frontier=131072 internal replay; all measured operations reached their expected position
+SWEEP context=262016 new_tokens=130944 tps=306.9338
+DECODE context=262016 trial=-2 warmup=1 tps=25.9741 first_ms=39.591
+DECODE context=262016 trial=-1 warmup=1 tps=25.5811 first_ms=38.023
+DECODE context=262016 trial=0 warmup=0 tps=25.7288 first_ms=38.643
+DECODE context=262016 trial=1 warmup=0 tps=25.5089 first_ms=38.663
+DECODE context=262016 trial=2 warmup=0 tps=25.9606 first_ms=38.686
+DECODE context=262016 trial=3 warmup=0 tps=25.6616 first_ms=38.656
+SUFFIX context=262016 trial=-2 warmup=1 tps=143.8202
+SUFFIX context=262016 trial=-1 warmup=1 tps=144.6942
+SUFFIX context=262016 trial=0 warmup=0 tps=144.3571
+SUFFIX context=262016 trial=1 warmup=0 tps=143.7427
+SUFFIX context=262016 trial=2 warmup=0 tps=144.3333
+SUFFIX context=262016 trial=3 warmup=0 tps=144.5149
+PASS frontier=262016 internal replay; all measured operations reached their expected position
+PASS complete full-capacity stock/stack benchmark; production disk KV unused

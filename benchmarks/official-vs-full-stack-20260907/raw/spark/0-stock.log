@@ -1,0 +1,127 @@
+ds4: Linux cuda backend set oom_score_adj=1000
+ds4: warming mapped tensor pages: 80.76 GiB
+ds4: warmed tensor pages in 74.880s (checksum=2599568558)
+ds4: CUDA backend initialized on NVIDIA GB10 (sm_121) dev=0
+ds4: direct I/O enabled for /benchmark-models/DeepSeek-V4-Flash-Vision-Exp-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8.gguf align=4096
+ds4: direct I/O enabled for /benchmark-models/DeepSeek-V4-Flash-Vision-Exp-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8.gguf align=4096
+ds4: q2k aligned repack base: 43 tensors 28.22 GiB in 4.9s (threads=6)
+ds4: direct I/O enabled for /benchmark-models/DeepSeek-V4-Flash-Vision-Exp-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8.gguf align=4096
+ds4: iq2 aligned repack base: 86 tensors 44.34 GiB in 47.4s (threads=6)
+ds4: direct I/O enabled for /benchmark-models/DeepSeek-V4-Flash-Vision-Exp-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8.gguf align=4096
+ds4: q8 aligned repack base: 345 tensors 6.15 GiB in 6.9s (threads=6)
+ds4: built 474 aligned CUDA artifacts (78.71 GiB) in 59.2s; expert raw residency replaced
+ds4: CUDA aligned artifacts replace expert residency; leaving the 80.76 GiB model mmap unpinned
+ds4: CUDA preparing model tensor mappings
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA q8 fp16 cache budget exhausted; using q8 kernels (request=4.00 MiB cached=0.00 GiB free=1.22 GiB reserve=4.00 GiB total=121.69 GiB)
+ds4: CUDA startup model preparation covered 8.20 GiB of tensor spans in 9.336s
+ds4: CUDA directly mapped 0.87 GiB auxiliary model
+ds4: cuda backend initialized for graph diagnostics
+ds4: memory: KV 3.55 GiB (raw 0.19 + compressed 3.36) + buffers 1.00 GiB + resident model 80.76 GiB = 85.31 GiB planned
+ds4: memory detail: ctx=262144 prefill_cap=2048 raw_kv_rows=2304 compressed_kv_rows=65538 backend=cuda
+ds4: shared session prefill workspace enabled: cap=2048, 1.97 GiB total GPU memory; each additional session aliases this allocation
+STARTUP seconds=154.601997 context=262144 residents=2 active=1 prefill=2048 warm_weights=1
+ds4: dense Q8 prefill using aligned D2R
+ds4: moe gateup y-indirect q8 staging engage (flat-pool p5b, first n_tokens=2048 n_assign=12288)
+ds4: routed MoE using fused-direct CUDA prefill
+ds4: routed MoE using aligned CUDA artifacts
+RESIDENT index=1 capacity=262144 occupied=32768
+SWEEP context=32 new_tokens=32 tps=36.5174
+DECODE context=32 trial=-2 warmup=1 tps=19.1421 first_ms=53.200
+DECODE context=32 trial=-1 warmup=1 tps=19.1344 first_ms=51.735
+DECODE context=32 trial=0 warmup=0 tps=19.1409 first_ms=51.711
+DECODE context=32 trial=1 warmup=0 tps=19.1540 first_ms=51.743
+DECODE context=32 trial=2 warmup=0 tps=19.1281 first_ms=51.756
+DECODE context=32 trial=3 warmup=0 tps=19.1471 first_ms=51.696
+SUFFIX context=32 trial=-2 warmup=1 tps=188.5024
+SUFFIX context=32 trial=-1 warmup=1 tps=188.7270
+SUFFIX context=32 trial=0 warmup=0 tps=189.3218
+SUFFIX context=32 trial=1 warmup=0 tps=190.7362
+SUFFIX context=32 trial=2 warmup=0 tps=188.2345
+SUFFIX context=32 trial=3 warmup=0 tps=189.5862
+PASS frontier=32 internal replay; all measured operations reached their expected position
+SWEEP context=512 new_tokens=480 tps=435.9589
+DECODE context=512 trial=-2 warmup=1 tps=18.9855 first_ms=53.828
+DECODE context=512 trial=-1 warmup=1 tps=18.9833 first_ms=53.105
+DECODE context=512 trial=0 warmup=0 tps=18.9684 first_ms=53.785
+DECODE context=512 trial=1 warmup=0 tps=18.9834 first_ms=52.313
+DECODE context=512 trial=2 warmup=0 tps=18.9943 first_ms=52.339
+DECODE context=512 trial=3 warmup=0 tps=18.9767 first_ms=54.233
+SUFFIX context=512 trial=-2 warmup=1 tps=188.3301
+SUFFIX context=512 trial=-1 warmup=1 tps=188.4164
+SUFFIX context=512 trial=0 warmup=0 tps=188.2289
+SUFFIX context=512 trial=1 warmup=0 tps=188.0506
+SUFFIX context=512 trial=2 warmup=0 tps=188.6743
+SUFFIX context=512 trial=3 warmup=0 tps=189.3093
+PASS frontier=512 internal replay; all measured operations reached their expected position
+SWEEP context=2048 new_tokens=1536 tps=691.6992
+DECODE context=2048 trial=-2 warmup=1 tps=18.5148 first_ms=76.274
+DECODE context=2048 trial=-1 warmup=1 tps=18.6535 first_ms=55.397
+DECODE context=2048 trial=0 warmup=0 tps=18.6505 first_ms=54.385
+DECODE context=2048 trial=1 warmup=0 tps=18.6432 first_ms=53.808
+DECODE context=2048 trial=2 warmup=0 tps=18.6504 first_ms=54.579
+DECODE context=2048 trial=3 warmup=0 tps=18.6631 first_ms=54.605
+SUFFIX context=2048 trial=-2 warmup=1 tps=174.3399
+SUFFIX context=2048 trial=-1 warmup=1 tps=174.4652
+SUFFIX context=2048 trial=0 warmup=0 tps=173.0375
+SUFFIX context=2048 trial=1 warmup=0 tps=172.3430
+SUFFIX context=2048 trial=2 warmup=0 tps=174.0595
+SUFFIX context=2048 trial=3 warmup=0 tps=173.7158
+PASS frontier=2048 internal replay; all measured operations reached their expected position
+SWEEP context=8192 new_tokens=6144 tps=681.7254
+DECODE context=8192 trial=-2 warmup=1 tps=15.0952 first_ms=88.573
+DECODE context=8192 trial=-1 warmup=1 tps=15.4343 first_ms=65.661
+DECODE context=8192 trial=0 warmup=0 tps=15.4318 first_ms=66.475
+DECODE context=8192 trial=1 warmup=0 tps=15.4349 first_ms=65.801
+DECODE context=8192 trial=2 warmup=0 tps=15.4282 first_ms=65.729
+DECODE context=8192 trial=3 warmup=0 tps=15.4411 first_ms=66.554
+SUFFIX context=8192 trial=-2 warmup=1 tps=166.5069
+SUFFIX context=8192 trial=-1 warmup=1 tps=166.4479
+SUFFIX context=8192 trial=0 warmup=0 tps=165.3825
+SUFFIX context=8192 trial=1 warmup=0 tps=165.3373
+SUFFIX context=8192 trial=2 warmup=0 tps=165.7340
+SUFFIX context=8192 trial=3 warmup=0 tps=165.0515
+PASS frontier=8192 internal replay; all measured operations reached their expected position
+SWEEP context=32768 new_tokens=24576 tps=663.1533
+DECODE context=32768 trial=-2 warmup=1 tps=14.5173 first_ms=91.030
+DECODE context=32768 trial=-1 warmup=1 tps=14.5548 first_ms=67.293
+DECODE context=32768 trial=0 warmup=0 tps=14.4071 first_ms=66.511
+DECODE context=32768 trial=1 warmup=0 tps=14.5586 first_ms=67.966
+DECODE context=32768 trial=2 warmup=0 tps=14.5703 first_ms=67.355
+DECODE context=32768 trial=3 warmup=0 tps=14.5780 first_ms=67.343
+SUFFIX context=32768 trial=-2 warmup=1 tps=163.3467
+SUFFIX context=32768 trial=-1 warmup=1 tps=163.4247
+SUFFIX context=32768 trial=0 warmup=0 tps=163.8774
+SUFFIX context=32768 trial=1 warmup=0 tps=162.8654
+SUFFIX context=32768 trial=2 warmup=0 tps=161.9234
+SUFFIX context=32768 trial=3 warmup=0 tps=162.3759
+PASS frontier=32768 internal replay; all measured operations reached their expected position
+SWEEP context=131072 new_tokens=98304 tps=626.2186
+DECODE context=131072 trial=-2 warmup=1 tps=12.5916 first_ms=79.466
+DECODE context=131072 trial=-1 warmup=1 tps=12.5978 first_ms=79.212
+DECODE context=131072 trial=0 warmup=0 tps=12.6001 first_ms=79.124
+DECODE context=131072 trial=1 warmup=0 tps=12.6039 first_ms=80.373
+DECODE context=131072 trial=2 warmup=0 tps=12.6037 first_ms=78.511
+DECODE context=131072 trial=3 warmup=0 tps=12.6056 first_ms=79.288
+SUFFIX context=131072 trial=-2 warmup=1 tps=155.1029
+SUFFIX context=131072 trial=-1 warmup=1 tps=155.2166
+SUFFIX context=131072 trial=0 warmup=0 tps=155.3871
+SUFFIX context=131072 trial=1 warmup=0 tps=154.1499
+SUFFIX context=131072 trial=2 warmup=0 tps=155.0019
+SUFFIX context=131072 trial=3 warmup=0 tps=154.8667
+PASS frontier=131072 internal replay; all measured operations reached their expected position
+SWEEP context=262016 new_tokens=130944 tps=510.5997
+DECODE context=262016 trial=-2 warmup=1 tps=10.8821 first_ms=92.548
+DECODE context=262016 trial=-1 warmup=1 tps=10.8999 first_ms=92.047
+DECODE context=262016 trial=0 warmup=0 tps=10.9074 first_ms=92.194
+DECODE context=262016 trial=1 warmup=0 tps=10.9072 first_ms=91.758
+DECODE context=262016 trial=2 warmup=0 tps=10.9049 first_ms=92.835
+DECODE context=262016 trial=3 warmup=0 tps=10.9052 first_ms=92.587
+SUFFIX context=262016 trial=-2 warmup=1 tps=66.3074
+SUFFIX context=262016 trial=-1 warmup=1 tps=66.3274
+SUFFIX context=262016 trial=0 warmup=0 tps=66.3584
+SUFFIX context=262016 trial=1 warmup=0 tps=66.4278
+SUFFIX context=262016 trial=2 warmup=0 tps=66.3172
+SUFFIX context=262016 trial=3 warmup=0 tps=66.2131
+PASS frontier=262016 internal replay; all measured operations reached their expected position
+PASS complete full-capacity stock/stack benchmark; production disk KV unused

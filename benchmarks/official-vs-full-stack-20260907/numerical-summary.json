@@ -1,0 +1,24 @@
+{
+  "spark": {
+    "pair_ab": {
+      "files": 21,
+      "elements": 118549760,
+      "bitwise_different": 116739758,
+      "vectors": 917,
+      "argmax_different": 48,
+      "max_abs": 6.604887008666992,
+      "rmse": 0.3134554638356938
+    }
+  },
+  "m3": {
+    "pair_ab": {
+      "files": 77,
+      "elements": 125789440,
+      "bitwise_different": 123979395,
+      "vectors": 973,
+      "argmax_different": 27,
+      "max_abs": 6.732069730758667,
+      "rmse": 0.2621395762589948
+    }
+  }
+}

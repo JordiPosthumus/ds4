@@ -1,0 +1,160 @@
+{
+  "passed": true,
+  "gpu_or_model_executed": false,
+  "source_sha256": "180ffef1b69d378d176a89e28b158f3f2ef84a8fb1e04dca13f7335c0d8499bd",
+  "makefile_sha256": "9eb00f5d6848e4ed75d990d0fb3e5920a32c8f64d514167328fa159b5d558c04",
+  "corpus_sha256": "443b3169e6b07837484df10b392115f11baa4258232bf91801a025b0967f8807",
+  "machine": {
+    "system": "Darwin",
+    "release": "27.0.0",
+    "version": "Darwin Kernel Version 27.0.0: Tue Aug 11 22:01:56 PDT 2026; root:xnu-13432.1.9~3/RELEASE_ARM64_T6031",
+    "machine": "arm64",
+    "processor": "arm"
+  },
+  "results": [
+    {
+      "label": "stock",
+      "executables": {
+        "ds4": "602252215d22c5b55d0c4ed0a2bd83d59c86de6a0c39e776db84571600d4b014",
+        "ds4-server": "6121074a05c81c34b01eb45a1eafd31bd3baef4506b87ded203cb6b256f6e8a0",
+        "ds4-bench": "a3f247da13634c1a5b1178ef7b08b09952ab96c47adc06675be4acf20a42c5f8",
+        "stack-bench": "41ac59e8a8fce45c83054999d24d58137f4270f89e0df5378a530b0b6c42167a"
+      },
+      "objects": {
+        "ds4.o": "1d794bca5ad9d8c1fa2748890d3eab4011a0cd4570669ff8d4fb4d9dbd8395ce",
+        "ds4_agent.o": "d3fc915ae0a1b0cfe6c704827cbecfe31a2755bc7b8648e42fc4a9fb35e3d87b",
+        "ds4_agent_test.o": "1e84391aeb4b72017dd02da52e07dcc9271d70225f648dee4650e2ae0a750522",
+        "ds4_bench.o": "93714e98f0d5f47fc895550cabbc6617b1bdcfc26dfe8181211cbd2cd368f6ad",
+        "ds4_cli.o": "03831a3410b3972cbb7e52a9ca8d6c0be4fe3409e7832e87e6dc93d06197b27b",
+        "ds4_distributed.o": "e8922b30435dcb4a50be79108977874938102e7d0a3d194a9c7182c9c9c6f0e9",
+        "ds4_eval.o": "1b9be305a4771cc31e0890e294f3311f97d4a7db3b17489da411f9d893f0a91e",
+        "ds4_eval_cases.o": "909ade54de9e0a3e8f7a92bd0a1581ffcd90736a2444f8ac91a3f3f97e6e6cf7",
+        "ds4_gpu_args.o": "f87c79068bb6156cf9d026d4c0eff68684c88d1a991810b27fe8ae8b5e7e2699",
+        "ds4_help.o": "04dfe880ce24f42fb3bbf49d0a80e0477c01c6a82cf94c82cbdacdd88c91584d",
+        "ds4_image.o": "b432ebe2cdc91e267892ddb1cae1d139e75dacf3810d245ab9bba33a5ee1a1d2",
+        "ds4_kvstore.o": "5c28c8a82ed3fbf722c11ab39ad88c0a4f6b1c4743e539301391f549c5debcbd",
+        "ds4_layer_pack.o": "fdcbf48b25c8788c4d48176127c3a049ec7c2cf137164ad312213bec628b46fa",
+        "ds4_metal.o": "8bc0f277b49399207395f34269f0b90ffb5365c47d17033d213554ba700f7e92",
+        "ds4_prompt_prefix.o": "50bdb7c1c9e5691439e1c2b1a3a426566d623429a345a5062818488a94648db7",
+        "ds4_server.o": "cc9cbbc3a3492b5ef62186ee0c21f1d70fe915d6e5642efaf18584f26e63d8cc",
+        "ds4_ssd.o": "22df2bcaa9c2fe0b6724dd863ce78b78f6a2cf995d0993981e4b69ff3ef31611",
+        "ds4_test.o": "86dd4fe7986bfaeb19a7000afc5be5e69a0a9629099fcaeb65be2b111dec8be9",
+        "ds4_tp.o": "3ca831d9e37553159b5a636fd296e6fcd8b1cae6f6fc0b6e2c3a560184788f3f",
+        "ds4_web.o": "dc56ba2cadce88ead18a22474d4def43f6e56a166d643cf6bba22c0f5080db9b",
+        "linenoise.o": "0f75af87fdca29100321823f871b9471f38ef7ed7b162627f1604c890e0b5b71",
+        "rax.o": "9f88170a76a9334baa7099ff6c557e3efba7137e1681bf21a7344505ca8076f1",
+        "stack-bench.o": "dd23206019a32beba8e95d466b43a2ec0fcba6e627767b48e3d9ddea66408f54"
+      },
+      "commands": [
+        {
+          "command": [
+            "make",
+            "-j2",
+            "ds4",
+            "ds4-server",
+            "ds4-bench",
+            "ds4-eval",
+            "ds4-agent"
+          ],
+          "exit": 0,
+          "seconds": 12.038726125028916
+        },
+        {
+          "command": [
+            "make",
+            "-j2",
+            "-f",
+            "Makefile",
+            "-f",
+            "/benchmark/benchmark.mk",
+            "STACK_BENCH_SOURCE=/benchmark/stack_bench.c",
+            "stack-bench"
+          ],
+          "exit": 0,
+          "seconds": 0.1774247499415651
+        },
+        {
+          "command": [
+            "make",
+            "-j2",
+            "test-frontends"
+          ],
+          "exit": 0,
+          "seconds": 10.350930749904364
+        }
+      ]
+    },
+    {
+      "label": "full",
+      "executables": {
+        "ds4": "653c7fb48ef45c5dc61195fa098d96e604cb80f81a47b50641a18bda4f02eacf",
+        "ds4-server": "52173c8d3b298a2fc32928c6b71f9a8776bd9b540b2a2c149db8a4892ab841e4",
+        "ds4-bench": "bb152e722fa73610b48dd7575fe8719eac3d7639bed3bea3b52590a9ba76e017",
+        "stack-bench": "58eae2b8dac7ec04cda2886ffd05db71b8988f17ae40c1fb153fb2c9ca9406c1"
+      },
+      "objects": {
+        "ds4.o": "0c205951081f8bb3d3ba9b40c9bd406472d1c9242624aeae90071755342bb16f",
+        "ds4_agent.o": "6354fc984d7d95f6261afc63a4756c52377bd1282eeec08c130256edbd34d8eb",
+        "ds4_agent_test.o": "1fcc313108213cd9733c04d2eaf13925abce69def0f31d070596d4e32605f78c",
+        "ds4_bench.o": "9b6013123b94733c95fb4d069427e9a52c8680e98dee28109c1db138f467089a",
+        "ds4_cli.o": "b04e9c9f4af92cee1d597ce26c6a7fe0e64673f5c69a20d817db0dc4aa2ff3c0",
+        "ds4_distributed.o": "044574f17d60850330008a438f98b8b159fa5a35cb18d07ae20ca516e3a9be8f",
+        "ds4_eval.o": "668dce9baaa1b4a05c8dac46d3027e263b5ea1b1d484093278e88351503a685e",
+        "ds4_eval_cases.o": "342a34b6617f1467d6b39b13543f8c9f099ea749a46ebc44c20b1433a57c643c",
+        "ds4_gpu_args.o": "3d62f6e8720ee570c7acfbe6c34ec2fc39918fe1632060a55e67d47b26187a3d",
+        "ds4_help.o": "5b1f0bf4af7e6fea1a4ff4f5b563cd8ae32294e01d7a9f8a258c1d514914b8a6",
+        "ds4_image.o": "aba9e8b76e14abe5ace80d484121a6a781827482a93f2f3e3249f1e29f7d0b35",
+        "ds4_kvstore.o": "04f99edf09af8a43bad3c1cd22150d3335270abd3938dfb15635c310385dd529",
+        "ds4_layer_pack.o": "2cd7e4a49f8008fa0a9cac96f45316882d9d743c2a38f3ca2d60982e37ef22d7",
+        "ds4_metal.o": "ebac5fed4df44c5cb507603f25248b5a9684494d0e8e0667a7e8c19088ad3023",
+        "ds4_prompt_prefix.o": "a9a656e06dec79aa59b0b7f873f6ff89dcfd24e1b80408a2466facc3bcf16bc0",
+        "ds4_server.o": "e9c820f452563ab157ddfc43b03e5c868e6323cf0bdeef04a5a50d3a629f27ac",
+        "ds4_ssd.o": "040ff9e5c20b8a8a98cdbc954738be05954688be129361a24c5d3a3e17f15849",
+        "ds4_test.o": "6720baeec670585e1d4fc4011a65c97aa95324fbed085499765f091f627883bc",
+        "ds4_tp.o": "6f5f22dd71abda0489e1d28cc5aae815e0fbbac16ffbbe2317ae073fc7acc910",
+        "ds4_web.o": "7ea8f83a4fa1e2a57ebce1603f770ff89228577e4957129c770c6e4bab3805a6",
+        "linenoise.o": "444987b2c27992fa7079f8c07d2606a947a50ea42b5f72720caf69208cba18de",
+        "rax.o": "110084426e769203869af059108c3337f5f16438166f5ad780f31f68b0b19f17",
+        "stack-bench.o": "1a65692395ba17e52ea7cb55f6e4feadae1e51ee4eef3c58319327fd76d0beb3"
+      },
+      "commands": [
+        {
+          "command": [
+            "make",
+            "-j2",
+            "ds4",
+            "ds4-server",
+            "ds4-bench",
+            "ds4-eval",
+            "ds4-agent"
+          ],
+          "exit": 0,
+          "seconds": 12.34757054108195
+        },
+        {
+          "command": [
+            "make",
+            "-j2",
+            "-f",
+            "Makefile",
+            "-f",
+            "/benchmark/benchmark.mk",
+            "STACK_BENCH_SOURCE=/benchmark/stack_bench.c",
+            "stack-bench"
+          ],
+          "exit": 0,
+          "seconds": 0.1985388749744743
+        },
+        {
+          "command": [
+            "make",
+            "-j2",
+            "test-frontends"
+          ],
+          "exit": 0,
+          "seconds": 11.913149666972458
+        }
+      ]
+    }
+  ]
+}
