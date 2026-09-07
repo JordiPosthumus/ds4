@@ -365,6 +365,27 @@ test-cuda-visual-attention: tests/test_cuda_visual_attention
 	./tests/test_cuda_visual_attention --fractional
 	./tests/test_cuda_visual_attention --boundaries
 	./tests/test_cuda_visual_attention --memory
+
+tests/test_cuda_indexed_gather: tests/test_cuda_indexed_gather.cu ds4_cuda.o ds4_image.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -I. -o $@ $^ $(CUDA_LDLIBS)
+
+.PHONY: test-cuda-indexed-gather test-cuda-topk-warp check-cuda-topk-warp-source
+test-cuda-indexed-gather: tests/test_cuda_indexed_gather
+	./tests/test_cuda_indexed_gather
+
+check-cuda-topk-warp-source:
+	python3 tests/check_cuda_topk_warp_source.py
+
+tests/cuda_topk_warp/screen: tests/cuda_topk_warp/screen.cu tests/cuda_topk_warp/reference-kernels.cuh tests/cuda_topk_warp/candidate-kernels.cuh ds4_cuda.cu tests/check_cuda_topk_warp_source.py
+	python3 tests/check_cuda_topk_warp_source.py
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -o $@ $<
+
+tests/cuda_topk_warp/screen-structural: tests/cuda_topk_warp/screen-structural.cu tests/cuda_topk_warp/reference-kernels.cuh tests/cuda_topk_warp/candidate-kernels.cuh ds4_cuda.cu tests/check_cuda_topk_warp_source.py
+	python3 tests/check_cuda_topk_warp_source.py
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -o $@ $<
+
+test-cuda-topk-warp: check-cuda-topk-warp-source tests/cuda_topk_warp/screen
+	cd tests/cuda_topk_warp && ./screen
 endif
 
 ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_linux_memory.h
@@ -838,6 +859,8 @@ ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_session_state.o \
 tests/test_session_state_gpu.o: ds4_tool_text.h
 
 clean:
+	rm -f tests/test_cuda_indexed_gather tests/cuda_topk_warp/screen tests/cuda_topk_warp/screen-structural
+	rm -f tests/cuda_topk_warp/reference-selected.u32 tests/cuda_topk_warp/candidate-selected.u32
 	rm -f tests/test_cuda_visual_attention
 	rm -f tests/test_metal_ssd_experts tests/test_metal_decode_raw_attention
 	rm -f tests/test_cuda_q8_scratch

@@ -64,6 +64,10 @@ __pycache__/
 /tests/*.bak-*
 /tests/test_indexer_scorers
 /tests/test_topk_ab
+/tests/test_cuda_indexed_gather
+/tests/cuda_topk_warp/screen
+/tests/cuda_topk_warp/screen-structural
+/tests/cuda_topk_warp/*-selected.u32
 /local-performance/
 
 /tests/test_metal_decode_raw_attention

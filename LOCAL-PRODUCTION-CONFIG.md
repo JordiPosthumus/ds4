@@ -157,3 +157,28 @@ under `local-performance/upstream-integration-m2-20260907T013000Z/`; this sectio
 alone does not assert a deployment. The owner authorized selecting a validated
 faster build independently for each host, with original source/binary/cache
 rollback retained and DSG handback verified.
+
+## Shared CUDA candidate, 2026-09-07
+
+The staged CUDA source combines within-warp shuffle sorting with the ordered
+F32 KV gathering implementation from PR #993. Sorting retains the original
+comparator network, selected rows and cross-warp barriers. Ordered gathering
+retains row order, duplicates and the existing attention reduction. It remains
+opt-in through `DS4_CUDA_INDEXED_DECODE_GATHER=1`; this source preparation does
+not change a launcher or authorize a production selection by itself.
+
+The existing Q8-to-FP16 weight-cache policy and 4096 MiB reserve are unchanged.
+The owner's approval for two private cache-disabled diagnostic processes does
+not authorize disabling that cache in production. Context, output capacity,
+resident/active sessions, prefill, cold anchors and disabled live-KV rewind keep
+the settings above. All Metal runtime files remain byte-identical to the
+accepted shared Metal revision `f40c0fc`.
+
+`make test-cuda-topk-warp` checks the actual runtime source against its guarded
+reference/candidate CUDA fixtures before compiling and running them. The
+separate structural executable supports sanitizer runs. `make
+test-cuda-indexed-gather` covers output identity, invalid and duplicate rows,
+scratch reuse, shape fallbacks and scalar reference checks. Full model, API,
+performance and verified cache handback evidence remains a separate acceptance
+requirement. Spark 1's normal-setting API checks have passed, but numerical
+causality and Spark 2's complete comparison are still pending at preparation.
